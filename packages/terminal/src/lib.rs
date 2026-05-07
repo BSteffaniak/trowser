@@ -29,23 +29,206 @@ impl Default for TerminalRenderOptions {
     }
 }
 
+/// A rendered terminal document with optional hit-test metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RenderedDocument {
+    /// Rendered terminal lines.
+    pub lines: Vec<RenderedLine>,
+}
+
+impl RenderedDocument {
+    /// Converts the document to newline-terminated plain text.
+    #[must_use]
+    pub fn to_plain_text(&self) -> String {
+        let mut output = String::new();
+        for line in &self.lines {
+            output.push_str(&line.text);
+            output.push('\n');
+        }
+        output
+    }
+}
+
+/// One rendered terminal line.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RenderedLine {
+    /// Visible line text.
+    pub text: String,
+    /// Link hitboxes on this line.
+    pub links: Vec<LinkHitbox>,
+}
+
+/// Clickable link range within a rendered line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkHitbox {
+    /// One-based link id shown in terminal output.
+    pub link_id: u32,
+    /// Inclusive start column.
+    pub start_col: u16,
+    /// Exclusive end column.
+    pub end_col: u16,
+}
+
+impl LinkHitbox {
+    /// Returns true if a terminal column is inside this hitbox.
+    #[must_use]
+    pub const fn contains(self, column: u16) -> bool {
+        self.start_col <= column && column < self.end_col
+    }
+}
+
 /// Renders a semantic page into terminal-safe reader-mode text.
 #[must_use]
 pub fn render_plain_text(page: &SemanticPage, options: &TerminalRenderOptions) -> String {
+    render_document(page, options).to_plain_text()
+}
+
+/// Renders a semantic page into terminal lines plus link hit-test metadata.
+#[must_use]
+pub fn render_document(page: &SemanticPage, options: &TerminalRenderOptions) -> RenderedDocument {
     let page = sanitize_page(page);
     let width = usize::from(options.width.max(40));
-    let mut output = String::new();
+    let mut document = RenderedDocument::default();
 
-    render_header(&page, width, &mut output);
-    render_nav_summary(&page, width, &mut output);
+    push_header_lines(&page, width, &mut document);
+    push_nav_summary_lines(&page, width, &mut document);
 
     let blocks = reader_blocks(&page.blocks);
     let mut next_link_id = 1usize;
     for block in blocks {
-        render_reader_block(block, &mut next_link_id, width, options, &mut output);
+        push_reader_block_lines(block, &mut next_link_id, width, options, &mut document);
     }
 
-    output
+    document
+}
+
+fn push_header_lines(page: &SemanticPage, width: usize, document: &mut RenderedDocument) {
+    let mut output = String::new();
+    render_header(page, width, &mut output);
+    push_text_lines(document, &output, None);
+}
+
+fn push_nav_summary_lines(page: &SemanticPage, width: usize, document: &mut RenderedDocument) {
+    let mut output = String::new();
+    render_nav_summary(page, width, &mut output);
+    push_text_lines(document, &output, None);
+}
+
+fn push_reader_block_lines(
+    block: &SemanticBlock,
+    next_link_id: &mut usize,
+    terminal_width: usize,
+    options: &TerminalRenderOptions,
+    document: &mut RenderedDocument,
+) {
+    let placement = ReaderPlacement::from_block(block, terminal_width);
+    match block {
+        SemanticBlock::Heading { level, text, .. } => {
+            document.lines.push(RenderedLine::default());
+            document.lines.push(RenderedLine {
+                text: format!(
+                    "{}{} {text}",
+                    " ".repeat(placement.indent),
+                    "#".repeat(usize::from((*level).clamp(1, 6)))
+                ),
+                links: Vec::new(),
+            });
+            document.lines.push(RenderedLine::default());
+        }
+        SemanticBlock::Paragraph { text, .. } => {
+            push_wrapped_lines(document, text, placement.indent, placement.width, None);
+            document.lines.push(RenderedLine::default());
+        }
+        SemanticBlock::ListItem { text, .. } => {
+            push_wrapped_lines(
+                document,
+                &format!("• {text}"),
+                placement.indent,
+                placement.width,
+                None,
+            );
+        }
+        SemanticBlock::Link { text, url, .. } => {
+            let label = if text.is_empty() {
+                url.as_str()
+            } else {
+                text.as_str()
+            };
+            let link_id = u32::try_from(*next_link_id).unwrap_or(u32::MAX);
+            *next_link_id += 1;
+            let value = format!("[{link_id}] {label} <{url}>");
+            push_wrapped_lines(
+                document,
+                &value,
+                placement.indent,
+                placement.width,
+                Some(link_id),
+            );
+            document.lines.push(RenderedLine::default());
+        }
+        SemanticBlock::Image {
+            alt,
+            url,
+            width,
+            height,
+            ..
+        } => {
+            let mut output = String::new();
+            render_image_box(alt, url, *width, *height, placement, options, &mut output);
+            push_text_lines(document, &output, None);
+        }
+        SemanticBlock::FormControl {
+            label,
+            control_type,
+            value,
+            ..
+        } => {
+            let text = if value.is_empty() {
+                format!("[{control_type}] {label}")
+            } else {
+                format!("[{control_type}] {label}: {value}")
+            };
+            push_wrapped_lines(document, &text, placement.indent, placement.width, None);
+            document.lines.push(RenderedLine::default());
+        }
+    }
+}
+
+fn push_wrapped_lines(
+    document: &mut RenderedDocument,
+    text: &str,
+    indent: usize,
+    width: usize,
+    link_id: Option<u32>,
+) {
+    for line in wrap_lines(text, width) {
+        let text = format!("{}{}", " ".repeat(indent), line);
+        let links = link_id.map_or_else(Vec::new, |link_id| {
+            vec![LinkHitbox {
+                link_id,
+                start_col: u16::try_from(indent).unwrap_or(u16::MAX),
+                end_col: u16::try_from(text.chars().count()).unwrap_or(u16::MAX),
+            }]
+        });
+        document.lines.push(RenderedLine { text, links });
+    }
+}
+
+fn push_text_lines(document: &mut RenderedDocument, text: &str, link_id: Option<u32>) {
+    for line in text.lines() {
+        let end_col = u16::try_from(line.chars().count()).unwrap_or(u16::MAX);
+        let links = link_id.map_or_else(Vec::new, |link_id| {
+            vec![LinkHitbox {
+                link_id,
+                start_col: 0,
+                end_col,
+            }]
+        });
+        document.lines.push(RenderedLine {
+            text: line.to_string(),
+            links,
+        });
+    }
 }
 
 fn render_header(page: &SemanticPage, width: usize, output: &mut String) {
@@ -113,71 +296,6 @@ fn nav_link_label(block: &SemanticBlock) -> Option<String> {
     } else {
         text.clone()
     })
-}
-
-fn render_reader_block(
-    block: &SemanticBlock,
-    next_link_id: &mut usize,
-    terminal_width: usize,
-    options: &TerminalRenderOptions,
-    output: &mut String,
-) {
-    let placement = ReaderPlacement::from_block(block, terminal_width);
-    match block {
-        SemanticBlock::Heading { level, text, .. } => {
-            output.push('\n');
-            output.push_str(&" ".repeat(placement.indent));
-            output.push_str(&"#".repeat(usize::from((*level).clamp(1, 6))));
-            output.push(' ');
-            output.push_str(text);
-            output.push_str("\n\n");
-        }
-        SemanticBlock::Paragraph { text, .. } => {
-            render_wrapped(text, placement.indent, placement.width, output);
-            output.push('\n');
-        }
-        SemanticBlock::ListItem { text, .. } => {
-            render_wrapped(
-                &format!("• {text}"),
-                placement.indent,
-                placement.width,
-                output,
-            );
-        }
-        SemanticBlock::Link { text, url, .. } => {
-            let label = if text.is_empty() {
-                url.as_str()
-            } else {
-                text.as_str()
-            };
-            let link_id = *next_link_id;
-            *next_link_id += 1;
-            let value = format!("[{link_id}] {label} <{url}>");
-            render_wrapped(&value, placement.indent, placement.width, output);
-            output.push('\n');
-        }
-        SemanticBlock::Image {
-            alt,
-            url,
-            width,
-            height,
-            ..
-        } => render_image_box(alt, url, *width, *height, placement, options, output),
-        SemanticBlock::FormControl {
-            label,
-            control_type,
-            value,
-            ..
-        } => {
-            let text = if value.is_empty() {
-                format!("[{control_type}] {label}")
-            } else {
-                format!("[{control_type}] {label}: {value}")
-            };
-            render_wrapped(&text, placement.indent, placement.width, output);
-            output.push('\n');
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]

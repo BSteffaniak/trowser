@@ -12,7 +12,10 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
 use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, read};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton,
+    MouseEventKind, read,
+};
 use crossterm::execute;
 use crossterm::style::Print;
 use crossterm::terminal::{
@@ -25,7 +28,9 @@ use trowser_client::{ClientError, TrowserClient};
 use trowser_config::{ConfigPaths, TROWSER_DAEMON_READY_FILE_ENV, TrowserConfig};
 use trowser_ipc::{Request, Response, ServerStatus};
 use trowser_server::TrowserServer;
-use trowser_terminal::{TerminalRenderOptions, render_plain_text};
+use trowser_terminal::{
+    RenderedDocument, TerminalRenderOptions, render_document, render_plain_text,
+};
 use trowser_terminal_image::detect_from_env;
 
 mod trace;
@@ -189,7 +194,7 @@ async fn run_interactive(
     } else {
         active_snapshot_or_empty(&client).await
     };
-    let mut rendered = render_page_lines(&page, config);
+    let mut rendered = render_page_document(&page, config);
     let mut offset = 0usize;
     let mut message =
         String::from("q quit · j/k scroll · o open · f follow · b back · F forward · r reload");
@@ -197,97 +202,114 @@ async fn run_interactive(
 
     loop {
         draw_viewport(&rendered, offset, &message)?;
-        let Event::Key(key) = read()? else {
-            continue;
-        };
-        match key {
-            KeyEvent {
-                code: KeyCode::Char('q'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('c'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => break,
-            KeyEvent {
-                code: KeyCode::Char('j') | KeyCode::Down,
-                ..
-            } => {
-                offset = offset
-                    .saturating_add(1)
-                    .min(rendered.len().saturating_sub(1));
-            }
-            KeyEvent {
-                code: KeyCode::Char('k') | KeyCode::Up,
-                ..
-            } => offset = offset.saturating_sub(1),
-            KeyEvent {
-                code: KeyCode::Char('g'),
-                ..
-            } => offset = 0,
-            KeyEvent {
-                code: KeyCode::Char('G'),
-                ..
-            } => offset = rendered.len().saturating_sub(1),
-            KeyEvent {
-                code: KeyCode::Char('o'),
-                ..
-            } => {
-                if let Some(url) = prompt_input("Open URL: ")? {
-                    page = open_and_snapshot(&client, &url).await?;
-                    rendered = render_page_lines(&page, config);
-                    offset = 0;
-                    message = format!("opened {url}");
+        match read()? {
+            Event::Key(key) => match key {
+                KeyEvent {
+                    code: KeyCode::Char('q'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
                 }
-            }
-            KeyEvent {
-                code: KeyCode::Char('f'),
-                ..
-            } => {
-                if let Some(raw) = prompt_input("Follow link: ")?
-                    && let Ok(link_id) = raw.trim().parse::<u32>()
-                {
-                    page = follow_and_snapshot(&client, link_id).await?;
-                    rendered = render_page_lines(&page, config);
-                    offset = 0;
-                    message = format!("followed link {link_id}");
+                | KeyEvent {
+                    code: KeyCode::Char('c'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } => break,
+                KeyEvent {
+                    code: KeyCode::Char('j') | KeyCode::Down,
+                    ..
+                } => {
+                    offset = offset
+                        .saturating_add(1)
+                        .min(rendered.lines.len().saturating_sub(1));
                 }
-            }
-            KeyEvent {
-                code: KeyCode::Char('b') | KeyCode::Left,
-                ..
-            } => match back_and_snapshot(&client).await {
-                Ok(updated_page) => {
-                    page = updated_page;
-                    rendered = render_page_lines(&page, config);
-                    offset = 0;
-                    message = "back".to_string();
+                KeyEvent {
+                    code: KeyCode::Char('k') | KeyCode::Up,
+                    ..
+                } => offset = offset.saturating_sub(1),
+                KeyEvent {
+                    code: KeyCode::Char('g'),
+                    ..
+                } => offset = 0,
+                KeyEvent {
+                    code: KeyCode::Char('G'),
+                    ..
+                } => offset = rendered.lines.len().saturating_sub(1),
+                KeyEvent {
+                    code: KeyCode::Char('o'),
+                    ..
+                } => {
+                    if let Some(url) = prompt_input("Open URL: ")? {
+                        page = open_and_snapshot(&client, &url).await?;
+                        rendered = render_page_document(&page, config);
+                        offset = 0;
+                        message = format!("opened {url}");
+                    }
                 }
-                Err(error) => message = error.to_string(),
+                KeyEvent {
+                    code: KeyCode::Char('f'),
+                    ..
+                } => {
+                    if let Some(raw) = prompt_input("Follow link: ")?
+                        && let Ok(link_id) = raw.trim().parse::<u32>()
+                    {
+                        page = follow_and_snapshot(&client, link_id).await?;
+                        rendered = render_page_document(&page, config);
+                        offset = 0;
+                        message = format!("followed link {link_id}");
+                    }
+                }
+                KeyEvent {
+                    code: KeyCode::Char('b') | KeyCode::Left,
+                    ..
+                } => match back_and_snapshot(&client).await {
+                    Ok(updated_page) => {
+                        page = updated_page;
+                        rendered = render_page_document(&page, config);
+                        offset = 0;
+                        message = "back".to_string();
+                    }
+                    Err(error) => message = error.to_string(),
+                },
+                KeyEvent {
+                    code: KeyCode::Char('F') | KeyCode::Right,
+                    ..
+                } => match forward_and_snapshot(&client).await {
+                    Ok(updated_page) => {
+                        page = updated_page;
+                        rendered = render_page_document(&page, config);
+                        offset = 0;
+                        message = "forward".to_string();
+                    }
+                    Err(error) => message = error.to_string(),
+                },
+                KeyEvent {
+                    code: KeyCode::Char('r'),
+                    ..
+                } => {
+                    page = reload_and_snapshot(&client).await?;
+                    rendered = render_page_document(&page, config);
+                    offset = 0;
+                    message = "reloaded".to_string();
+                }
+                _ => {}
             },
-            KeyEvent {
-                code: KeyCode::Char('F') | KeyCode::Right,
-                ..
-            } => match forward_and_snapshot(&client).await {
-                Ok(updated_page) => {
-                    page = updated_page;
-                    rendered = render_page_lines(&page, config);
-                    offset = 0;
-                    message = "forward".to_string();
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollDown => {
+                    offset = offset
+                        .saturating_add(3)
+                        .min(rendered.lines.len().saturating_sub(1));
                 }
-                Err(error) => message = error.to_string(),
+                MouseEventKind::ScrollUp => offset = offset.saturating_sub(3),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(link_id) = link_at(&rendered, offset, mouse.row, mouse.column) {
+                        page = follow_and_snapshot(&client, link_id).await?;
+                        rendered = render_page_document(&page, config);
+                        offset = 0;
+                        message = format!("followed link {link_id}");
+                    }
+                }
+                _ => {}
             },
-            KeyEvent {
-                code: KeyCode::Char('r'),
-                ..
-            } => {
-                page = reload_and_snapshot(&client).await?;
-                rendered = render_page_lines(&page, config);
-                offset = 0;
-                message = "reloaded".to_string();
-            }
             _ => {}
         }
     }
@@ -371,30 +393,36 @@ async fn active_snapshot_or_empty(client: &TrowserClient) -> trowser_render::Sem
     }
 }
 
-fn render_page_lines(page: &trowser_render::SemanticPage, config: &TrowserConfig) -> Vec<String> {
-    render_plain_text(
+fn render_page_document(
+    page: &trowser_render::SemanticPage,
+    config: &TrowserConfig,
+) -> RenderedDocument {
+    render_document(
         page,
         &TerminalRenderOptions {
             width: config.render.max_width,
             image_capabilities: detect_from_env(),
         },
     )
-    .lines()
-    .map(str::to_string)
-    .collect()
 }
 
-fn draw_viewport(lines: &[String], offset: usize, message: &str) -> Result<()> {
+fn draw_viewport(document: &RenderedDocument, offset: usize, message: &str) -> Result<()> {
     let (width, height) = size()?;
     let body_height = usize::from(height.saturating_sub(2));
     let mut out = stdout();
     execute!(out, MoveTo(0, 0), Clear(ClearType::All), Hide)?;
     execute!(out, Print("trowser"), MoveTo(0, 1))?;
-    for (row, line) in lines.iter().skip(offset).take(body_height).enumerate() {
+    for (row, line) in document
+        .lines
+        .iter()
+        .skip(offset)
+        .take(body_height)
+        .enumerate()
+    {
         execute!(
             out,
             MoveTo(0, u16::try_from(row + 1).unwrap_or(u16::MAX)),
-            Print(truncate_for_terminal(line, width))
+            Print(truncate_for_terminal(&line.text, width))
         )?;
     }
     execute!(
@@ -405,6 +433,26 @@ fn draw_viewport(lines: &[String], offset: usize, message: &str) -> Result<()> {
     )?;
     out.flush()?;
     Ok(())
+}
+
+fn link_at(
+    document: &RenderedDocument,
+    offset: usize,
+    screen_row: u16,
+    column: u16,
+) -> Option<u32> {
+    let (_, height) = size().ok()?;
+    if screen_row == 0 || screen_row >= height.saturating_sub(1) {
+        return None;
+    }
+    let line_index = offset + usize::from(screen_row.saturating_sub(1));
+    document
+        .lines
+        .get(line_index)?
+        .links
+        .iter()
+        .find(|link| link.contains(column))
+        .map(|link| link.link_id)
 }
 
 fn truncate_for_terminal(text: &str, width: u16) -> String {
@@ -444,7 +492,7 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
-        execute!(stdout(), EnterAlternateScreen, Hide)?;
+        execute!(stdout(), EnterAlternateScreen, EnableMouseCapture, Hide)?;
         Ok(Self)
     }
 }
@@ -452,7 +500,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), Show, LeaveAlternateScreen);
+        let _ = execute!(stdout(), Show, DisableMouseCapture, LeaveAlternateScreen);
     }
 }
 
