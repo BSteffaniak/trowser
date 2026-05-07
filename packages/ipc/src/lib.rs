@@ -67,6 +67,10 @@ pub enum Request {
     Back,
     /// Navigates the active tab forward in browser history.
     Forward,
+    /// Activates/clicks a form control in the active tab.
+    ClickControl { control_id: u32 },
+    /// Inputs text into a form control in the active tab.
+    InputText { control_id: u32, text: String },
     /// Lists known tabs.
     ListTabs,
     /// Follows a reader-mode link in the active tab.

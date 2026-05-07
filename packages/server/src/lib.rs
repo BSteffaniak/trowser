@@ -159,6 +159,10 @@ impl TrowserServer {
             Request::Reload => self.handle_reload().await,
             Request::Back => self.handle_back().await,
             Request::Forward => self.handle_forward().await,
+            Request::ClickControl { control_id } => self.handle_click_control(control_id).await,
+            Request::InputText { control_id, text } => {
+                self.handle_input_text(control_id, text).await
+            }
             Request::ListTabs => Response::Tabs(self.snapshot().await),
             Request::FollowLink { link_id } => self.handle_follow_link(link_id).await,
             Request::Snapshot { tab_id } => self.handle_snapshot(&tab_id).await,
@@ -287,6 +291,34 @@ impl TrowserServer {
         }
     }
 
+    async fn handle_click_control(&self, control_id: u32) -> Response {
+        let Some(tab_id) = self.active_tab_id().await else {
+            return Response::Error {
+                message: "no active tab".to_string(),
+            };
+        };
+        match self.click_control(control_id).await {
+            Ok(page) => self.store_page(tab_id, page).await,
+            Err(error) => Response::Error {
+                message: error.to_string(),
+            },
+        }
+    }
+
+    async fn handle_input_text(&self, control_id: u32, text: String) -> Response {
+        let Some(tab_id) = self.active_tab_id().await else {
+            return Response::Error {
+                message: "no active tab".to_string(),
+            };
+        };
+        match self.input_text(control_id, &text).await {
+            Ok(page) => self.store_page(tab_id, page).await,
+            Err(error) => Response::Error {
+                message: error.to_string(),
+            },
+        }
+    }
+
     async fn active_tab_id(&self) -> Option<TabId> {
         let state = self.state.lock().await;
         let tab_id = state.active_tab.clone();
@@ -387,6 +419,41 @@ impl TrowserServer {
             return Err(trowser_browser_cdp::CdpError::NavigationHistory);
         };
         browser.forward().await
+    }
+
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "browser mutex intentionally serializes access to the single persistent CDP process"
+    )]
+    async fn click_control(
+        &self,
+        control_id: u32,
+    ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
+        let mut browser = self.browser.lock().await;
+        let Some(browser) = browser.as_mut() else {
+            return Err(trowser_browser_cdp::CdpError::PageAction(
+                "browser is not connected".to_string(),
+            ));
+        };
+        browser.click_control(control_id).await
+    }
+
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "browser mutex intentionally serializes access to the single persistent CDP process"
+    )]
+    async fn input_text(
+        &self,
+        control_id: u32,
+        text: &str,
+    ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
+        let mut browser = self.browser.lock().await;
+        let Some(browser) = browser.as_mut() else {
+            return Err(trowser_browser_cdp::CdpError::PageAction(
+                "browser is not connected".to_string(),
+            ));
+        };
+        browser.input_text(control_id, text).await
     }
 
     async fn shutdown_browser(&self) {

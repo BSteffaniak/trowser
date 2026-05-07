@@ -114,6 +114,9 @@ pub enum CdpError {
     /// Requested browser history entry does not exist.
     #[error("no matching browser navigation history entry")]
     NavigationHistory,
+    /// Requested page action could not be performed.
+    #[error("CDP page action failed: {0}")]
+    PageAction(String),
     /// Extracted page data had an unexpected shape.
     #[error("CDP semantic extraction failed: {0}")]
     Extraction(String),
@@ -219,6 +222,24 @@ impl CdpBrowser {
         self.active_page().await?.forward().await
     }
 
+    /// Activates/clicks a form control and extracts semantic content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the control does not exist or `CDP` action/extraction fails.
+    pub async fn click_control(&mut self, control_id: u32) -> CdpResult<SemanticPage> {
+        self.active_page().await?.click_control(control_id).await
+    }
+
+    /// Inputs text into a form control and extracts semantic content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the control does not exist or `CDP` action/extraction fails.
+    pub async fn input_text(&mut self, control_id: u32, text: &str) -> CdpResult<SemanticPage> {
+        self.active_page().await?.input_text(control_id, text).await
+    }
+
     async fn active_page(&mut self) -> CdpResult<&mut CdpPage> {
         if self.active_page.is_none() {
             self.active_page = Some(CdpPage::create(self.port).await?);
@@ -280,6 +301,44 @@ impl CdpPage {
     async fn forward(&mut self) -> CdpResult<SemanticPage> {
         let entry_id = self.history_entry(1).await?;
         self.navigate_to_history_entry(entry_id).await
+    }
+
+    async fn click_control(&mut self, control_id: u32) -> CdpResult<SemanticPage> {
+        self.run_action(&click_control_js(control_id)).await?;
+        self.wait_for_page_load(Duration::from_secs(2)).await;
+        self.cdp.extract_semantic_page().await
+    }
+
+    async fn input_text(&mut self, control_id: u32, text: &str) -> CdpResult<SemanticPage> {
+        self.run_action(&input_text_js(control_id, text)?).await?;
+        self.cdp.extract_semantic_page().await
+    }
+
+    async fn run_action(&mut self, expression: &str) -> CdpResult<()> {
+        let result = self
+            .cdp
+            .call(
+                "Runtime.evaluate",
+                json!({
+                    "expression": expression,
+                    "returnByValue": true,
+                    "awaitPromise": true,
+                }),
+            )
+            .await?;
+        let value = result
+            .get("result")
+            .and_then(|value| value.get("value"))
+            .ok_or(CdpError::MissingField("Runtime.evaluate.result.value"))?;
+        if value.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            return Ok(());
+        }
+        let message = value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown page action failure")
+            .to_string();
+        Err(CdpError::PageAction(message))
     }
 
     async fn navigate_to_history_entry(&mut self, entry_id: i64) -> CdpResult<SemanticPage> {
@@ -634,6 +693,51 @@ impl CdpSemanticBlock {
     }
 }
 
+fn click_control_js(control_id: u32) -> String {
+    format!(
+        r"
+(() => {{
+  const controls = trowserVisibleControls();
+  const el = controls[{}];
+  if (!el) return {{ ok: false, error: 'unknown control id {control_id}' }};
+  el.focus();
+  el.click();
+  return {{ ok: true }};
+}})()
+",
+        control_id.saturating_sub(1)
+    )
+}
+
+fn input_text_js(control_id: u32, text: &str) -> CdpResult<String> {
+    let text = serde_json::to_string(text)?;
+    Ok(format!(
+        r"
+(() => {{
+  const controls = trowserVisibleControls();
+  const el = controls[{}];
+  if (!el) return {{ ok: false, error: 'unknown control id {control_id}' }};
+  const tag = el.tagName.toLowerCase();
+  if (tag === 'select') {{
+    const value = {text};
+    const option = Array.from(el.options).find((item) => item.value === value || item.text === value);
+    if (!option) return {{ ok: false, error: 'no matching select option' }};
+    el.value = option.value;
+  }} else if ('value' in el) {{
+    el.value = {text};
+  }} else {{
+    return {{ ok: false, error: 'control does not accept text' }};
+  }}
+  el.focus();
+  el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+  el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+  return {{ ok: true }};
+}})()
+",
+        control_id.saturating_sub(1)
+    ))
+}
+
 const DOM_EXTRACTION_JS: &str = r#"
 (() => {
   const blocks = [];
@@ -669,6 +773,7 @@ const DOM_EXTRACTION_JS: &str = r#"
     const text = clean(el.innerText || el.textContent || el.getAttribute('aria-label'));
     if (text) blocks.push({ kind, text, layout: layout(el), region: region(el), ...extra });
   };
+  window.trowserVisibleControls = () => Array.from(document.body.querySelectorAll('input,textarea,button,select')).filter(visible);
 
   for (const el of document.body.querySelectorAll('h1,h2,h3,h4,h5,h6,p,a,img,input,textarea,button,select,li')) {
     if (!visible(el)) continue;

@@ -56,6 +56,18 @@ pub enum Command {
     Back,
     /// Navigate the active tab forward.
     Forward,
+    /// Click/activate a numbered form control.
+    Click {
+        /// Control id to click.
+        control_id: u32,
+    },
+    /// Input text into a numbered form control.
+    Input {
+        /// Control id to fill.
+        control_id: u32,
+        /// Text to input.
+        text: String,
+    },
     /// List daemon tabs.
     Tabs,
     /// Print resolved paths.

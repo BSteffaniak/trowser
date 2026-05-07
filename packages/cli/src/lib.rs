@@ -29,7 +29,8 @@ use trowser_config::{ConfigPaths, TROWSER_DAEMON_READY_FILE_ENV, TrowserConfig};
 use trowser_ipc::{Request, Response, ServerStatus};
 use trowser_server::TrowserServer;
 use trowser_terminal::{
-    RenderedDocument, TerminalRenderOptions, render_document, render_plain_text,
+    ControlHitboxAction, RenderedDocument, TerminalRenderOptions, render_document,
+    render_plain_text,
 };
 use trowser_terminal_image::detect_from_env;
 
@@ -63,6 +64,24 @@ pub async fn run() -> Result<u8> {
         Command::Follow { link_id } => run_follow(&paths, &config, link_id, cli.json).await,
         Command::Back => run_navigation(&paths, &config, Request::Back, cli.json).await,
         Command::Forward => run_navigation(&paths, &config, Request::Forward, cli.json).await,
+        Command::Click { control_id } => {
+            run_navigation(
+                &paths,
+                &config,
+                Request::ClickControl { control_id },
+                cli.json,
+            )
+            .await
+        }
+        Command::Input { control_id, text } => {
+            run_navigation(
+                &paths,
+                &config,
+                Request::InputText { control_id, text },
+                cli.json,
+            )
+            .await
+        }
         Command::Tabs => run_tabs(&paths, cli.json).await,
         Command::Paths => Ok(run_paths(&paths, cli.json)),
         Command::Doctor => Ok(run_doctor(&config, cli.json)),
@@ -196,8 +215,9 @@ async fn run_interactive(
     };
     let mut rendered = render_page_document(&page, config);
     let mut offset = 0usize;
-    let mut message =
-        String::from("q quit · j/k scroll · o open · f follow · b back · F forward · r reload");
+    let mut message = String::from(
+        "q quit · j/k scroll · o open · f follow · i input · c click · b back · F forward · r reload",
+    );
     let _guard = TerminalGuard::enter()?;
 
     loop {
@@ -259,6 +279,34 @@ async fn run_interactive(
                     }
                 }
                 KeyEvent {
+                    code: KeyCode::Char('i'),
+                    ..
+                } => {
+                    if let Some(raw) = prompt_input("Input control: ")?
+                        && let Ok(control_id) = raw.trim().parse::<u32>()
+                        && let Some(text) = prompt_input("Text: ")?
+                    {
+                        page = input_and_snapshot(&client, control_id, text).await?;
+                        rendered = render_page_document(&page, config);
+                        offset = 0;
+                        message = format!("input text into control {control_id}");
+                    }
+                }
+                KeyEvent {
+                    code: KeyCode::Char('c'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                } => {
+                    if let Some(raw) = prompt_input("Click control: ")?
+                        && let Ok(control_id) = raw.trim().parse::<u32>()
+                    {
+                        page = click_and_snapshot(&client, control_id).await?;
+                        rendered = render_page_document(&page, config);
+                        offset = 0;
+                        message = format!("clicked control {control_id}");
+                    }
+                }
+                KeyEvent {
                     code: KeyCode::Char('b') | KeyCode::Left,
                     ..
                 } => match back_and_snapshot(&client).await {
@@ -301,11 +349,35 @@ async fn run_interactive(
                 }
                 MouseEventKind::ScrollUp => offset = offset.saturating_sub(3),
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(link_id) = link_at(&rendered, offset, mouse.row, mouse.column) {
-                        page = follow_and_snapshot(&client, link_id).await?;
-                        rendered = render_page_document(&page, config);
-                        offset = 0;
-                        message = format!("followed link {link_id}");
+                    if let Some(target) = target_at(&rendered, offset, mouse.row, mouse.column) {
+                        match target {
+                            ClickTarget::Link(link_id) => {
+                                page = follow_and_snapshot(&client, link_id).await?;
+                                rendered = render_page_document(&page, config);
+                                offset = 0;
+                                message = format!("followed link {link_id}");
+                            }
+                            ClickTarget::Control {
+                                control_id,
+                                action: ControlHitboxAction::Click,
+                            } => {
+                                page = click_and_snapshot(&client, control_id).await?;
+                                rendered = render_page_document(&page, config);
+                                offset = 0;
+                                message = format!("clicked control {control_id}");
+                            }
+                            ClickTarget::Control {
+                                control_id,
+                                action: ControlHitboxAction::InputText,
+                            } => {
+                                if let Some(text) = prompt_input("Text: ")? {
+                                    page = input_and_snapshot(&client, control_id, text).await?;
+                                    rendered = render_page_document(&page, config);
+                                    offset = 0;
+                                    message = format!("input text into control {control_id}");
+                                }
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -353,6 +425,21 @@ async fn back_and_snapshot(client: &TrowserClient) -> Result<trowser_render::Sem
 
 async fn forward_and_snapshot(client: &TrowserClient) -> Result<trowser_render::SemanticPage> {
     navigation_and_snapshot(client, Request::Forward).await
+}
+
+async fn click_and_snapshot(
+    client: &TrowserClient,
+    control_id: u32,
+) -> Result<trowser_render::SemanticPage> {
+    navigation_and_snapshot(client, Request::ClickControl { control_id }).await
+}
+
+async fn input_and_snapshot(
+    client: &TrowserClient,
+    control_id: u32,
+    text: String,
+) -> Result<trowser_render::SemanticPage> {
+    navigation_and_snapshot(client, Request::InputText { control_id, text }).await
 }
 
 async fn navigation_and_snapshot(
@@ -443,24 +530,40 @@ fn draw_viewport(document: &RenderedDocument, offset: usize, message: &str) -> R
     Ok(())
 }
 
-fn link_at(
+#[derive(Debug, Clone, Copy)]
+enum ClickTarget {
+    Link(u32),
+    Control {
+        control_id: u32,
+        action: ControlHitboxAction,
+    },
+}
+
+fn target_at(
     document: &RenderedDocument,
     offset: usize,
     screen_row: u16,
     column: u16,
-) -> Option<u32> {
+) -> Option<ClickTarget> {
     let (_, height) = size().ok()?;
     if screen_row == 0 || screen_row >= height.saturating_sub(1) {
         return None;
     }
     let line_index = offset + usize::from(screen_row.saturating_sub(1));
-    document
-        .lines
-        .get(line_index)?
-        .links
+    let line = document.lines.get(line_index)?;
+    line.links
         .iter()
         .find(|link| link.contains(column))
-        .map(|link| link.link_id)
+        .map(|link| ClickTarget::Link(link.link_id))
+        .or_else(|| {
+            line.controls
+                .iter()
+                .find(|control| control.contains(column))
+                .map(|control| ClickTarget::Control {
+                    control_id: control.control_id,
+                    action: control.action,
+                })
+        })
 }
 
 fn truncate_for_terminal(text: &str, width: u16) -> String {

@@ -56,6 +56,8 @@ pub struct RenderedLine {
     pub text: String,
     /// Link hitboxes on this line.
     pub links: Vec<LinkHitbox>,
+    /// Form-control hitboxes on this line.
+    pub controls: Vec<ControlHitbox>,
 }
 
 /// Clickable link range within a rendered line.
@@ -77,6 +79,36 @@ impl LinkHitbox {
     }
 }
 
+/// Clickable form-control range within a rendered line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlHitbox {
+    /// One-based control id shown in terminal output.
+    pub control_id: u32,
+    /// Default click behavior for this control.
+    pub action: ControlHitboxAction,
+    /// Inclusive start column.
+    pub start_col: u16,
+    /// Exclusive end column.
+    pub end_col: u16,
+}
+
+impl ControlHitbox {
+    /// Returns true if a terminal column is inside this hitbox.
+    #[must_use]
+    pub const fn contains(self, column: u16) -> bool {
+        self.start_col <= column && column < self.end_col
+    }
+}
+
+/// Suggested behavior when clicking a rendered form control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlHitboxAction {
+    /// Prompt for text and fill the control.
+    InputText,
+    /// Activate/click the control.
+    Click,
+}
+
 /// Renders a semantic page into terminal-safe reader-mode text.
 #[must_use]
 pub fn render_plain_text(page: &SemanticPage, options: &TerminalRenderOptions) -> String {
@@ -95,8 +127,16 @@ pub fn render_document(page: &SemanticPage, options: &TerminalRenderOptions) -> 
 
     let blocks = reader_blocks(&page.blocks);
     let mut next_link_id = 1usize;
+    let mut next_control_id = 1usize;
     for block in blocks {
-        push_reader_block_lines(block, &mut next_link_id, width, options, &mut document);
+        push_reader_block_lines(
+            block,
+            &mut next_link_id,
+            &mut next_control_id,
+            width,
+            options,
+            &mut document,
+        );
     }
 
     document
@@ -117,6 +157,7 @@ fn push_nav_summary_lines(page: &SemanticPage, width: usize, document: &mut Rend
 fn push_reader_block_lines(
     block: &SemanticBlock,
     next_link_id: &mut usize,
+    next_control_id: &mut usize,
     terminal_width: usize,
     options: &TerminalRenderOptions,
     document: &mut RenderedDocument,
@@ -132,6 +173,7 @@ fn push_reader_block_lines(
                     "#".repeat(usize::from((*level).clamp(1, 6)))
                 ),
                 links: Vec::new(),
+                controls: Vec::new(),
             });
             document.lines.push(RenderedLine::default());
         }
@@ -183,12 +225,21 @@ fn push_reader_block_lines(
             value,
             ..
         } => {
+            let control_id = u32::try_from(*next_control_id).unwrap_or(u32::MAX);
+            *next_control_id += 1;
             let text = if value.is_empty() {
-                format!("[{control_type}] {label}")
+                format!("[control {control_id}] {control_type} {label}")
             } else {
-                format!("[{control_type}] {label}: {value}")
+                format!("[control {control_id}] {control_type} {label}: {value}")
             };
-            push_wrapped_lines(document, &text, placement.indent, placement.width, None);
+            push_wrapped_control_lines(
+                document,
+                &text,
+                placement.indent,
+                placement.width,
+                control_id,
+                control_action(control_type),
+            );
             document.lines.push(RenderedLine::default());
         }
     }
@@ -210,7 +261,41 @@ fn push_wrapped_lines(
                 end_col: u16::try_from(text.chars().count()).unwrap_or(u16::MAX),
             }]
         });
-        document.lines.push(RenderedLine { text, links });
+        document.lines.push(RenderedLine {
+            text,
+            links,
+            controls: Vec::new(),
+        });
+    }
+}
+
+fn push_wrapped_control_lines(
+    document: &mut RenderedDocument,
+    text: &str,
+    indent: usize,
+    width: usize,
+    control_id: u32,
+    action: ControlHitboxAction,
+) {
+    for line in wrap_lines(text, width) {
+        let text = format!("{}{}", " ".repeat(indent), line);
+        document.lines.push(RenderedLine {
+            controls: vec![ControlHitbox {
+                control_id,
+                action,
+                start_col: u16::try_from(indent).unwrap_or(u16::MAX),
+                end_col: u16::try_from(text.chars().count()).unwrap_or(u16::MAX),
+            }],
+            text,
+            links: Vec::new(),
+        });
+    }
+}
+
+fn control_action(control_type: &str) -> ControlHitboxAction {
+    match control_type {
+        "button" | "submit" | "reset" | "image" => ControlHitboxAction::Click,
+        _ => ControlHitboxAction::InputText,
     }
 }
 
@@ -227,6 +312,7 @@ fn push_text_lines(document: &mut RenderedDocument, text: &str, link_id: Option<
         document.lines.push(RenderedLine {
             text: line.to_string(),
             links,
+            controls: Vec::new(),
         });
     }
 }
