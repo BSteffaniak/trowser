@@ -68,6 +68,20 @@ pub enum Command {
         /// Text to input.
         text: String,
     },
+    /// Switch to a tab.
+    Switch {
+        /// Tab id to activate.
+        tab_id: String,
+    },
+    /// Close a tab.
+    Close {
+        /// Tab id to close.
+        tab_id: String,
+    },
+    /// Switch to the next tab.
+    NextTab,
+    /// Switch to the previous tab.
+    PreviousTab,
     /// List daemon tabs.
     Tabs,
     /// Print resolved paths.

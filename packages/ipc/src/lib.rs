@@ -57,8 +57,16 @@ pub enum Request {
     Hello(ClientHello),
     /// Returns daemon status.
     Status,
-    /// Opens or navigates a tab to a URL.
+    /// Opens a new tab to a URL.
     Open { url: String },
+    /// Switches to a tab.
+    SwitchTab { tab_id: TabId },
+    /// Closes a tab.
+    CloseTab { tab_id: TabId },
+    /// Switches to the next tab.
+    NextTab,
+    /// Switches to the previous tab.
+    PreviousTab,
     /// Returns a semantic snapshot for the active tab.
     ActiveSnapshot,
     /// Reloads the active tab.

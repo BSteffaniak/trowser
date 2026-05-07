@@ -155,6 +155,10 @@ impl TrowserServer {
             Request::Hello(hello) => Self::handle_hello(&hello),
             Request::Status => Response::Status(self.status()),
             Request::Open { url } => self.handle_open(url).await,
+            Request::SwitchTab { tab_id } => self.handle_switch_tab(tab_id).await,
+            Request::CloseTab { tab_id } => self.handle_close_tab(tab_id).await,
+            Request::NextTab => self.handle_next_tab().await,
+            Request::PreviousTab => self.handle_previous_tab().await,
             Request::ActiveSnapshot => self.handle_active_snapshot().await,
             Request::Reload => self.handle_reload().await,
             Request::Back => self.handle_back().await,
@@ -191,17 +195,20 @@ impl TrowserServer {
     }
 
     async fn handle_open(&self, url: String) -> Response {
+        let tab_id = self.allocate_tab_id().await;
         let page = self
-            .fetch_page(&url)
+            .open_browser_tab(tab_id.clone(), &url)
             .await
             .unwrap_or_else(|error| error_page(&url, &error.to_string()));
+        self.store_page(tab_id, page).await
+    }
+
+    async fn allocate_tab_id(&self) -> TabId {
         let mut state = self.state.lock().await;
         let tab_id = TabId::new(format!("tab-{}", state.next_tab_id));
         state.next_tab_id += 1;
-        state.tabs.insert(tab_id.clone(), page);
-        state.active_tab = Some(tab_id.clone());
         drop(state);
-        Response::Opened { tab_id }
+        tab_id
     }
 
     async fn handle_follow_link(&self, link_id: u32) -> Response {
@@ -212,14 +219,10 @@ impl TrowserServer {
         };
 
         let page = self
-            .fetch_page(&url)
+            .navigate_browser_tab(&tab_id, &url)
             .await
             .unwrap_or_else(|error| error_page(&url, &error.to_string()));
-        let mut state = self.state.lock().await;
-        state.tabs.insert(tab_id.clone(), page);
-        state.active_tab = Some(tab_id.clone());
-        drop(state);
-        Response::Opened { tab_id }
+        self.store_page(tab_id, page).await
     }
 
     async fn follow_link_target(&self, link_id: u32) -> Option<(TabId, String)> {
@@ -232,6 +235,74 @@ impl TrowserServer {
             .find(|link| link.id == link_id)
             .map(|link| link.url)?;
         Some((tab_id, target))
+    }
+
+    async fn handle_switch_tab(&self, tab_id: TabId) -> Response {
+        let mut state = self.state.lock().await;
+        if !state.tabs.contains_key(&tab_id) {
+            return Response::Error {
+                message: format!("unknown tab {}", tab_id.as_str()),
+            };
+        }
+        state.active_tab = Some(tab_id.clone());
+        drop(state);
+        Response::Opened { tab_id }
+    }
+
+    async fn handle_close_tab(&self, tab_id: TabId) -> Response {
+        {
+            let mut browser = self.browser.lock().await;
+            if let Some(browser) = browser.as_mut() {
+                let _ = browser.close_tab(&tab_id).await;
+            }
+        }
+
+        let mut state = self.state.lock().await;
+        if state.tabs.remove(&tab_id).is_none() {
+            return Response::Error {
+                message: format!("unknown tab {}", tab_id.as_str()),
+            };
+        }
+        if state.active_tab.as_ref() == Some(&tab_id) {
+            state.active_tab = state.tabs.keys().next().cloned();
+        }
+        let active_tab = state.active_tab.clone();
+        drop(state);
+        active_tab.map_or(Response::Ok, |tab_id| Response::Opened { tab_id })
+    }
+
+    async fn handle_next_tab(&self) -> Response {
+        self.switch_relative_tab(1).await
+    }
+
+    async fn handle_previous_tab(&self) -> Response {
+        self.switch_relative_tab(-1).await
+    }
+
+    async fn switch_relative_tab(&self, offset: isize) -> Response {
+        let mut state = self.state.lock().await;
+        let tabs = state.tabs.keys().cloned().collect::<Vec<_>>();
+        if tabs.is_empty() {
+            return Response::Error {
+                message: "no tabs".to_string(),
+            };
+        }
+        let current_index = state
+            .active_tab
+            .as_ref()
+            .and_then(|active| tabs.iter().position(|tab| tab == active))
+            .unwrap_or(0);
+        let target_index = if offset.is_negative() {
+            current_index
+                .checked_sub(offset.unsigned_abs())
+                .unwrap_or(tabs.len() - 1)
+        } else {
+            (current_index + usize::try_from(offset).unwrap_or(0)) % tabs.len()
+        };
+        let tab_id = tabs[target_index].clone();
+        state.active_tab = Some(tab_id.clone());
+        drop(state);
+        Response::Opened { tab_id }
     }
 
     async fn handle_active_snapshot(&self) -> Response {
@@ -257,7 +328,7 @@ impl TrowserServer {
             };
         };
         let page = self
-            .reload_page(&url)
+            .reload_page(&tab_id, &url)
             .await
             .unwrap_or_else(|error| error_page(&url, &error.to_string()));
         self.store_page(tab_id, page).await
@@ -269,7 +340,7 @@ impl TrowserServer {
                 message: "no active tab".to_string(),
             };
         };
-        match self.back_page().await {
+        match self.back_page(&tab_id).await {
             Ok(page) => self.store_page(tab_id, page).await,
             Err(error) => Response::Error {
                 message: error.to_string(),
@@ -283,7 +354,7 @@ impl TrowserServer {
                 message: "no active tab".to_string(),
             };
         };
-        match self.forward_page().await {
+        match self.forward_page(&tab_id).await {
             Ok(page) => self.store_page(tab_id, page).await,
             Err(error) => Response::Error {
                 message: error.to_string(),
@@ -297,7 +368,7 @@ impl TrowserServer {
                 message: "no active tab".to_string(),
             };
         };
-        match self.click_control(control_id).await {
+        match self.click_control(&tab_id, control_id).await {
             Ok(page) => self.store_page(tab_id, page).await,
             Err(error) => Response::Error {
                 message: error.to_string(),
@@ -311,7 +382,7 @@ impl TrowserServer {
                 message: "no active tab".to_string(),
             };
         };
-        match self.input_text(control_id, &text).await {
+        match self.input_text(&tab_id, control_id, &text).await {
             Ok(page) => self.store_page(tab_id, page).await,
             Err(error) => Response::Error {
                 message: error.to_string(),
@@ -354,9 +425,13 @@ impl TrowserServer {
 
     #[allow(
         clippy::significant_drop_tightening,
-        reason = "browser mutex intentionally serializes access to the single persistent CDP process"
+        reason = "browser mutex intentionally serializes access to persistent CDP page targets"
     )]
-    async fn fetch_page(&self, url: &str) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
+    async fn open_browser_tab(
+        &self,
+        tab_id: TabId,
+        url: &str,
+    ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
         let mut browser = self.browser.lock().await;
         if browser.is_none() {
             let config = CdpBackendConfig {
@@ -368,15 +443,39 @@ impl TrowserServer {
         let Some(browser) = browser.as_mut() else {
             unreachable!("browser initialized above")
         };
-        browser.fetch_semantic_page(url).await
+        browser.open_tab(tab_id, url).await
     }
 
     #[allow(
         clippy::significant_drop_tightening,
-        reason = "browser mutex intentionally serializes access to the single persistent CDP process"
+        reason = "browser mutex intentionally serializes access to persistent CDP page targets"
+    )]
+    async fn navigate_browser_tab(
+        &self,
+        tab_id: &TabId,
+        url: &str,
+    ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
+        let mut browser = self.browser.lock().await;
+        if browser.is_none() {
+            let config = CdpBackendConfig {
+                browser_binary: self.config.browser.binary.clone(),
+                headless: self.config.browser.headless,
+            };
+            *browser = Some(CdpBrowser::launch(&config).await?);
+        }
+        let Some(browser) = browser.as_mut() else {
+            unreachable!("browser initialized above")
+        };
+        browser.navigate_tab(tab_id, url).await
+    }
+
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "browser mutex intentionally serializes access to persistent CDP page targets"
     )]
     async fn reload_page(
         &self,
+        tab_id: &TabId,
         fallback_url: &str,
     ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
         let mut browser = self.browser.lock().await;
@@ -389,44 +488,54 @@ impl TrowserServer {
             let Some(browser) = browser.as_mut() else {
                 unreachable!("browser initialized above")
             };
-            return browser.fetch_semantic_page(fallback_url).await;
+            return browser.open_tab(tab_id.clone(), fallback_url).await;
         }
         let Some(browser) = browser.as_mut() else {
             unreachable!("browser checked above")
         };
-        browser.reload().await
+        match browser.reload_tab(tab_id).await {
+            Ok(page) => Ok(page),
+            Err(_) => browser.open_tab(tab_id.clone(), fallback_url).await,
+        }
     }
 
     #[allow(
         clippy::significant_drop_tightening,
-        reason = "browser mutex intentionally serializes access to the single persistent CDP process"
+        reason = "browser mutex intentionally serializes access to persistent CDP page targets"
     )]
-    async fn back_page(&self) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
+    async fn back_page(
+        &self,
+        tab_id: &TabId,
+    ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
         let mut browser = self.browser.lock().await;
         let Some(browser) = browser.as_mut() else {
             return Err(trowser_browser_cdp::CdpError::NavigationHistory);
         };
-        browser.back().await
+        browser.back_tab(tab_id).await
     }
 
     #[allow(
         clippy::significant_drop_tightening,
-        reason = "browser mutex intentionally serializes access to the single persistent CDP process"
+        reason = "browser mutex intentionally serializes access to persistent CDP page targets"
     )]
-    async fn forward_page(&self) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
+    async fn forward_page(
+        &self,
+        tab_id: &TabId,
+    ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
         let mut browser = self.browser.lock().await;
         let Some(browser) = browser.as_mut() else {
             return Err(trowser_browser_cdp::CdpError::NavigationHistory);
         };
-        browser.forward().await
+        browser.forward_tab(tab_id).await
     }
 
     #[allow(
         clippy::significant_drop_tightening,
-        reason = "browser mutex intentionally serializes access to the single persistent CDP process"
+        reason = "browser mutex intentionally serializes access to persistent CDP page targets"
     )]
     async fn click_control(
         &self,
+        tab_id: &TabId,
         control_id: u32,
     ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
         let mut browser = self.browser.lock().await;
@@ -435,15 +544,16 @@ impl TrowserServer {
                 "browser is not connected".to_string(),
             ));
         };
-        browser.click_control(control_id).await
+        browser.click_control(tab_id, control_id).await
     }
 
     #[allow(
         clippy::significant_drop_tightening,
-        reason = "browser mutex intentionally serializes access to the single persistent CDP process"
+        reason = "browser mutex intentionally serializes access to persistent CDP page targets"
     )]
     async fn input_text(
         &self,
+        tab_id: &TabId,
         control_id: u32,
         text: &str,
     ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
@@ -453,7 +563,7 @@ impl TrowserServer {
                 "browser is not connected".to_string(),
             ));
         };
-        browser.input_text(control_id, text).await
+        browser.input_text(tab_id, control_id, text).await
     }
 
     async fn shutdown_browser(&self) {

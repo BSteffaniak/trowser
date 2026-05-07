@@ -7,6 +7,7 @@
 //! This crate is intentionally the only place where Chromium/CDP-specific
 //! implementation details should live.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -22,6 +23,7 @@ use trowser_browser::{
     NavigateRequest,
 };
 use trowser_render::{BlockLayout, SemanticBlock, SemanticPage, SemanticRegion};
+use trowser_session_models::TabId;
 
 /// Configuration for the Chromium/CDP backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,7 +151,7 @@ pub struct CdpBrowser {
     child: Child,
     _profile: tempfile::TempDir,
     port: u16,
-    active_page: Option<CdpPage>,
+    pages: BTreeMap<TabId, CdpPage>,
 }
 
 impl std::fmt::Debug for CdpBrowser {
@@ -181,73 +183,107 @@ impl CdpBrowser {
             child,
             _profile: profile,
             port,
-            active_page: None,
+            pages: BTreeMap::new(),
         })
     }
 
-    /// Navigates the persistent active `CDP` page and extracts semantic content.
+    /// Creates or replaces a `CDP` page for a trowser tab, navigates it, and extracts content.
     ///
     /// # Errors
     ///
     /// Returns an error if target creation, navigation, or extraction fails.
-    pub async fn fetch_semantic_page(&mut self, url: &str) -> CdpResult<SemanticPage> {
-        self.active_page().await?.navigate(url).await
+    pub async fn open_tab(&mut self, tab_id: TabId, url: &str) -> CdpResult<SemanticPage> {
+        if self.pages.contains_key(&tab_id) {
+            self.close_tab(&tab_id).await?;
+        }
+        let mut page = CdpPage::create(self.port).await?;
+        let semantic_page = page.navigate(url).await?;
+        self.pages.insert(tab_id, page);
+        Ok(semantic_page)
     }
 
-    /// Reloads the persistent active `CDP` page and extracts semantic content.
+    /// Navigates an existing tab, creating the page target if necessary.
     ///
     /// # Errors
     ///
-    /// Returns an error if the page target cannot be created, reload fails, or
-    /// extraction fails.
-    pub async fn reload(&mut self) -> CdpResult<SemanticPage> {
-        self.active_page().await?.reload().await
+    /// Returns an error if target creation, navigation, or extraction fails.
+    pub async fn navigate_tab(&mut self, tab_id: &TabId, url: &str) -> CdpResult<SemanticPage> {
+        if !self.pages.contains_key(tab_id) {
+            return self.open_tab(tab_id.clone(), url).await;
+        }
+        self.page_mut(tab_id)?.navigate(url).await
     }
 
-    /// Navigates the persistent active `CDP` page backward in history.
+    /// Reloads a tab and extracts semantic content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the page target is missing or reload/extraction fails.
+    pub async fn reload_tab(&mut self, tab_id: &TabId) -> CdpResult<SemanticPage> {
+        self.page_mut(tab_id)?.reload().await
+    }
+
+    /// Navigates a tab backward in history.
     ///
     /// # Errors
     ///
     /// Returns an error if no back entry exists or `CDP` navigation/extraction fails.
-    pub async fn back(&mut self) -> CdpResult<SemanticPage> {
-        self.active_page().await?.back().await
+    pub async fn back_tab(&mut self, tab_id: &TabId) -> CdpResult<SemanticPage> {
+        self.page_mut(tab_id)?.back().await
     }
 
-    /// Navigates the persistent active `CDP` page forward in history.
+    /// Navigates a tab forward in history.
     ///
     /// # Errors
     ///
     /// Returns an error if no forward entry exists or `CDP` navigation/extraction fails.
-    pub async fn forward(&mut self) -> CdpResult<SemanticPage> {
-        self.active_page().await?.forward().await
+    pub async fn forward_tab(&mut self, tab_id: &TabId) -> CdpResult<SemanticPage> {
+        self.page_mut(tab_id)?.forward().await
     }
 
-    /// Activates/clicks a form control and extracts semantic content.
+    /// Activates/clicks a form control in a tab and extracts semantic content.
     ///
     /// # Errors
     ///
     /// Returns an error if the control does not exist or `CDP` action/extraction fails.
-    pub async fn click_control(&mut self, control_id: u32) -> CdpResult<SemanticPage> {
-        self.active_page().await?.click_control(control_id).await
+    pub async fn click_control(
+        &mut self,
+        tab_id: &TabId,
+        control_id: u32,
+    ) -> CdpResult<SemanticPage> {
+        self.page_mut(tab_id)?.click_control(control_id).await
     }
 
-    /// Inputs text into a form control and extracts semantic content.
+    /// Inputs text into a form control in a tab and extracts semantic content.
     ///
     /// # Errors
     ///
     /// Returns an error if the control does not exist or `CDP` action/extraction fails.
-    pub async fn input_text(&mut self, control_id: u32, text: &str) -> CdpResult<SemanticPage> {
-        self.active_page().await?.input_text(control_id, text).await
+    pub async fn input_text(
+        &mut self,
+        tab_id: &TabId,
+        control_id: u32,
+        text: &str,
+    ) -> CdpResult<SemanticPage> {
+        self.page_mut(tab_id)?.input_text(control_id, text).await
     }
 
-    async fn active_page(&mut self) -> CdpResult<&mut CdpPage> {
-        if self.active_page.is_none() {
-            self.active_page = Some(CdpPage::create(self.port).await?);
+    /// Closes the browser page target for a tab.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Chromium rejects the close request.
+    pub async fn close_tab(&mut self, tab_id: &TabId) -> CdpResult<()> {
+        if let Some(page) = self.pages.remove(tab_id) {
+            close_page_target(self.port, &page.target_id).await?;
         }
-        let Some(page) = self.active_page.as_mut() else {
-            unreachable!("active page initialized above")
-        };
-        Ok(page)
+        Ok(())
+    }
+
+    fn page_mut(&mut self, tab_id: &TabId) -> CdpResult<&mut CdpPage> {
+        self.pages.get_mut(tab_id).ok_or_else(|| {
+            CdpError::PageAction(format!("browser tab {} is not connected", tab_id.as_str()))
+        })
     }
 
     /// Terminates the Chromium child process.
@@ -267,16 +303,20 @@ impl Drop for CdpBrowser {
 }
 
 struct CdpPage {
+    target_id: String,
     cdp: CdpConnection,
 }
 
 impl CdpPage {
     async fn create(port: u16) -> CdpResult<Self> {
-        let ws_url = create_page_ws_url(port).await?;
-        let mut cdp = CdpConnection::connect(&ws_url).await?;
+        let target = create_page_target(port).await?;
+        let mut cdp = CdpConnection::connect(&target.web_socket_debugger_url).await?;
         cdp.call("Page.enable", json!({})).await?;
         cdp.call("Runtime.enable", json!({})).await?;
-        Ok(Self { cdp })
+        Ok(Self {
+            target_id: target.id,
+            cdp,
+        })
     }
 
     async fn navigate(&mut self, url: &str) -> CdpResult<SemanticPage> {
@@ -390,7 +430,7 @@ impl CdpPage {
 /// navigation fails, or semantic extraction fails.
 pub async fn fetch_semantic_page(config: &CdpBackendConfig, url: &str) -> CdpResult<SemanticPage> {
     let mut browser = CdpBrowser::launch(config).await?;
-    let result = browser.fetch_semantic_page(url).await;
+    let result = browser.open_tab(TabId::new("tab-0"), url).await;
     let _ = browser.shutdown().await;
     result
 }
@@ -429,6 +469,7 @@ fn allocate_local_port() -> std::io::Result<u16> {
 
 #[derive(Debug, Deserialize)]
 struct DevToolsTarget {
+    id: String,
     #[serde(rename = "webSocketDebuggerUrl")]
     web_socket_debugger_url: String,
 }
@@ -447,15 +488,23 @@ async fn wait_for_devtools(port: u16) -> CdpResult<()> {
     Err(CdpError::DevToolsTimeout)
 }
 
-async fn create_page_ws_url(port: u16) -> CdpResult<String> {
+async fn create_page_target(port: u16) -> CdpResult<DevToolsTarget> {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{port}/json/new?about:blank");
     let response = client.put(&url).send().await?;
-    let target = response
+    response
         .error_for_status()?
         .json::<DevToolsTarget>()
-        .await?;
-    Ok(target.web_socket_debugger_url)
+        .await
+        .map_err(CdpError::Http)
+}
+
+async fn close_page_target(port: u16, target_id: &str) -> CdpResult<()> {
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{port}/json/close/{target_id}");
+    let response = client.get(&url).send().await?;
+    response.error_for_status()?;
+    Ok(())
 }
 
 type WsStream =

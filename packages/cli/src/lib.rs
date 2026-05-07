@@ -82,6 +82,32 @@ pub async fn run() -> Result<u8> {
             )
             .await
         }
+        Command::Switch { tab_id } => {
+            run_navigation(
+                &paths,
+                &config,
+                Request::SwitchTab {
+                    tab_id: trowser_session_models::TabId::new(tab_id),
+                },
+                cli.json,
+            )
+            .await
+        }
+        Command::Close { tab_id } => {
+            run_maybe_navigation(
+                &paths,
+                &config,
+                Request::CloseTab {
+                    tab_id: trowser_session_models::TabId::new(tab_id),
+                },
+                cli.json,
+            )
+            .await
+        }
+        Command::NextTab => run_navigation(&paths, &config, Request::NextTab, cli.json).await,
+        Command::PreviousTab => {
+            run_navigation(&paths, &config, Request::PreviousTab, cli.json).await
+        }
         Command::Tabs => run_tabs(&paths, cli.json).await,
         Command::Paths => Ok(run_paths(&paths, cli.json)),
         Command::Doctor => Ok(run_doctor(&config, cli.json)),
@@ -183,11 +209,40 @@ async fn run_navigation(
 ) -> Result<u8> {
     let client = ensure_server(paths).await?;
     let page = navigation_and_snapshot(&client, request).await?;
+    print_page(config, &page, json)?;
+    Ok(0)
+}
+
+async fn run_maybe_navigation(
+    paths: &ConfigPaths,
+    config: &TrowserConfig,
+    request: Request,
+    json: bool,
+) -> Result<u8> {
+    let client = ensure_server(paths).await?;
+    match client.send(&request).await? {
+        Response::Opened { tab_id } => {
+            let page = snapshot_tab(&client, tab_id).await?;
+            print_page(config, &page, json)?;
+        }
+        Response::Ok if json => println!("{}", serde_json::json!({ "ok": true })),
+        Response::Ok => println!("ok"),
+        Response::Error { message } => anyhow::bail!(message),
+        unexpected => anyhow::bail!("unexpected navigation response: {unexpected:?}"),
+    }
+    Ok(0)
+}
+
+fn print_page(
+    config: &TrowserConfig,
+    page: &trowser_render::SemanticPage,
+    json: bool,
+) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(&page)?);
+        println!("{}", serde_json::to_string_pretty(page)?);
     } else {
         let rendered = render_plain_text(
-            &page,
+            page,
             &TerminalRenderOptions {
                 width: config.render.max_width,
                 image_capabilities: detect_from_env(),
@@ -195,7 +250,7 @@ async fn run_navigation(
         );
         print!("{rendered}");
     }
-    Ok(0)
+    Ok(())
 }
 
 #[allow(
@@ -214,14 +269,16 @@ async fn run_interactive(
         active_snapshot_or_empty(&client).await
     };
     let mut rendered = render_page_document(&page, config);
+    let mut tab_status = tabs_status(&client).await.unwrap_or_default();
     let mut offset = 0usize;
+    let mut search_query = String::new();
     let mut message = String::from(
-        "q quit · j/k scroll · o open · f follow · i input · c click · b back · F forward · r reload",
+        "q quit · j/k scroll · o/t open tab · Tab switch · x close · f follow · i input · c click · b back · F forward · r reload",
     );
     let _guard = TerminalGuard::enter()?;
 
     loop {
-        draw_viewport(&rendered, offset, &message)?;
+        draw_viewport(&page, &rendered, offset, &message, &tab_status)?;
         match read()? {
             Event::Key(key) => match key {
                 KeyEvent {
@@ -255,14 +312,105 @@ async fn run_interactive(
                     ..
                 } => offset = rendered.lines.len().saturating_sub(1),
                 KeyEvent {
-                    code: KeyCode::Char('o'),
+                    code: KeyCode::Char('/'),
+                    ..
+                } => {
+                    if let Some(query) = prompt_input("Search: ")? {
+                        search_query = query;
+                        if let Some(found) = find_line(&rendered, &search_query, 0, true) {
+                            offset = found;
+                            message = format!("found: {search_query}");
+                        } else {
+                            message = format!("not found: {search_query}");
+                        }
+                    }
+                }
+                KeyEvent {
+                    code: KeyCode::Char('n'),
+                    ..
+                } => {
+                    if let Some(found) =
+                        find_line(&rendered, &search_query, offset.saturating_add(1), true)
+                    {
+                        offset = found;
+                        message = format!("found: {search_query}");
+                    }
+                }
+                KeyEvent {
+                    code: KeyCode::Char('N'),
+                    ..
+                } => {
+                    if let Some(found) =
+                        find_line(&rendered, &search_query, offset.saturating_sub(1), false)
+                    {
+                        offset = found;
+                        message = format!("found: {search_query}");
+                    }
+                }
+                KeyEvent {
+                    code: KeyCode::Char('o' | 't'),
                     ..
                 } => {
                     if let Some(url) = prompt_input("Open URL: ")? {
                         page = open_and_snapshot(&client, &url).await?;
                         rendered = render_page_document(&page, config);
+                        tab_status = tabs_status(&client).await.unwrap_or_default();
                         offset = 0;
                         message = format!("opened {url}");
+                    }
+                }
+                KeyEvent {
+                    code: KeyCode::Tab, ..
+                } => match next_tab_and_snapshot(&client).await {
+                    Ok(updated_page) => {
+                        page = updated_page;
+                        rendered = render_page_document(&page, config);
+                        tab_status = tabs_status(&client).await.unwrap_or_default();
+                        offset = 0;
+                        message = "next tab".to_string();
+                    }
+                    Err(error) => message = error.to_string(),
+                },
+                KeyEvent {
+                    code: KeyCode::BackTab,
+                    ..
+                } => match previous_tab_and_snapshot(&client).await {
+                    Ok(updated_page) => {
+                        page = updated_page;
+                        rendered = render_page_document(&page, config);
+                        tab_status = tabs_status(&client).await.unwrap_or_default();
+                        offset = 0;
+                        message = "previous tab".to_string();
+                    }
+                    Err(error) => message = error.to_string(),
+                },
+                KeyEvent {
+                    code: KeyCode::Char('x'),
+                    ..
+                } => match close_active_tab_and_snapshot(&client).await {
+                    Ok(updated_page) => {
+                        page = updated_page;
+                        rendered = render_page_document(&page, config);
+                        tab_status = tabs_status(&client).await.unwrap_or_default();
+                        offset = 0;
+                        message = "closed tab".to_string();
+                    }
+                    Err(error) => message = error.to_string(),
+                },
+                KeyEvent {
+                    code: KeyCode::Char(ch),
+                    ..
+                } if ('1'..='9').contains(&ch) => {
+                    let index = usize::try_from(ch.to_digit(10).unwrap_or(1)).unwrap_or(1);
+                    match switch_tab_index_and_snapshot(&client, index).await {
+                        Ok(updated_page) => {
+                            page = updated_page;
+                            rendered = render_page_document(&page, config);
+                            tab_status = tabs_status(&client).await.unwrap_or_default();
+                            offset = 0;
+                            message = format!("switched to tab {index}");
+                        }
+                        Err(error) => message = error.to_string(),
                     }
                 }
                 KeyEvent {
@@ -427,6 +575,47 @@ async fn forward_and_snapshot(client: &TrowserClient) -> Result<trowser_render::
     navigation_and_snapshot(client, Request::Forward).await
 }
 
+async fn next_tab_and_snapshot(client: &TrowserClient) -> Result<trowser_render::SemanticPage> {
+    navigation_and_snapshot(client, Request::NextTab).await
+}
+
+async fn switch_tab_index_and_snapshot(
+    client: &TrowserClient,
+    one_based_index: usize,
+) -> Result<trowser_render::SemanticPage> {
+    let response = client.send(&Request::ListTabs).await?;
+    let Response::Tabs(snapshot) = response else {
+        anyhow::bail!("unexpected tabs response: {response:?}");
+    };
+    let tab_id = snapshot
+        .tabs
+        .get(one_based_index.saturating_sub(1))
+        .map(|tab| tab.id.clone());
+    let Some(tab_id) = tab_id else {
+        anyhow::bail!("unknown tab index {one_based_index}");
+    };
+    navigation_and_snapshot(client, Request::SwitchTab { tab_id }).await
+}
+
+async fn previous_tab_and_snapshot(client: &TrowserClient) -> Result<trowser_render::SemanticPage> {
+    navigation_and_snapshot(client, Request::PreviousTab).await
+}
+
+async fn close_active_tab_and_snapshot(
+    client: &TrowserClient,
+) -> Result<trowser_render::SemanticPage> {
+    let active = client.send(&Request::ActiveSnapshot).await?;
+    let Response::ActiveSnapshot { tab_id, .. } = active else {
+        return Ok(empty_page("Press o to open a URL."));
+    };
+    match client.send(&Request::CloseTab { tab_id }).await? {
+        Response::Opened { tab_id } => snapshot_tab(client, tab_id).await,
+        Response::Ok => Ok(empty_page("Press o to open a URL.")),
+        Response::Error { message } => anyhow::bail!(message),
+        unexpected => anyhow::bail!("unexpected close response: {unexpected:?}"),
+    }
+}
+
 async fn click_and_snapshot(
     client: &TrowserClient,
     control_id: u32,
@@ -465,18 +654,38 @@ async fn snapshot_tab(
     Ok(page)
 }
 
+async fn tabs_status(client: &TrowserClient) -> Result<String> {
+    let response = client.send(&Request::ListTabs).await?;
+    let Response::Tabs(snapshot) = response else {
+        anyhow::bail!("unexpected tabs response: {response:?}");
+    };
+    if snapshot.tabs.is_empty() {
+        return Ok("no tabs".to_string());
+    }
+    let active_index = snapshot
+        .tabs
+        .iter()
+        .position(|tab| tab.active)
+        .map_or(1, |index| index + 1);
+    Ok(format!("tab {active_index}/{}", snapshot.tabs.len()))
+}
+
 async fn active_snapshot_or_empty(client: &TrowserClient) -> trowser_render::SemanticPage {
     match client.send(&Request::ActiveSnapshot).await {
         Ok(Response::ActiveSnapshot { page, .. }) => page,
-        _ => trowser_render::SemanticPage {
-            url: String::new(),
-            title: "trowser".to_string(),
-            blocks: vec![trowser_render::SemanticBlock::Paragraph {
-                text: "Press o to open a URL.".to_string(),
-                layout: None,
-                region: trowser_render::SemanticRegion::Main,
-            }],
-        },
+        _ => empty_page("Press o to open a URL."),
+    }
+}
+
+fn empty_page(message: &str) -> trowser_render::SemanticPage {
+    trowser_render::SemanticPage {
+        url: String::new(),
+        title: "trowser".to_string(),
+        blocks: vec![trowser_render::SemanticBlock::Paragraph {
+            text: message.to_string(),
+            layout: None,
+            region: trowser_render::SemanticRegion::Main,
+        }],
     }
 }
 
@@ -493,17 +702,30 @@ fn render_page_document(
     )
 }
 
-fn draw_viewport(document: &RenderedDocument, offset: usize, message: &str) -> Result<()> {
+fn draw_viewport(
+    page: &trowser_render::SemanticPage,
+    document: &RenderedDocument,
+    offset: usize,
+    message: &str,
+    tab_status: &str,
+) -> Result<()> {
     let (width, height) = size()?;
     let body_height = height.saturating_sub(2);
     let mut out = stdout();
+    let scroll = scroll_percent(document, offset);
+    let title = if page.title.is_empty() {
+        page.url.as_str()
+    } else {
+        page.title.as_str()
+    };
+    let header = format!("trowser | {tab_status} | {scroll}% | {title}");
 
     queue!(out, BeginSynchronizedUpdate, Hide)?;
     queue!(
         out,
         MoveTo(0, 0),
         Clear(ClearType::CurrentLine),
-        Print("trowser")
+        Print(truncate_for_terminal(&header, width))
     )?;
 
     for row in 0..body_height {
@@ -528,6 +750,43 @@ fn draw_viewport(document: &RenderedDocument, offset: usize, message: &str) -> R
     )?;
     out.flush()?;
     Ok(())
+}
+
+fn scroll_percent(document: &RenderedDocument, offset: usize) -> u8 {
+    let max_offset = document.lines.len().saturating_sub(1);
+    if max_offset == 0 {
+        return 0;
+    }
+    u8::try_from((offset.saturating_mul(100) / max_offset).min(100)).unwrap_or(100)
+}
+
+fn find_line(
+    document: &RenderedDocument,
+    query: &str,
+    start: usize,
+    forward: bool,
+) -> Option<usize> {
+    if query.is_empty() {
+        return None;
+    }
+    let needle = query.to_lowercase();
+    if forward {
+        return document
+            .lines
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find(|(_, line)| line.text.to_lowercase().contains(&needle))
+            .map(|(index, _)| index);
+    }
+    document
+        .lines
+        .iter()
+        .enumerate()
+        .take(start.saturating_add(1))
+        .rev()
+        .find(|(_, line)| line.text.to_lowercase().contains(&needle))
+        .map(|(index, _)| index)
 }
 
 #[derive(Debug, Clone, Copy)]
