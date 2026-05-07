@@ -68,7 +68,7 @@ pub enum Request {
 }
 
 /// Server response sent to a client request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Response {
     /// Protocol handshake response.
     Hello(ServerHello),

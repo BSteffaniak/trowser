@@ -21,7 +21,7 @@ use trowser_browser::{
     BrowserBackend, BrowserCapabilities, BrowserError, BrowserResult, ExtractedPage,
     NavigateRequest,
 };
-use trowser_render::{SemanticBlock, SemanticPage};
+use trowser_render::{BlockLayout, SemanticBlock, SemanticPage, SemanticRegion};
 
 /// Configuration for the Chromium/CDP backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,6 +307,8 @@ impl CdpConnection {
         if page.blocks.is_empty() {
             page.blocks.push(SemanticBlock::Paragraph {
                 text: "No semantic text content was found on this page.".to_string(),
+                layout: None,
+                region: SemanticRegion::Main,
             });
         }
         Ok(page)
@@ -348,58 +350,118 @@ enum CdpSemanticBlock {
     Heading {
         level: u8,
         text: String,
+        layout: Option<BlockLayout>,
+        region: SemanticRegion,
     },
     Paragraph {
         text: String,
+        layout: Option<BlockLayout>,
+        region: SemanticRegion,
+    },
+    ListItem {
+        text: String,
+        layout: Option<BlockLayout>,
+        region: SemanticRegion,
     },
     Link {
         text: String,
         url: String,
+        layout: Option<BlockLayout>,
+        region: SemanticRegion,
     },
     Image {
         alt: String,
         url: String,
         width: Option<u32>,
         height: Option<u32>,
+        layout: Option<BlockLayout>,
+        region: SemanticRegion,
     },
     FormControl {
         label: String,
         control_type: String,
         value: String,
+        layout: Option<BlockLayout>,
+        region: SemanticRegion,
     },
 }
 
 impl CdpSemanticBlock {
     fn into_semantic_block(self) -> SemanticBlock {
         match self {
-            Self::Heading { level, text } => SemanticBlock::Heading { level, text },
-            Self::Paragraph { text } => SemanticBlock::Paragraph { text },
-            Self::Link { text, url } => SemanticBlock::Link { text, url },
+            Self::Heading {
+                level,
+                text,
+                layout,
+                region,
+            } => SemanticBlock::Heading {
+                level,
+                text,
+                layout,
+                region,
+            },
+            Self::Paragraph {
+                text,
+                layout,
+                region,
+            } => SemanticBlock::Paragraph {
+                text,
+                layout,
+                region,
+            },
+            Self::ListItem {
+                text,
+                layout,
+                region,
+            } => SemanticBlock::ListItem {
+                text,
+                layout,
+                region,
+            },
+            Self::Link {
+                text,
+                url,
+                layout,
+                region,
+            } => SemanticBlock::Link {
+                text,
+                url,
+                layout,
+                region,
+            },
             Self::Image {
                 alt,
                 url,
                 width,
                 height,
+                layout,
+                region,
             } => SemanticBlock::Image {
                 alt,
                 url,
                 width,
                 height,
+                layout,
+                region,
             },
             Self::FormControl {
                 label,
                 control_type,
                 value,
+                layout,
+                region,
             } => SemanticBlock::FormControl {
                 label,
                 control_type,
                 value,
+                layout,
+                region,
             },
         }
     }
 }
 
-const DOM_EXTRACTION_JS: &str = r"
+const DOM_EXTRACTION_JS: &str = r#"
 (() => {
   const blocks = [];
   const clean = (value) => (value || '').replace(/\s+/g, ' ').trim();
@@ -409,9 +471,30 @@ const DOM_EXTRACTION_JS: &str = r"
     const rect = el.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
   };
+  const layout = (el) => {
+    const rect = el.getBoundingClientRect();
+    return {
+      x: rect.x + window.scrollX,
+      y: rect.y + window.scrollY,
+      width: rect.width,
+      height: rect.height,
+    };
+  };
+  const region = (el) => {
+    const container = el.closest('main, article, nav, aside, header, footer, [role="main"], [role="article"], [role="navigation"], [role="complementary"], [role="banner"], [role="contentinfo"]');
+    if (!container) return 'Main';
+    const tag = container.tagName.toLowerCase();
+    const role = (container.getAttribute('role') || '').toLowerCase();
+    if (tag === 'main' || tag === 'article' || role === 'main' || role === 'article') return 'Main';
+    if (tag === 'nav' || role === 'navigation') return 'Navigation';
+    if (tag === 'aside' || role === 'complementary') return 'Aside';
+    if (tag === 'header' || role === 'banner') return 'Header';
+    if (tag === 'footer' || role === 'contentinfo') return 'Footer';
+    return 'Main';
+  };
   const pushText = (kind, el, extra = {}) => {
     const text = clean(el.innerText || el.textContent || el.getAttribute('aria-label'));
-    if (text) blocks.push({ kind, text, ...extra });
+    if (text) blocks.push({ kind, text, layout: layout(el), region: region(el), ...extra });
   };
 
   for (const el of document.body.querySelectorAll('h1,h2,h3,h4,h5,h6,p,a,img,input,textarea,button,select,li')) {
@@ -419,9 +502,11 @@ const DOM_EXTRACTION_JS: &str = r"
     const tag = el.tagName.toLowerCase();
     if (/^h[1-6]$/.test(tag)) {
       pushText('heading', el, { level: Number(tag.slice(1)) });
+    } else if (tag === 'li') {
+      pushText('list_item', el);
     } else if (tag === 'a') {
       const text = clean(el.innerText || el.textContent || el.href);
-      if (text || el.href) blocks.push({ kind: 'link', text, url: el.href || '' });
+      if (text || el.href) blocks.push({ kind: 'link', text, url: el.href || '', layout: layout(el), region: region(el) });
     } else if (tag === 'img') {
       blocks.push({
         kind: 'image',
@@ -429,6 +514,8 @@ const DOM_EXTRACTION_JS: &str = r"
         url: el.currentSrc || el.src || '',
         width: el.naturalWidth || null,
         height: el.naturalHeight || null,
+        layout: layout(el),
+        region: region(el),
       });
     } else if (tag === 'input' || tag === 'textarea' || tag === 'button' || tag === 'select') {
       blocks.push({
@@ -436,6 +523,8 @@ const DOM_EXTRACTION_JS: &str = r"
         label: clean(el.labels && el.labels[0] ? el.labels[0].innerText : (el.getAttribute('aria-label') || el.name || el.placeholder || el.innerText)),
         control_type: clean(el.type || tag),
         value: clean(el.value || ''),
+        layout: layout(el),
+        region: region(el),
       });
     } else {
       pushText('paragraph', el);
@@ -448,7 +537,7 @@ const DOM_EXTRACTION_JS: &str = r"
     blocks,
   });
 })()
-";
+"#;
 
 fn default_browser_candidates() -> Vec<String> {
     #[cfg(target_os = "macos")]

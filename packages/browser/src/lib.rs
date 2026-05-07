@@ -56,7 +56,7 @@ pub struct NavigateRequest {
 }
 
 /// Result of a page extraction operation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExtractedPage {
     /// Tab id the page belongs to.
     pub tab_id: TabId,

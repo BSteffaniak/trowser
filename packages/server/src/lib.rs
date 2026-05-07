@@ -17,7 +17,7 @@ use trowser_ipc::{
     ClientHello, PROTOCOL_VERSION, ProtocolCapabilities, Request, Response, ServerHello,
     ServerStatus,
 };
-use trowser_render::{SemanticBlock, SemanticPage};
+use trowser_render::{SemanticBlock, SemanticPage, SemanticRegion};
 use trowser_session_models::{SessionSnapshot, TabId, TabSummary};
 
 /// Daemon errors.
@@ -249,9 +249,13 @@ fn error_page(url: &str, error: &str) -> SemanticPage {
             SemanticBlock::Heading {
                 level: 1,
                 text: "CDP extraction failed".to_string(),
+                layout: None,
+                region: SemanticRegion::Main,
             },
             SemanticBlock::Paragraph {
                 text: error.to_string(),
+                layout: None,
+                region: SemanticRegion::Main,
             },
         ],
     }
