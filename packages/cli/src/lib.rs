@@ -16,12 +16,12 @@ use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton,
     MouseEventKind, read,
 };
-use crossterm::execute;
 use crossterm::style::Print;
 use crossterm::terminal::{
-    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-    enable_raw_mode, size,
+    BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate, EnterAlternateScreen,
+    LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
 };
+use crossterm::{execute, queue};
 use trowser_browser_cdp::discover_browser_binary;
 use trowser_cli_schema::{Cli, Command, ServerCommand};
 use trowser_client::{ClientError, TrowserClient};
@@ -408,28 +408,36 @@ fn render_page_document(
 
 fn draw_viewport(document: &RenderedDocument, offset: usize, message: &str) -> Result<()> {
     let (width, height) = size()?;
-    let body_height = usize::from(height.saturating_sub(2));
+    let body_height = height.saturating_sub(2);
     let mut out = stdout();
-    execute!(out, MoveTo(0, 0), Clear(ClearType::All), Hide)?;
-    execute!(out, Print("trowser"), MoveTo(0, 1))?;
-    for (row, line) in document
-        .lines
-        .iter()
-        .skip(offset)
-        .take(body_height)
-        .enumerate()
-    {
-        execute!(
+
+    queue!(out, BeginSynchronizedUpdate, Hide)?;
+    queue!(
+        out,
+        MoveTo(0, 0),
+        Clear(ClearType::CurrentLine),
+        Print("trowser")
+    )?;
+
+    for row in 0..body_height {
+        let line = document
+            .lines
+            .get(offset + usize::from(row))
+            .map_or("", |line| line.text.as_str());
+        queue!(
             out,
-            MoveTo(0, u16::try_from(row + 1).unwrap_or(u16::MAX)),
-            Print(truncate_for_terminal(&line.text, width))
+            MoveTo(0, row.saturating_add(1)),
+            Clear(ClearType::CurrentLine),
+            Print(truncate_for_terminal(line, width))
         )?;
     }
-    execute!(
+
+    queue!(
         out,
         MoveTo(0, height.saturating_sub(1)),
         Clear(ClearType::CurrentLine),
-        Print(truncate_for_terminal(message, width))
+        Print(truncate_for_terminal(message, width)),
+        EndSynchronizedUpdate
     )?;
     out.flush()?;
     Ok(())
@@ -492,7 +500,13 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
-        execute!(stdout(), EnterAlternateScreen, EnableMouseCapture, Hide)?;
+        execute!(
+            stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            Hide,
+            Clear(ClearType::All)
+        )?;
         Ok(Self)
     }
 }
