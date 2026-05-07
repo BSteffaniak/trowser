@@ -42,6 +42,11 @@ pub enum Command {
     },
     /// Print daemon/client status.
     Status,
+    /// Follow a numbered link from the active page.
+    Follow {
+        /// Link id to follow.
+        link_id: u32,
+    },
     /// List daemon tabs.
     Tabs,
     /// Print resolved paths.

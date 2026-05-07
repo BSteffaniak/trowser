@@ -61,6 +61,8 @@ pub enum Request {
     Open { url: String },
     /// Lists known tabs.
     ListTabs,
+    /// Follows a reader-mode link in the active tab.
+    FollowLink { link_id: u32 },
     /// Returns a semantic snapshot for a tab.
     Snapshot { tab_id: TabId },
     /// Requests graceful daemon shutdown.

@@ -4,7 +4,7 @@
 
 //! Terminal rendering primitives for trowser.
 
-use trowser_render::{SemanticBlock, SemanticPage, SemanticRegion, sanitize_page};
+use trowser_render::{SemanticBlock, SemanticPage, SemanticRegion, reader_blocks, sanitize_page};
 use trowser_terminal_image::TerminalImageCapabilities;
 
 const CSS_PX_PER_CELL_X: f64 = 9.0;
@@ -39,15 +39,10 @@ pub fn render_plain_text(page: &SemanticPage, options: &TerminalRenderOptions) -
     render_header(&page, width, &mut output);
     render_nav_summary(&page, width, &mut output);
 
-    let main_blocks = prioritized_blocks(&page.blocks, SemanticRegion::Main);
-    let fallback_blocks = if main_blocks.is_empty() {
-        page.blocks.iter().collect::<Vec<_>>()
-    } else {
-        main_blocks
-    };
-
-    for (index, block) in fallback_blocks.into_iter().enumerate() {
-        render_reader_block(block, index + 1, width, options, &mut output);
+    let blocks = reader_blocks(&page.blocks);
+    let mut next_link_id = 1usize;
+    for block in blocks {
+        render_reader_block(block, &mut next_link_id, width, options, &mut output);
     }
 
     output
@@ -120,32 +115,9 @@ fn nav_link_label(block: &SemanticBlock) -> Option<String> {
     })
 }
 
-fn prioritized_blocks(blocks: &[SemanticBlock], region: SemanticRegion) -> Vec<&SemanticBlock> {
-    blocks
-        .iter()
-        .filter(|block| block.region() == region)
-        .filter(|block| !is_noise_block(block))
-        .collect()
-}
-
-fn is_noise_block(block: &SemanticBlock) -> bool {
-    match block {
-        SemanticBlock::Image {
-            alt, width, height, ..
-        } => {
-            alt.is_empty()
-                && width
-                    .zip(*height)
-                    .is_some_and(|(width, height)| width <= 140 && height <= 40)
-        }
-        SemanticBlock::Link { text, url, .. } => text.trim().is_empty() && url.trim().is_empty(),
-        _ => false,
-    }
-}
-
 fn render_reader_block(
     block: &SemanticBlock,
-    link_id: usize,
+    next_link_id: &mut usize,
     terminal_width: usize,
     options: &TerminalRenderOptions,
     output: &mut String,
@@ -178,6 +150,8 @@ fn render_reader_block(
             } else {
                 text.as_str()
             };
+            let link_id = *next_link_id;
+            *next_link_id += 1;
             let value = format!("[{link_id}] {label} <{url}>");
             render_wrapped(&value, placement.indent, placement.width, output);
             output.push('\n');

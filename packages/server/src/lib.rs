@@ -17,7 +17,7 @@ use trowser_ipc::{
     ClientHello, PROTOCOL_VERSION, ProtocolCapabilities, Request, Response, ServerHello,
     ServerStatus,
 };
-use trowser_render::{SemanticBlock, SemanticPage, SemanticRegion};
+use trowser_render::{SemanticBlock, SemanticPage, SemanticRegion, reader_links};
 use trowser_session_models::{SessionSnapshot, TabId, TabSummary};
 
 /// Daemon errors.
@@ -153,6 +153,7 @@ impl TrowserServer {
             Request::Status => Response::Status(self.status()),
             Request::Open { url } => self.handle_open(url).await,
             Request::ListTabs => Response::Tabs(self.snapshot().await),
+            Request::FollowLink { link_id } => self.handle_follow_link(link_id).await,
             Request::Snapshot { tab_id } => self.handle_snapshot(&tab_id).await,
             Request::Shutdown => {
                 self.shutdown.notify_waiters();
@@ -189,6 +190,36 @@ impl TrowserServer {
         state.active_tab = Some(tab_id.clone());
         drop(state);
         Response::Opened { tab_id }
+    }
+
+    async fn handle_follow_link(&self, link_id: u32) -> Response {
+        let Some((tab_id, url)) = self.follow_link_target(link_id).await else {
+            return Response::Error {
+                message: format!("unknown link id {link_id}"),
+            };
+        };
+
+        let page = self
+            .fetch_page(&url)
+            .await
+            .unwrap_or_else(|error| error_page(&url, &error.to_string()));
+        let mut state = self.state.lock().await;
+        state.tabs.insert(tab_id.clone(), page);
+        state.active_tab = Some(tab_id.clone());
+        drop(state);
+        Response::Opened { tab_id }
+    }
+
+    async fn follow_link_target(&self, link_id: u32) -> Option<(TabId, String)> {
+        let state = self.state.lock().await;
+        let tab_id = state.active_tab.clone()?;
+        let page = state.tabs.get(&tab_id)?.clone();
+        drop(state);
+        let target = reader_links(&page)
+            .into_iter()
+            .find(|link| link.id == link_id)
+            .map(|link| link.url)?;
+        Some((tab_id, target))
     }
 
     async fn handle_snapshot(&self, tab_id: &TabId) -> Response {

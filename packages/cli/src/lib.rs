@@ -39,6 +39,7 @@ pub async fn run() -> Result<u8> {
         Command::Open { url } => run_open(&paths, &config, &url, cli.json).await,
         Command::Server { command } => run_server(&command, &paths, cli.json).await,
         Command::Status => run_status(&paths, cli.json).await,
+        Command::Follow { link_id } => run_follow(&paths, &config, link_id, cli.json).await,
         Command::Tabs => run_tabs(&paths, cli.json).await,
         Command::Paths => Ok(run_paths(&paths, cli.json)),
         Command::Doctor => Ok(run_doctor(&config, cli.json)),
@@ -76,6 +77,39 @@ async fn run_open(
 
     let Response::Opened { tab_id } = opened else {
         anyhow::bail!("unexpected open response: {opened:?}");
+    };
+
+    let snapshot = client.send(&Request::Snapshot { tab_id }).await?;
+    let Response::Snapshot { page } = snapshot else {
+        anyhow::bail!("unexpected snapshot response: {snapshot:?}");
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&page)?);
+    } else {
+        let rendered = render_plain_text(
+            &page,
+            &TerminalRenderOptions {
+                width: config.render.max_width,
+                image_capabilities: detect_from_env(),
+            },
+        );
+        print!("{rendered}");
+    }
+
+    Ok(0)
+}
+
+async fn run_follow(
+    paths: &ConfigPaths,
+    config: &TrowserConfig,
+    link_id: u32,
+    json: bool,
+) -> Result<u8> {
+    let client = ensure_server(paths).await?;
+    let followed = client.send(&Request::FollowLink { link_id }).await?;
+    let Response::Opened { tab_id } = followed else {
+        anyhow::bail!("unexpected follow response: {followed:?}");
     };
 
     let snapshot = client.send(&Request::Snapshot { tab_id }).await?;

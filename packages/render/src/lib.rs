@@ -58,6 +58,17 @@ pub enum SemanticRegion {
     Unknown,
 }
 
+/// Link target exposed by reader-mode rendering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReaderLink {
+    /// One-based link id shown in terminal output.
+    pub id: u32,
+    /// Link text.
+    pub text: String,
+    /// Link target URL.
+    pub url: String,
+}
+
 /// Terminal-renderable semantic block.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SemanticBlock {
@@ -131,6 +142,61 @@ impl SemanticBlock {
             | Self::Image { region, .. }
             | Self::FormControl { region, .. } => *region,
         }
+    }
+}
+
+/// Returns reader-mode link targets in the same order used by the terminal renderer.
+#[must_use]
+pub fn reader_links(page: &SemanticPage) -> Vec<ReaderLink> {
+    let blocks = reader_blocks(&page.blocks);
+    blocks
+        .into_iter()
+        .filter_map(|block| {
+            let SemanticBlock::Link { text, url, .. } = block else {
+                return None;
+            };
+            Some((text, url))
+        })
+        .enumerate()
+        .map(|(index, (text, url))| ReaderLink {
+            id: u32::try_from(index + 1).unwrap_or(u32::MAX),
+            text: text.clone(),
+            url: url.clone(),
+        })
+        .collect()
+}
+
+/// Returns semantic blocks prioritized for reader-mode rendering.
+#[must_use]
+pub fn reader_blocks(blocks: &[SemanticBlock]) -> Vec<&SemanticBlock> {
+    let main_blocks = blocks
+        .iter()
+        .filter(|block| block.region() == SemanticRegion::Main)
+        .filter(|block| !is_noise_block(block))
+        .collect::<Vec<_>>();
+
+    if main_blocks.is_empty() {
+        blocks
+            .iter()
+            .filter(|block| !is_noise_block(block))
+            .collect()
+    } else {
+        main_blocks
+    }
+}
+
+fn is_noise_block(block: &SemanticBlock) -> bool {
+    match block {
+        SemanticBlock::Image {
+            alt, width, height, ..
+        } => {
+            alt.is_empty()
+                && width
+                    .zip(*height)
+                    .is_some_and(|(width, height)| width <= 140 && height <= 40)
+        }
+        SemanticBlock::Link { text, url, .. } => text.trim().is_empty() && url.trim().is_empty(),
+        _ => false,
     }
 }
 
@@ -228,7 +294,9 @@ fn sanitize_block(block: &SemanticBlock) -> SemanticBlock {
 
 #[cfg(test)]
 mod tests {
-    use super::{SemanticBlock, SemanticPage, SemanticRegion, sanitize_terminal_text};
+    use super::{
+        SemanticBlock, SemanticPage, SemanticRegion, reader_links, sanitize_terminal_text,
+    };
 
     #[test]
     fn strips_escape_characters() {
@@ -250,5 +318,23 @@ mod tests {
         };
         let encoded = serde_json::to_string(&block).expect("serialize block");
         assert!(encoded.contains("Paragraph"));
+    }
+
+    #[test]
+    fn reader_links_are_numbered() {
+        let page = SemanticPage {
+            url: String::new(),
+            title: String::new(),
+            blocks: vec![SemanticBlock::Link {
+                text: "Example".to_string(),
+                url: "https://example.com".to_string(),
+                layout: None,
+                region: SemanticRegion::Main,
+            }],
+        };
+
+        let links = reader_links(&page);
+        assert_eq!(links[0].id, 1);
+        assert_eq!(links[0].url, "https://example.com");
     }
 }
