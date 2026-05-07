@@ -155,6 +155,8 @@ impl TrowserServer {
             Request::Hello(hello) => Self::handle_hello(&hello),
             Request::Status => Response::Status(self.status()),
             Request::Open { url } => self.handle_open(url).await,
+            Request::ActiveSnapshot => self.handle_active_snapshot().await,
+            Request::Reload => self.handle_reload().await,
             Request::ListTabs => Response::Tabs(self.snapshot().await),
             Request::FollowLink { link_id } => self.handle_follow_link(link_id).await,
             Request::Snapshot { tab_id } => self.handle_snapshot(&tab_id).await,
@@ -224,6 +226,47 @@ impl TrowserServer {
             .find(|link| link.id == link_id)
             .map(|link| link.url)?;
         Some((tab_id, target))
+    }
+
+    async fn handle_active_snapshot(&self) -> Response {
+        let state = self.state.lock().await;
+        let Some(tab_id) = state.active_tab.clone() else {
+            return Response::Error {
+                message: "no active tab".to_string(),
+            };
+        };
+        let Some(page) = state.tabs.get(&tab_id).cloned() else {
+            return Response::Error {
+                message: format!("unknown active tab {}", tab_id.as_str()),
+            };
+        };
+        drop(state);
+        Response::ActiveSnapshot { tab_id, page }
+    }
+
+    async fn handle_reload(&self) -> Response {
+        let Some((tab_id, url)) = self.active_tab_url().await else {
+            return Response::Error {
+                message: "no active tab".to_string(),
+            };
+        };
+        let page = self
+            .fetch_page(&url)
+            .await
+            .unwrap_or_else(|error| error_page(&url, &error.to_string()));
+        let mut state = self.state.lock().await;
+        state.tabs.insert(tab_id.clone(), page);
+        state.active_tab = Some(tab_id.clone());
+        drop(state);
+        Response::Opened { tab_id }
+    }
+
+    async fn active_tab_url(&self) -> Option<(TabId, String)> {
+        let state = self.state.lock().await;
+        let tab_id = state.active_tab.clone()?;
+        let url = state.tabs.get(&tab_id)?.url.clone();
+        drop(state);
+        Some((tab_id, url))
     }
 
     async fn handle_snapshot(&self, tab_id: &TabId) -> Response {

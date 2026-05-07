@@ -59,6 +59,10 @@ pub enum Request {
     Status,
     /// Opens or navigates a tab to a URL.
     Open { url: String },
+    /// Returns a semantic snapshot for the active tab.
+    ActiveSnapshot,
+    /// Reloads the active tab.
+    Reload,
     /// Lists known tabs.
     ListTabs,
     /// Follows a reader-mode link in the active tab.
@@ -82,6 +86,8 @@ pub enum Response {
     Tabs(SessionSnapshot),
     /// Semantic page snapshot response.
     Snapshot { page: SemanticPage },
+    /// Active tab semantic page snapshot response.
+    ActiveSnapshot { tab_id: TabId, page: SemanticPage },
     /// Empty success response.
     Ok,
     /// Error response.

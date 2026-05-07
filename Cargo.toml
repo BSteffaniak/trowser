@@ -72,6 +72,7 @@ bmux_codec = { git = "https://github.com/BSteffaniak/bmux", branch = "master", p
 # External dependencies
 anyhow = { version = "1.0.98", default-features = false }
 clap = { version = "4.5.40", default-features = false }
+crossterm = { version = "0.29.0", default-features = false }
 dirs = { version = "6.0.0", default-features = false }
 futures-util = { version = "0.3.31", default-features = false }
 profiling = { version = "1.0.17", default-features = false }

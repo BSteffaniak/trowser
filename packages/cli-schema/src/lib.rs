@@ -33,7 +33,12 @@ pub enum Command {
     Open {
         /// URL to open.
         url: String,
+        /// Stay in an interactive terminal viewport after opening.
+        #[arg(long, short = 'i')]
+        interactive: bool,
     },
+    /// Start interactive terminal browser mode.
+    Interactive,
     /// Manage the trowser daemon.
     Server {
         /// Server command.

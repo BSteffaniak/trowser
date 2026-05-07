@@ -5,11 +5,20 @@
 //! Command-line interface for trowser.
 
 use std::fs::OpenOptions;
+use std::io::{Write, stdout};
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
+use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, read};
+use crossterm::execute;
+use crossterm::style::Print;
+use crossterm::terminal::{
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+    enable_raw_mode, size,
+};
 use trowser_browser_cdp::discover_browser_binary;
 use trowser_cli_schema::{Cli, Command, ServerCommand};
 use trowser_client::{ClientError, TrowserClient};
@@ -35,8 +44,15 @@ pub async fn run() -> Result<u8> {
     let paths = ConfigPaths::resolve();
     let config = TrowserConfig::load(&paths)?;
 
-    match cli.command.unwrap_or(Command::Doctor) {
-        Command::Open { url } => run_open(&paths, &config, &url, cli.json).await,
+    match cli.command.unwrap_or(Command::Interactive) {
+        Command::Open { url, interactive } if interactive => {
+            run_interactive(&paths, &config, Some(url)).await
+        }
+        Command::Open {
+            url,
+            interactive: _,
+        } => run_open(&paths, &config, &url, cli.json).await,
+        Command::Interactive => run_interactive(&paths, &config, None).await,
         Command::Server { command } => run_server(&command, &paths, cli.json).await,
         Command::Status => run_status(&paths, cli.json).await,
         Command::Follow { link_id } => run_follow(&paths, &config, link_id, cli.json).await,
@@ -131,6 +147,243 @@ async fn run_follow(
     }
 
     Ok(0)
+}
+
+async fn run_interactive(
+    paths: &ConfigPaths,
+    config: &TrowserConfig,
+    initial_url: Option<String>,
+) -> Result<u8> {
+    let client = ensure_server(paths).await?;
+    let mut page = if let Some(url) = initial_url {
+        open_and_snapshot(&client, &url).await?
+    } else {
+        active_snapshot_or_empty(&client).await
+    };
+    let mut rendered = render_page_lines(&page, config);
+    let mut offset = 0usize;
+    let mut message = String::from("q quit · j/k scroll · o open · f follow · r reload");
+    let _guard = TerminalGuard::enter()?;
+
+    loop {
+        draw_viewport(&rendered, offset, &message)?;
+        let Event::Key(key) = read()? else {
+            continue;
+        };
+        match key {
+            KeyEvent {
+                code: KeyCode::Char('q'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => break,
+            KeyEvent {
+                code: KeyCode::Char('j') | KeyCode::Down,
+                ..
+            } => {
+                offset = offset
+                    .saturating_add(1)
+                    .min(rendered.len().saturating_sub(1));
+            }
+            KeyEvent {
+                code: KeyCode::Char('k') | KeyCode::Up,
+                ..
+            } => offset = offset.saturating_sub(1),
+            KeyEvent {
+                code: KeyCode::Char('g'),
+                ..
+            } => offset = 0,
+            KeyEvent {
+                code: KeyCode::Char('G'),
+                ..
+            } => offset = rendered.len().saturating_sub(1),
+            KeyEvent {
+                code: KeyCode::Char('o'),
+                ..
+            } => {
+                if let Some(url) = prompt_input("Open URL: ")? {
+                    page = open_and_snapshot(&client, &url).await?;
+                    rendered = render_page_lines(&page, config);
+                    offset = 0;
+                    message = format!("opened {url}");
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Char('f'),
+                ..
+            } => {
+                if let Some(raw) = prompt_input("Follow link: ")?
+                    && let Ok(link_id) = raw.trim().parse::<u32>()
+                {
+                    page = follow_and_snapshot(&client, link_id).await?;
+                    rendered = render_page_lines(&page, config);
+                    offset = 0;
+                    message = format!("followed link {link_id}");
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Char('r'),
+                ..
+            } => {
+                page = reload_and_snapshot(&client).await?;
+                rendered = render_page_lines(&page, config);
+                offset = 0;
+                message = "reloaded".to_string();
+            }
+            _ => {}
+        }
+    }
+
+    Ok(0)
+}
+
+async fn open_and_snapshot(
+    client: &TrowserClient,
+    url: &str,
+) -> Result<trowser_render::SemanticPage> {
+    let opened = client
+        .send(&Request::Open {
+            url: url.to_string(),
+        })
+        .await?;
+    let Response::Opened { tab_id } = opened else {
+        anyhow::bail!("unexpected open response: {opened:?}");
+    };
+    snapshot_tab(client, tab_id).await
+}
+
+async fn follow_and_snapshot(
+    client: &TrowserClient,
+    link_id: u32,
+) -> Result<trowser_render::SemanticPage> {
+    let followed = client.send(&Request::FollowLink { link_id }).await?;
+    let Response::Opened { tab_id } = followed else {
+        anyhow::bail!("unexpected follow response: {followed:?}");
+    };
+    snapshot_tab(client, tab_id).await
+}
+
+async fn reload_and_snapshot(client: &TrowserClient) -> Result<trowser_render::SemanticPage> {
+    let reloaded = client.send(&Request::Reload).await?;
+    let Response::Opened { tab_id } = reloaded else {
+        anyhow::bail!("unexpected reload response: {reloaded:?}");
+    };
+    snapshot_tab(client, tab_id).await
+}
+
+async fn snapshot_tab(
+    client: &TrowserClient,
+    tab_id: trowser_session_models::TabId,
+) -> Result<trowser_render::SemanticPage> {
+    let snapshot = client.send(&Request::Snapshot { tab_id }).await?;
+    let Response::Snapshot { page } = snapshot else {
+        anyhow::bail!("unexpected snapshot response: {snapshot:?}");
+    };
+    Ok(page)
+}
+
+async fn active_snapshot_or_empty(client: &TrowserClient) -> trowser_render::SemanticPage {
+    match client.send(&Request::ActiveSnapshot).await {
+        Ok(Response::ActiveSnapshot { page, .. }) => page,
+        _ => trowser_render::SemanticPage {
+            url: String::new(),
+            title: "trowser".to_string(),
+            blocks: vec![trowser_render::SemanticBlock::Paragraph {
+                text: "Press o to open a URL.".to_string(),
+                layout: None,
+                region: trowser_render::SemanticRegion::Main,
+            }],
+        },
+    }
+}
+
+fn render_page_lines(page: &trowser_render::SemanticPage, config: &TrowserConfig) -> Vec<String> {
+    render_plain_text(
+        page,
+        &TerminalRenderOptions {
+            width: config.render.max_width,
+            image_capabilities: detect_from_env(),
+        },
+    )
+    .lines()
+    .map(str::to_string)
+    .collect()
+}
+
+fn draw_viewport(lines: &[String], offset: usize, message: &str) -> Result<()> {
+    let (width, height) = size()?;
+    let body_height = usize::from(height.saturating_sub(2));
+    let mut out = stdout();
+    execute!(out, MoveTo(0, 0), Clear(ClearType::All), Hide)?;
+    execute!(out, Print("trowser"), MoveTo(0, 1))?;
+    for (row, line) in lines.iter().skip(offset).take(body_height).enumerate() {
+        execute!(
+            out,
+            MoveTo(0, u16::try_from(row + 1).unwrap_or(u16::MAX)),
+            Print(truncate_for_terminal(line, width))
+        )?;
+    }
+    execute!(
+        out,
+        MoveTo(0, height.saturating_sub(1)),
+        Clear(ClearType::CurrentLine),
+        Print(truncate_for_terminal(message, width))
+    )?;
+    out.flush()?;
+    Ok(())
+}
+
+fn truncate_for_terminal(text: &str, width: u16) -> String {
+    text.chars().take(usize::from(width)).collect()
+}
+
+fn prompt_input(prompt: &str) -> Result<Option<String>> {
+    let (_, height) = size()?;
+    let mut out = stdout();
+    let mut input = String::new();
+    loop {
+        execute!(
+            out,
+            MoveTo(0, height.saturating_sub(1)),
+            Clear(ClearType::CurrentLine),
+            Print(prompt),
+            Print(&input)
+        )?;
+        out.flush()?;
+        let Event::Key(key) = read()? else {
+            continue;
+        };
+        match key.code {
+            KeyCode::Enter => return Ok(Some(input)),
+            KeyCode::Esc => return Ok(None),
+            KeyCode::Backspace => {
+                input.pop();
+            }
+            KeyCode::Char(ch) => input.push(ch),
+            _ => {}
+        }
+    }
+}
+
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        execute!(stdout(), EnterAlternateScreen, Hide)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(stdout(), Show, LeaveAlternateScreen);
+    }
 }
 
 async fn run_server(command: &ServerCommand, paths: &ConfigPaths, json: bool) -> Result<u8> {
