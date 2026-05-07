@@ -10,7 +10,8 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify};
-use trowser_config::ConfigPaths;
+use trowser_browser_cdp::{CdpBackendConfig, fetch_semantic_page};
+use trowser_config::{ConfigPaths, TrowserConfig};
 use trowser_ipc::{
     ClientHello, PROTOCOL_VERSION, ProtocolCapabilities, Request, Response, ServerHello,
     ServerStatus,
@@ -43,6 +44,7 @@ struct ServerState {
 #[derive(Debug, Clone)]
 pub struct TrowserServer {
     paths: ConfigPaths,
+    config: TrowserConfig,
     state: Arc<Mutex<ServerState>>,
     shutdown: Arc<Notify>,
 }
@@ -50,9 +52,10 @@ pub struct TrowserServer {
 impl TrowserServer {
     /// Creates a daemon runtime.
     #[must_use]
-    pub fn new(paths: ConfigPaths) -> Self {
+    pub fn new(paths: ConfigPaths, config: TrowserConfig) -> Self {
         Self {
             paths,
+            config,
             state: Arc::new(Mutex::new(ServerState::default())),
             shutdown: Arc::new(Notify::new()),
         }
@@ -173,10 +176,13 @@ impl TrowserServer {
     }
 
     async fn handle_open(&self, url: String) -> Response {
+        let page = self
+            .fetch_page(&url)
+            .await
+            .unwrap_or_else(|error| error_page(&url, &error.to_string()));
         let mut state = self.state.lock().await;
         let tab_id = TabId::new(format!("tab-{}", state.next_tab_id));
         state.next_tab_id += 1;
-        let page = placeholder_page(&url);
         state.tabs.insert(tab_id.clone(), page);
         state.active_tab = Some(tab_id.clone());
         drop(state);
@@ -191,6 +197,14 @@ impl TrowserServer {
             },
             |page| Response::Snapshot { page },
         )
+    }
+
+    async fn fetch_page(&self, url: &str) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
+        let config = CdpBackendConfig {
+            browser_binary: self.config.browser.binary.clone(),
+            headless: self.config.browser.headless,
+        };
+        fetch_semantic_page(&config, url).await
     }
 
     async fn snapshot(&self) -> SessionSnapshot {
@@ -213,19 +227,17 @@ impl TrowserServer {
     }
 }
 
-fn placeholder_page(url: &str) -> SemanticPage {
+fn error_page(url: &str, error: &str) -> SemanticPage {
     SemanticPage {
         url: url.to_string(),
-        title: format!("Queued: {url}"),
+        title: format!("Failed to load: {url}"),
         blocks: vec![
             SemanticBlock::Heading {
                 level: 1,
-                text: "trowser daemon is real".to_string(),
+                text: "CDP extraction failed".to_string(),
             },
             SemanticBlock::Paragraph {
-                text: format!(
-                    "The daemon accepted navigation to {url}. Chromium/CDP extraction is the next backend step."
-                ),
+                text: error.to_string(),
             },
         ],
     }

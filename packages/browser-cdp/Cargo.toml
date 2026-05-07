@@ -11,6 +11,14 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+futures-util           = { workspace = true, features = ["sink", "std"] }
+reqwest                = { workspace = true }
+serde                  = { workspace = true, features = ["derive"] }
+serde_json             = { workspace = true, features = ["std"] }
+tempfile               = { workspace = true }
+thiserror              = { workspace = true }
+tokio                  = { workspace = true, features = ["process", "time"] }
+tokio-tungstenite      = { workspace = true }
 trowser_browser        = { workspace = true }
 trowser_render         = { workspace = true }
 trowser_session_models = { workspace = true }

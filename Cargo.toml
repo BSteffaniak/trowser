@@ -73,11 +73,20 @@ bmux_codec = { git = "https://github.com/BSteffaniak/bmux", branch = "master", p
 anyhow = { version = "1.0.98", default-features = false }
 clap = { version = "4.5.40", default-features = false }
 dirs = { version = "6.0.0", default-features = false }
+futures-util = { version = "0.3.31", default-features = false }
 profiling = { version = "1.0.17", default-features = false }
+reqwest = { version = "0.12.28", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
 serde = { version = "1.0.219", default-features = false, features = ["std"] }
 serde_json = { version = "1.0.140", default-features = false }
+tempfile = { version = "3.27.0", default-features = false }
 thiserror = { version = "2.0.12", default-features = false }
 tokio = { version = "1.45.1", default-features = false }
+tokio-tungstenite = { version = "0.28.0", default-features = false, features = [
+    "connect",
+] }
 toml = { version = "0.8.23", default-features = false, features = [
     "display",
     "parse",

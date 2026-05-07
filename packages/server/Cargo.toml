@@ -23,6 +23,7 @@ tokio = { workspace = true, features = [
     "signal",
     "sync",
 ] }
+trowser_browser_cdp = { workspace = true }
 trowser_config = { workspace = true }
 trowser_ipc = { workspace = true }
 trowser_render = { workspace = true }
@@ -32,6 +33,7 @@ trowser_session_models = { workspace = true }
 default = []
 fail-on-warnings = [
     "bmux_codec/fail-on-warnings",
+    "trowser_browser_cdp/fail-on-warnings",
     "trowser_config/fail-on-warnings",
     "trowser_ipc/fail-on-warnings",
     "trowser_render/fail-on-warnings",

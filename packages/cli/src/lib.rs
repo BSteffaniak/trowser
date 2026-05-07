@@ -99,7 +99,8 @@ async fn run_open(
 }
 
 async fn run_server(command: &ServerCommand, paths: &ConfigPaths, json: bool) -> Result<u8> {
-    let server = TrowserServer::new(paths.clone());
+    let config = TrowserConfig::load(paths)?;
+    let server = TrowserServer::new(paths.clone(), config);
     match command {
         ServerCommand::Start { foreground } => {
             if !foreground {
