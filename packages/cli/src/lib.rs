@@ -5,9 +5,9 @@
 //! Command-line interface for trowser.
 
 use std::fs::OpenOptions;
-use std::io::{Write, stdout};
-use std::process::Stdio;
-use std::time::Duration;
+use std::io::{ErrorKind, Write, stdout};
+use std::process::{Command as ProcessCommand, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
@@ -917,8 +917,10 @@ async fn ensure_server(paths: &ConfigPaths) -> Result<TrowserClient> {
     let client = TrowserClient::new(paths.clone());
     match client.send(&Request::Status).await {
         Ok(_) => Ok(client),
-        Err(error) if should_restart_daemon(&error) => {
-            remove_stale_socket(paths)?;
+        Err(error) if should_recover_daemon(&error) => {
+            let allow_legacy_scan = !matches!(&error, ClientError::Connect { .. });
+            let _ = terminate_daemon(paths, allow_legacy_scan).await?;
+            remove_stale_runtime_files(paths)?;
             run_server_start_background(paths, false).await?;
             Ok(TrowserClient::new(paths.clone()))
         }
@@ -926,15 +928,15 @@ async fn ensure_server(paths: &ConfigPaths) -> Result<TrowserClient> {
     }
 }
 
-fn should_restart_daemon(error: &ClientError) -> bool {
+fn should_recover_daemon(error: &ClientError) -> bool {
     match error {
         ClientError::Connect { .. } => true,
         ClientError::Io(error) => matches!(
             error.kind(),
-            std::io::ErrorKind::UnexpectedEof
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::ConnectionAborted
-                | std::io::ErrorKind::BrokenPipe
+            ErrorKind::UnexpectedEof
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::BrokenPipe
         ),
         ClientError::Encode(_)
         | ClientError::Server(_)
@@ -948,6 +950,19 @@ fn remove_stale_socket(paths: &ConfigPaths) -> Result<()> {
         std::fs::remove_file(&socket)?;
     }
     Ok(())
+}
+
+fn remove_stale_pid_file(paths: &ConfigPaths) -> Result<()> {
+    let pid_file = paths.daemon_pid_path();
+    if pid_file.exists() {
+        std::fs::remove_file(pid_file)?;
+    }
+    Ok(())
+}
+
+fn remove_stale_runtime_files(paths: &ConfigPaths) -> Result<()> {
+    remove_stale_socket(paths)?;
+    remove_stale_pid_file(paths)
 }
 
 async fn run_server_start_background(paths: &ConfigPaths, json: bool) -> Result<u8> {
@@ -968,7 +983,7 @@ async fn run_server_start_background(paths: &ConfigPaths, json: bool) -> Result<
     let log_for_stderr = log.try_clone()?;
 
     let exe = std::env::current_exe()?;
-    let mut command = std::process::Command::new(exe);
+    let mut command = ProcessCommand::new(exe);
     command
         .arg("server")
         .arg("start")
@@ -1021,18 +1036,207 @@ fn report_server_started(paths: &ConfigPaths, log_path: &std::path::Path, json: 
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopOutcome {
+    Stopped,
+    NotRunning,
+}
+
 async fn run_server_stop(paths: &ConfigPaths, json: bool) -> Result<()> {
-    let client = TrowserClient::new(paths.clone());
-    let response = client.send(&Request::Shutdown).await?;
-    if response != Response::Ok {
-        anyhow::bail!("unexpected shutdown response: {response:?}");
-    }
+    let outcome = request_shutdown_or_terminate(paths).await?;
     if json {
-        println!("{}", serde_json::json!({ "server": "stopped" }));
+        println!(
+            "{}",
+            serde_json::json!({
+                "server": match outcome {
+                    StopOutcome::Stopped => "stopped",
+                    StopOutcome::NotRunning => "not_running",
+                }
+            })
+        );
     } else {
-        println!("trowser daemon stopped");
+        match outcome {
+            StopOutcome::Stopped => println!("trowser daemon stopped"),
+            StopOutcome::NotRunning => println!("trowser daemon is not running"),
+        }
     }
     Ok(())
+}
+
+async fn request_shutdown_or_terminate(paths: &ConfigPaths) -> Result<StopOutcome> {
+    let client = TrowserClient::new(paths.clone());
+    match client.send(&Request::Shutdown).await {
+        Ok(Response::Ok) => {
+            if wait_for_daemon_shutdown(paths, Duration::from_secs(2)).await {
+                remove_stale_runtime_files(paths)?;
+                Ok(StopOutcome::Stopped)
+            } else {
+                terminate_daemon(paths, true).await
+            }
+        }
+        Ok(response) => anyhow::bail!("unexpected shutdown response: {response:?}"),
+        Err(error) if should_recover_daemon(&error) => terminate_daemon(paths, true).await,
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn wait_for_daemon_shutdown(paths: &ConfigPaths, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !paths.server_socket_path().exists() {
+            return true;
+        }
+
+        let client = TrowserClient::new(paths.clone());
+        if let Err(error) = client.send(&Request::Status).await
+            && should_recover_daemon(&error)
+        {
+            return true;
+        }
+
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn terminate_daemon(paths: &ConfigPaths, allow_legacy_scan: bool) -> Result<StopOutcome> {
+    if let Some(pid) = read_pid_file(paths)? {
+        if process_exists(pid) {
+            terminate_pid(pid).await?;
+            remove_stale_runtime_files(paths)?;
+            return Ok(StopOutcome::Stopped);
+        }
+        remove_stale_runtime_files(paths)?;
+        return Ok(StopOutcome::NotRunning);
+    }
+
+    if !allow_legacy_scan {
+        remove_stale_runtime_files(paths)?;
+        return Ok(StopOutcome::NotRunning);
+    }
+
+    match legacy_daemon_pids()?[..] {
+        [] => {
+            remove_stale_runtime_files(paths)?;
+            Ok(StopOutcome::NotRunning)
+        }
+        [pid] => {
+            terminate_pid(pid).await?;
+            remove_stale_runtime_files(paths)?;
+            Ok(StopOutcome::Stopped)
+        }
+        ref pids => anyhow::bail!(
+            "found multiple trowser daemon processes without a pid file: {pids:?}; stop one manually or use a runtime-specific pid file"
+        ),
+    }
+}
+
+fn read_pid_file(paths: &ConfigPaths) -> Result<Option<u32>> {
+    let pid_file = paths.daemon_pid_path();
+    if !pid_file.exists() {
+        return Ok(None);
+    }
+
+    let contents = std::fs::read_to_string(&pid_file)?;
+    if let Some(pid) = parse_pid(contents.trim()) {
+        Ok(Some(pid))
+    } else {
+        std::fs::remove_file(pid_file)?;
+        Ok(None)
+    }
+}
+
+fn parse_pid(value: &str) -> Option<u32> {
+    let pid = value.parse::<u32>().ok()?;
+    (pid > 0).then_some(pid)
+}
+
+async fn terminate_pid(pid: u32) -> Result<()> {
+    send_signal(pid, "TERM")?;
+    if wait_for_pid_exit(pid, Duration::from_secs(3)).await {
+        return Ok(());
+    }
+
+    send_signal(pid, "KILL")?;
+    if wait_for_pid_exit(pid, Duration::from_secs(2)).await {
+        return Ok(());
+    }
+
+    anyhow::bail!("failed to stop trowser daemon process {pid}")
+}
+
+fn send_signal(pid: u32, signal: &str) -> Result<()> {
+    let status = ProcessCommand::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() || !process_exists(pid) {
+        return Ok(());
+    }
+    anyhow::bail!("failed to send SIG{signal} to trowser daemon process {pid}")
+}
+
+async fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !process_exists(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn process_exists(pid: u32) -> bool {
+    ProcessCommand::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn legacy_daemon_pids() -> Result<Vec<u32>> {
+    let output = ProcessCommand::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!("failed to list processes while looking for a legacy trowser daemon");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(legacy_daemon_pids_from_ps(&stdout, std::process::id()))
+}
+
+fn legacy_daemon_pids_from_ps(output: &str, current_pid: u32) -> Vec<u32> {
+    output
+        .lines()
+        .filter_map(parse_ps_line)
+        .filter(|(pid, command)| *pid != current_pid && daemon_process_matches(command))
+        .map(|(pid, _)| pid)
+        .collect()
+}
+
+fn parse_ps_line(line: &str) -> Option<(u32, &str)> {
+    let trimmed = line.trim_start();
+    let split_index = trimmed.find(char::is_whitespace)?;
+    let (pid, command) = trimmed.split_at(split_index);
+    Some((parse_pid(pid)?, command.trim_start()))
+}
+
+fn daemon_process_matches(command: &str) -> bool {
+    let command = command.replace('\0', " ");
+    command.contains("trowser")
+        && command.contains(" server ")
+        && command.contains(" start")
+        && command.contains("--foreground")
 }
 
 async fn run_status(paths: &ConfigPaths, json: bool) -> Result<u8> {
@@ -1087,6 +1291,7 @@ fn run_paths(paths: &ConfigPaths, json: bool) -> u8 {
                 "state_dir": paths.state_dir(),
                 "log_dir": paths.log_dir(),
                 "server_socket": paths.server_socket_path(),
+                "daemon_pid": paths.daemon_pid_path(),
             })
         );
     } else {
@@ -1096,6 +1301,7 @@ fn run_paths(paths: &ConfigPaths, json: bool) -> u8 {
         println!("state: {}", paths.state_dir().display());
         println!("logs: {}", paths.log_dir().display());
         println!("socket: {}", paths.server_socket_path().display());
+        println!("pid: {}", paths.daemon_pid_path().display());
     }
     0
 }
@@ -1123,4 +1329,51 @@ fn run_doctor(config: &TrowserConfig, json: bool) -> u8 {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{daemon_process_matches, legacy_daemon_pids_from_ps, parse_pid, parse_ps_line};
+
+    #[test]
+    fn parses_valid_positive_pid() {
+        assert_eq!(parse_pid("1234"), Some(1234));
+        assert_eq!(parse_pid("0"), None);
+        assert_eq!(parse_pid("not-a-pid"), None);
+    }
+
+    #[test]
+    fn parses_ps_lines_with_commands() {
+        assert_eq!(
+            parse_ps_line("  42 /tmp/trowser server start --foreground"),
+            Some((42, "/tmp/trowser server start --foreground"))
+        );
+        assert_eq!(parse_ps_line("not-a-pid /tmp/trowser"), None);
+    }
+
+    #[test]
+    fn matches_only_foreground_trowser_daemons() {
+        assert!(daemon_process_matches(
+            "/repo/target/debug/trowser server start --foreground"
+        ));
+        assert!(daemon_process_matches(
+            "/repo/target/debug/trowser\0server\0start\0--foreground"
+        ));
+        assert!(!daemon_process_matches(
+            "/repo/target/debug/trowser server stop"
+        ));
+        assert!(!daemon_process_matches(
+            "/usr/bin/other server start --foreground"
+        ));
+    }
+
+    #[test]
+    fn finds_legacy_daemon_pids_from_ps_output() {
+        let output = "\
+              10 /repo/target/debug/trowser server start --foreground\n\
+              11 /repo/target/debug/trowser server stop\n\
+              12 /usr/bin/other server start --foreground\n\
+              13 /repo/target/debug/trowser server start --foreground\n";
+        assert_eq!(legacy_daemon_pids_from_ps(output, 13), vec![10]);
+    }
 }

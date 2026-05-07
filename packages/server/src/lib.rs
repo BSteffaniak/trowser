@@ -105,12 +105,19 @@ impl TrowserServer {
                 tokio::fs::remove_file(&socket_path).await?;
             }
             let listener = tokio::net::UnixListener::bind(&socket_path)?;
+            let pid_path = self.paths.daemon_pid_path();
+            write_pid_file(&pid_path).await?;
             write_ready_file_if_requested(&socket_path).await?;
+            let mut terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
             loop {
                 tokio::select! {
                     signal = tokio::signal::ctrl_c() => {
                         signal?;
+                        break;
+                    }
+                    _ = terminate.recv() => {
                         break;
                     }
                     () = self.shutdown.notified() => {
@@ -132,6 +139,7 @@ impl TrowserServer {
             if socket_path.exists() {
                 tokio::fs::remove_file(&socket_path).await?;
             }
+            remove_pid_file_if_current(&pid_path).await?;
             Ok(())
         }
         #[cfg(not(unix))]
@@ -171,7 +179,6 @@ impl TrowserServer {
             Request::FollowLink { link_id } => self.handle_follow_link(link_id).await,
             Request::Snapshot { tab_id } => self.handle_snapshot(&tab_id).await,
             Request::Shutdown => {
-                self.shutdown_browser().await;
                 self.shutdown.notify_waiters();
                 Response::Ok
             }
@@ -592,6 +599,26 @@ impl TrowserServer {
             active_tab: state.active_tab.clone(),
         }
     }
+}
+
+async fn write_pid_file(pid_path: &Path) -> ServerResult<()> {
+    if let Some(parent) = pid_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(pid_path, std::process::id().to_string()).await?;
+    Ok(())
+}
+
+async fn remove_pid_file_if_current(pid_path: &Path) -> ServerResult<()> {
+    if !pid_path.exists() {
+        return Ok(());
+    }
+
+    let contents = tokio::fs::read_to_string(pid_path).await?;
+    if contents.trim() == std::process::id().to_string() {
+        tokio::fs::remove_file(pid_path).await?;
+    }
+    Ok(())
 }
 
 async fn write_ready_file_if_requested(socket_path: &Path) -> ServerResult<()> {

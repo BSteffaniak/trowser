@@ -236,6 +236,12 @@ impl ConfigPaths {
     pub fn server_socket_path(&self) -> PathBuf {
         self.runtime_dir.join("trowser.sock")
     }
+
+    /// Returns the local daemon pid file path.
+    #[must_use]
+    pub fn daemon_pid_path(&self) -> PathBuf {
+        self.runtime_dir.join("daemon.pid")
+    }
 }
 
 impl Default for ConfigPaths {
