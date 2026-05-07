@@ -20,7 +20,6 @@ pub struct SemanticPage {
 
 /// Terminal-renderable semantic block.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SemanticBlock {
     /// Heading with one-based HTML-like level.
     Heading { level: u8, text: String },
@@ -119,6 +118,6 @@ mod tests {
             text: "hello".to_string(),
         };
         let encoded = serde_json::to_string(&block).expect("serialize block");
-        assert!(encoded.contains("paragraph"));
+        assert!(encoded.contains("Paragraph"));
     }
 }

@@ -22,6 +22,8 @@ pub const TROWSER_DATA_DIR_ENV: &str = "TROWSER_DATA_DIR";
 pub const TROWSER_STATE_DIR_ENV: &str = "TROWSER_STATE_DIR";
 /// Environment variable that overrides the log directory.
 pub const TROWSER_LOG_DIR_ENV: &str = "TROWSER_LOG_DIR";
+/// Internal environment variable used by the parent CLI to request daemon readiness signaling.
+pub const TROWSER_DAEMON_READY_FILE_ENV: &str = "TROWSER_DAEMON_READY_FILE";
 
 /// Config loading error.
 #[derive(Debug, Error)]

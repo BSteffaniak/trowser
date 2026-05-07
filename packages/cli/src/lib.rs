@@ -4,6 +4,7 @@
 
 //! Command-line interface for trowser.
 
+use std::fs::OpenOptions;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use clap::Parser;
 use trowser_browser_cdp::discover_browser_binary;
 use trowser_cli_schema::{Cli, Command, ServerCommand};
 use trowser_client::{ClientError, TrowserClient};
-use trowser_config::{ConfigPaths, TrowserConfig};
+use trowser_config::{ConfigPaths, TROWSER_DAEMON_READY_FILE_ENV, TrowserConfig};
 use trowser_ipc::{Request, Response, ServerStatus};
 use trowser_server::TrowserServer;
 use trowser_terminal::{TerminalRenderOptions, render_plain_text};
@@ -135,7 +136,8 @@ async fn ensure_server(paths: &ConfigPaths) -> Result<TrowserClient> {
     let client = TrowserClient::new(paths.clone());
     match client.send(&Request::Status).await {
         Ok(_) => Ok(client),
-        Err(ClientError::Connect { .. }) => {
+        Err(error) if should_restart_daemon(&error) => {
+            remove_stale_socket(paths)?;
             run_server_start_background(paths, false).await?;
             Ok(TrowserClient::new(paths.clone()))
         }
@@ -143,41 +145,99 @@ async fn ensure_server(paths: &ConfigPaths) -> Result<TrowserClient> {
     }
 }
 
+fn should_restart_daemon(error: &ClientError) -> bool {
+    match error {
+        ClientError::Connect { .. } => true,
+        ClientError::Io(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+        ),
+        ClientError::Encode(_)
+        | ClientError::Server(_)
+        | ClientError::TransportUnavailable { .. } => false,
+    }
+}
+
+fn remove_stale_socket(paths: &ConfigPaths) -> Result<()> {
+    let socket = paths.server_socket_path();
+    if socket.exists() {
+        std::fs::remove_file(&socket)?;
+    }
+    Ok(())
+}
+
 async fn run_server_start_background(paths: &ConfigPaths, json: bool) -> Result<u8> {
+    remove_stale_socket(paths)?;
+    std::fs::create_dir_all(paths.runtime_dir())?;
+    std::fs::create_dir_all(paths.log_dir())?;
+
+    let ready_file = paths.runtime_dir().join("daemon.ready");
+    if ready_file.exists() {
+        std::fs::remove_file(&ready_file)?;
+    }
+
+    let log_path = paths.log_dir().join("daemon.log");
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let log_for_stderr = log.try_clone()?;
+
     let exe = std::env::current_exe()?;
     let mut command = std::process::Command::new(exe);
     command
         .arg("server")
         .arg("start")
         .arg("--foreground")
+        .env(TROWSER_DAEMON_READY_FILE_ENV, &ready_file)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let _child = command.spawn()?;
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_for_stderr));
+    let mut child = command.spawn()?;
 
-    let client = TrowserClient::new(paths.clone());
-    for _ in 0..50 {
-        if client.send(&Request::Status).await.is_ok() {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "server": "started",
-                        "socket": paths.server_socket_path(),
-                    })
-                );
-            } else {
-                println!("trowser daemon started");
+    loop {
+        if ready_file.exists() {
+            let client = TrowserClient::new(paths.clone());
+            if client.send(&Request::Status).await.is_ok() {
+                report_server_started(paths, &log_path, json);
+                return Ok(0);
             }
-            return Ok(0);
+            if let Err(error) = child.kill() {
+                eprintln!("failed to kill unhealthy trowser daemon: {error}");
+            }
+            anyhow::bail!(
+                "trowser daemon wrote readiness file but failed health check; log: {}",
+                log_path.display()
+            );
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
 
-    anyhow::bail!(
-        "timed out waiting for trowser daemon at {}",
-        paths.server_socket_path().display()
-    )
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "trowser daemon exited during startup with status {status}; log: {}",
+                log_path.display()
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn report_server_started(paths: &ConfigPaths, log_path: &std::path::Path, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "server": "started",
+                "socket": paths.server_socket_path(),
+                "log": log_path,
+            })
+        );
+    } else {
+        println!("trowser daemon started");
+    }
 }
 
 async fn run_server_stop(paths: &ConfigPaths, json: bool) -> Result<()> {

@@ -302,7 +302,8 @@ impl CdpConnection {
             .and_then(|value| value.get("value"))
             .and_then(Value::as_str)
             .ok_or(CdpError::MissingField("Runtime.evaluate.result.value"))?;
-        let mut page: SemanticPage = serde_json::from_str(page_json)?;
+        let page: CdpSemanticPage = serde_json::from_str(page_json)?;
+        let mut page = page.into_semantic_page();
         if page.blocks.is_empty() {
             page.blocks.push(SemanticBlock::Paragraph {
                 text: "No semantic text content was found on this page.".to_string(),
@@ -318,6 +319,84 @@ struct CdpMessage {
     method: Option<String>,
     result: Option<Value>,
     error: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CdpSemanticPage {
+    url: String,
+    title: String,
+    blocks: Vec<CdpSemanticBlock>,
+}
+
+impl CdpSemanticPage {
+    fn into_semantic_page(self) -> SemanticPage {
+        SemanticPage {
+            url: self.url,
+            title: self.title,
+            blocks: self
+                .blocks
+                .into_iter()
+                .map(CdpSemanticBlock::into_semantic_block)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum CdpSemanticBlock {
+    Heading {
+        level: u8,
+        text: String,
+    },
+    Paragraph {
+        text: String,
+    },
+    Link {
+        text: String,
+        url: String,
+    },
+    Image {
+        alt: String,
+        url: String,
+        width: Option<u32>,
+        height: Option<u32>,
+    },
+    FormControl {
+        label: String,
+        control_type: String,
+        value: String,
+    },
+}
+
+impl CdpSemanticBlock {
+    fn into_semantic_block(self) -> SemanticBlock {
+        match self {
+            Self::Heading { level, text } => SemanticBlock::Heading { level, text },
+            Self::Paragraph { text } => SemanticBlock::Paragraph { text },
+            Self::Link { text, url } => SemanticBlock::Link { text, url },
+            Self::Image {
+                alt,
+                url,
+                width,
+                height,
+            } => SemanticBlock::Image {
+                alt,
+                url,
+                width,
+                height,
+            },
+            Self::FormControl {
+                label,
+                control_type,
+                value,
+            } => SemanticBlock::FormControl {
+                label,
+                control_type,
+                value,
+            },
+        }
+    }
 }
 
 const DOM_EXTRACTION_JS: &str = r"

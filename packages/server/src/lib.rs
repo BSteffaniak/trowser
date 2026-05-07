@@ -5,13 +5,14 @@
 //! Daemon runtime for trowser.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify};
 use trowser_browser_cdp::{CdpBackendConfig, fetch_semantic_page};
-use trowser_config::{ConfigPaths, TrowserConfig};
+use trowser_config::{ConfigPaths, TROWSER_DAEMON_READY_FILE_ENV, TrowserConfig};
 use trowser_ipc::{
     ClientHello, PROTOCOL_VERSION, ProtocolCapabilities, Request, Response, ServerHello,
     ServerStatus,
@@ -102,6 +103,7 @@ impl TrowserServer {
                 tokio::fs::remove_file(&socket_path).await?;
             }
             let listener = tokio::net::UnixListener::bind(&socket_path)?;
+            write_ready_file_if_requested(&socket_path).await?;
 
             loop {
                 tokio::select! {
@@ -225,6 +227,18 @@ impl TrowserServer {
             active_tab: state.active_tab.clone(),
         }
     }
+}
+
+async fn write_ready_file_if_requested(socket_path: &Path) -> ServerResult<()> {
+    let Some(ready_path) = std::env::var_os(TROWSER_DAEMON_READY_FILE_ENV) else {
+        return Ok(());
+    };
+    let ready_path = std::path::PathBuf::from(ready_path);
+    if let Some(parent) = ready_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&ready_path, socket_path.to_string_lossy().as_bytes()).await?;
+    Ok(())
 }
 
 fn error_page(url: &str, error: &str) -> SemanticPage {

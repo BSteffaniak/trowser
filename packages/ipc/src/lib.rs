@@ -52,7 +52,6 @@ pub struct ProtocolCapabilities {
 
 /// Client request sent to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     /// Protocol handshake.
     Hello(ClientHello),
@@ -70,7 +69,6 @@ pub enum Request {
 
 /// Server response sent to a client request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     /// Protocol handshake response.
     Hello(ServerHello),
