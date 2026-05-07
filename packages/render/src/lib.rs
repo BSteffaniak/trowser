@@ -58,6 +58,9 @@ pub enum SemanticRegion {
     Unknown,
 }
 
+/// Maximum number of header/navigation links rendered in the reader nav summary.
+pub const NAV_SUMMARY_LINK_LIMIT: usize = 6;
+
 /// Link target exposed by reader-mode rendering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReaderLink {
@@ -148,21 +151,39 @@ impl SemanticBlock {
 /// Returns reader-mode link targets in the same order used by the terminal renderer.
 #[must_use]
 pub fn reader_links(page: &SemanticPage) -> Vec<ReaderLink> {
-    let blocks = reader_blocks(&page.blocks);
-    blocks
+    nav_link_blocks(&page.blocks)
         .into_iter()
-        .filter_map(|block| {
+        .chain(
+            reader_blocks(&page.blocks)
+                .into_iter()
+                .filter(|block| matches!(block, SemanticBlock::Link { .. })),
+        )
+        .enumerate()
+        .filter_map(|(index, block)| {
             let SemanticBlock::Link { text, url, .. } = block else {
                 return None;
             };
-            Some((text, url))
+            Some(ReaderLink {
+                id: u32::try_from(index + 1).unwrap_or(u32::MAX),
+                text: text.clone(),
+                url: url.clone(),
+            })
         })
-        .enumerate()
-        .map(|(index, (text, url))| ReaderLink {
-            id: u32::try_from(index + 1).unwrap_or(u32::MAX),
-            text: text.clone(),
-            url: url.clone(),
+        .collect()
+}
+
+fn nav_link_blocks(blocks: &[SemanticBlock]) -> Vec<&SemanticBlock> {
+    blocks
+        .iter()
+        .filter(|block| {
+            matches!(
+                block.region(),
+                SemanticRegion::Header | SemanticRegion::Navigation
+            )
         })
+        .filter(|block| matches!(block, SemanticBlock::Link { .. }))
+        .filter(|block| !is_noise_block(block))
+        .take(NAV_SUMMARY_LINK_LIMIT)
         .collect()
 }
 

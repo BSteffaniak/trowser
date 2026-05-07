@@ -4,7 +4,10 @@
 
 //! Terminal rendering primitives for trowser.
 
-use trowser_render::{SemanticBlock, SemanticPage, SemanticRegion, reader_blocks, sanitize_page};
+use trowser_render::{
+    NAV_SUMMARY_LINK_LIMIT, SemanticBlock, SemanticPage, SemanticRegion, reader_blocks,
+    sanitize_page,
+};
 use trowser_terminal_image::TerminalImageCapabilities;
 
 const CSS_PX_PER_CELL_X: f64 = 9.0;
@@ -123,11 +126,11 @@ pub fn render_document(page: &SemanticPage, options: &TerminalRenderOptions) -> 
     let mut document = RenderedDocument::default();
 
     push_header_lines(&page, width, &mut document);
-    push_nav_summary_lines(&page, width, &mut document);
 
     let blocks = reader_blocks(&page.blocks);
     let mut next_link_id = 1usize;
     let mut next_control_id = 1usize;
+    push_nav_summary_lines(&page, width, &mut next_link_id, &mut document);
     for block in blocks {
         push_reader_block_lines(
             block,
@@ -148,10 +151,35 @@ fn push_header_lines(page: &SemanticPage, width: usize, document: &mut RenderedD
     push_text_lines(document, &output, None);
 }
 
-fn push_nav_summary_lines(page: &SemanticPage, width: usize, document: &mut RenderedDocument) {
-    let mut output = String::new();
-    render_nav_summary(page, width, &mut output);
-    push_text_lines(document, &output, None);
+fn push_nav_summary_lines(
+    page: &SemanticPage,
+    width: usize,
+    next_link_id: &mut usize,
+    document: &mut RenderedDocument,
+) {
+    let nav_links = page
+        .blocks
+        .iter()
+        .filter_map(nav_link_target)
+        .take(NAV_SUMMARY_LINK_LIMIT)
+        .collect::<Vec<_>>();
+
+    if nav_links.is_empty() {
+        return;
+    }
+
+    document.lines.push(RenderedLine {
+        text: "nav:".to_string(),
+        links: Vec::new(),
+        controls: Vec::new(),
+    });
+    for (label, url) in nav_links {
+        let link_id = u32::try_from(*next_link_id).unwrap_or(u32::MAX);
+        *next_link_id += 1;
+        let value = format!("[{link_id}] {label} <{url}>");
+        push_wrapped_lines(document, &value, 0, width, Some(link_id));
+    }
+    document.lines.push(RenderedLine::default());
 }
 
 fn push_reader_block_lines(
@@ -294,8 +322,9 @@ fn push_wrapped_control_lines(
 
 fn control_action(control_type: &str) -> ControlHitboxAction {
     match control_type {
-        "button" | "submit" | "reset" | "image" => ControlHitboxAction::Click,
-        _ => ControlHitboxAction::InputText,
+        "text" | "search" | "email" | "password" | "tel" | "url" | "number" | "textarea"
+        | "select" => ControlHitboxAction::InputText,
+        _ => ControlHitboxAction::Click,
     }
 }
 
@@ -348,24 +377,7 @@ fn render_header(page: &SemanticPage, width: usize, output: &mut String) {
     output.push_str("\n\n");
 }
 
-fn render_nav_summary(page: &SemanticPage, width: usize, output: &mut String) {
-    let nav_links = page
-        .blocks
-        .iter()
-        .filter_map(nav_link_label)
-        .take(6)
-        .collect::<Vec<_>>();
-
-    if nav_links.is_empty() {
-        return;
-    }
-
-    let nav = format!("nav: {}", nav_links.join(" | "));
-    render_wrapped(&nav, 0, width, output);
-    output.push('\n');
-}
-
-fn nav_link_label(block: &SemanticBlock) -> Option<String> {
+fn nav_link_target(block: &SemanticBlock) -> Option<(String, String)> {
     let SemanticBlock::Link {
         text, url, region, ..
     } = block
@@ -377,11 +389,14 @@ fn nav_link_label(block: &SemanticBlock) -> Option<String> {
         return None;
     }
 
-    Some(if text.is_empty() {
-        url.clone()
-    } else {
-        text.clone()
-    })
+    Some((
+        if text.is_empty() {
+            url.clone()
+        } else {
+            text.clone()
+        },
+        url.clone(),
+    ))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -480,14 +495,6 @@ fn render_box_line(text: &str, indent: usize, width: usize, output: &mut String)
         output.push_str(&fit_line(&line, width.saturating_sub(4), ' '));
         output.push(' ');
         output.push('│');
-        output.push('\n');
-    }
-}
-
-fn render_wrapped(text: &str, indent: usize, width: usize, output: &mut String) {
-    for line in wrap_lines(text, width) {
-        output.push_str(&" ".repeat(indent));
-        output.push_str(&line);
         output.push('\n');
     }
 }

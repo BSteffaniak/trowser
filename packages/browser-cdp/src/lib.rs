@@ -773,9 +773,13 @@ const DOM_EXTRACTION_JS: &str = r#"
     const text = clean(el.innerText || el.textContent || el.getAttribute('aria-label'));
     if (text) blocks.push({ kind, text, layout: layout(el), region: region(el), ...extra });
   };
-  window.trowserVisibleControls = () => Array.from(document.body.querySelectorAll('input,textarea,button,select')).filter(visible);
+  const controlSelector = 'input,textarea,button,select,[role="button"],[role="menuitem"],[aria-haspopup],[aria-expanded],[onclick]';
+  const isControl = (el) => el.matches(controlSelector) && !el.matches('a[href]');
+  const controlType = (el) => clean(el.getAttribute('role') || el.type || el.tagName.toLowerCase());
+  const controlLabel = (el) => clean(el.labels && el.labels[0] ? el.labels[0].innerText : (el.getAttribute('aria-label') || el.getAttribute('title') || el.name || el.placeholder || el.innerText || el.textContent));
+  window.trowserVisibleControls = () => Array.from(document.body.querySelectorAll(controlSelector)).filter((el) => visible(el) && isControl(el));
 
-  for (const el of document.body.querySelectorAll('h1,h2,h3,h4,h5,h6,p,a,img,input,textarea,button,select,li')) {
+  for (const el of document.body.querySelectorAll(`h1,h2,h3,h4,h5,h6,p,a,img,li,${controlSelector}`)) {
     if (!visible(el)) continue;
     const tag = el.tagName.toLowerCase();
     if (/^h[1-6]$/.test(tag)) {
@@ -795,11 +799,11 @@ const DOM_EXTRACTION_JS: &str = r#"
         layout: layout(el),
         region: region(el),
       });
-    } else if (tag === 'input' || tag === 'textarea' || tag === 'button' || tag === 'select') {
+    } else if (isControl(el)) {
       blocks.push({
         kind: 'form_control',
-        label: clean(el.labels && el.labels[0] ? el.labels[0].innerText : (el.getAttribute('aria-label') || el.name || el.placeholder || el.innerText)),
-        control_type: clean(el.type || tag),
+        label: controlLabel(el),
+        control_type: controlType(el),
         value: clean(el.value || ''),
         layout: layout(el),
         region: region(el),
