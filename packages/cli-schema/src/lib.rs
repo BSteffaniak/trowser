@@ -42,6 +42,8 @@ pub enum Command {
     },
     /// Print daemon/client status.
     Status,
+    /// List daemon tabs.
+    Tabs,
     /// Print resolved paths.
     Paths,
     /// Print terminal capability information.

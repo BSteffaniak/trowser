@@ -11,12 +11,29 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bmux_codec = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "signal",
+    "sync",
+] }
 trowser_config = { workspace = true }
-trowser_ipc    = { workspace = true }
+trowser_ipc = { workspace = true }
+trowser_render = { workspace = true }
+trowser_session_models = { workspace = true }
 
 [features]
 default = []
 fail-on-warnings = [
+    "bmux_codec/fail-on-warnings",
     "trowser_config/fail-on-warnings",
     "trowser_ipc/fail-on-warnings",
+    "trowser_render/fail-on-warnings",
+    "trowser_session_models/fail-on-warnings",
 ]

@@ -15,7 +15,23 @@ The goal is a daemon-backed terminal browser that uses real browser engines for 
 
 ## Current status
 
-Initial workspace scaffold. The browser backend and terminal UI are not implemented yet.
+Initial workspace scaffold plus a working local daemon/client IPC vertical slice:
+
+```bash
+# Start the daemon in the foreground
+cargo run -p trowser_cli -- server start --foreground
+
+# In another terminal, query the daemon
+cargo run -p trowser_cli -- status
+
+# Open a URL through the daemon and render the placeholder semantic page
+cargo run -p trowser_cli -- open https://example.com
+
+# Stop the daemon
+cargo run -p trowser_cli -- server stop
+```
+
+`doctor` detects terminal image support and looks for a Chromium-compatible binary. Real CDP navigation/extraction is the next implementation step.
 
 ## Development
 

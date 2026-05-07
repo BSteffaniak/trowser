@@ -28,26 +28,36 @@ clap = { workspace = true, features = [
     "usage",
 ] }
 serde_json = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "time",
+] }
 tracing-subscriber = { workspace = true, optional = true, features = [
     "env-filter",
     "fmt",
     "std",
 ] }
+trowser_browser_cdp = { workspace = true }
 trowser_cli_schema = { workspace = true }
 trowser_client = { workspace = true }
 trowser_config = { workspace = true }
 trowser_ipc = { workspace = true }
 trowser_server = { workspace = true }
+trowser_terminal = { workspace = true }
 trowser_terminal_image = { workspace = true }
 
 [features]
 default = []
 fail-on-warnings = [
+    "trowser_browser_cdp/fail-on-warnings",
     "trowser_cli_schema/fail-on-warnings",
     "trowser_client/fail-on-warnings",
     "trowser_config/fail-on-warnings",
     "trowser_ipc/fail-on-warnings",
     "trowser_server/fail-on-warnings",
+    "trowser_terminal/fail-on-warnings",
     "trowser_terminal_image/fail-on-warnings",
 ]
 profile-trace = ["dep:tracing-subscriber"]

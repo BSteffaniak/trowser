@@ -4,8 +4,9 @@
 
 use std::process::ExitCode;
 
-fn main() -> ExitCode {
-    match trowser_cli::run() {
+#[tokio::main]
+async fn main() -> ExitCode {
+    match trowser_cli::run().await {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
             eprintln!("trowser error: {error:#}");
