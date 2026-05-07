@@ -1,0 +1,24 @@
+[package]
+authors     = { workspace = true }
+categories  = ["web-programming"]
+description = "Backend-neutral browser abstractions for trowser"
+edition     = { workspace = true }
+keywords    = ["browser", "trowser"]
+license     = { workspace = true }
+name        = "trowser_browser"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde                  = { workspace = true, features = ["derive"] }
+thiserror              = { workspace = true }
+trowser_render         = { workspace = true }
+trowser_session_models = { workspace = true }
+
+[features]
+default = []
+fail-on-warnings = [
+    "trowser_render/fail-on-warnings",
+    "trowser_session_models/fail-on-warnings",
+]

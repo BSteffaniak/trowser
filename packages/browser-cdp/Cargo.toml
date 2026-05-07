@@ -1,0 +1,24 @@
+[package]
+authors     = { workspace = true }
+categories  = ["web-programming"]
+description = "Chromium CDP browser backend for trowser"
+edition     = { workspace = true }
+keywords    = ["browser", "cdp", "chromium", "trowser"]
+license     = { workspace = true }
+name        = "trowser_browser_cdp"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+trowser_browser        = { workspace = true }
+trowser_render         = { workspace = true }
+trowser_session_models = { workspace = true }
+
+[features]
+default = []
+fail-on-warnings = [
+    "trowser_browser/fail-on-warnings",
+    "trowser_render/fail-on-warnings",
+    "trowser_session_models/fail-on-warnings",
+]

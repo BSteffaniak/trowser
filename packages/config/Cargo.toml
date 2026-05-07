@@ -1,0 +1,21 @@
+[package]
+authors     = { workspace = true }
+categories  = ["config"]
+description = "Configuration and path handling for trowser"
+edition     = { workspace = true }
+keywords    = ["config", "trowser"]
+license     = { workspace = true }
+name        = "trowser_config"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+dirs      = { workspace = true }
+serde     = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+toml      = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -1,0 +1,18 @@
+[package]
+authors     = { workspace = true }
+categories  = ["data-structures"]
+description = "Session model types for trowser"
+edition     = { workspace = true }
+keywords    = ["models", "session", "trowser"]
+license     = { workspace = true }
+name        = "trowser_session_models"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+
+[features]
+default          = []
+fail-on-warnings = []

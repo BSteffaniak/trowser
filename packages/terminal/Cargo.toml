@@ -1,0 +1,22 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-utilities", "rendering"]
+description = "Terminal rendering primitives for trowser"
+edition     = { workspace = true }
+keywords    = ["terminal", "trowser", "tui"]
+license     = { workspace = true }
+name        = "trowser_terminal"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+trowser_render         = { workspace = true }
+trowser_terminal_image = { workspace = true }
+
+[features]
+default = []
+fail-on-warnings = [
+    "trowser_render/fail-on-warnings",
+    "trowser_terminal_image/fail-on-warnings",
+]

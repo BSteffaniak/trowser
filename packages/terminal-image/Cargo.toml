@@ -1,0 +1,21 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-utilities", "rendering"]
+description = "Terminal image capability detection for trowser"
+edition     = { workspace = true }
+keywords    = ["image", "terminal", "trowser"]
+license     = { workspace = true }
+name        = "trowser_terminal_image"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+
+[features]
+default          = []
+fail-on-warnings = []
+iterm2           = []
+kitty            = []
+sixel            = []

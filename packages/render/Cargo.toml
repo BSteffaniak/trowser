@@ -1,0 +1,21 @@
+[package]
+authors     = { workspace = true }
+categories  = ["rendering"]
+description = "Semantic render model and sanitization for trowser"
+edition     = { workspace = true }
+keywords    = ["render", "terminal", "trowser"]
+license     = { workspace = true }
+name        = "trowser_render"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+serde_json = { workspace = true, features = ["std"] }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -1,0 +1,24 @@
+exclude = []
+include = [
+    "*.toml",
+    ".cargo/*.toml",
+    ".clippier/**/*.toml",
+    "packages/*/*.toml",
+    "packages/*/*/*.toml",
+    "packages/*/*/*/*.toml",
+    "packages/*/*/*/*/*.toml",
+    "packages/*/*/*/*/*/*.toml",
+    "packages/*/*/*/*/*/*/*.toml",
+    "packages/*/*/*/*/*/*/.cargo/*.toml",
+    "packages/*/*/*/*/*/.cargo/*.toml",
+    "packages/*/*/*/*/.cargo/*.toml",
+    "packages/*/*/*/.cargo/*.toml",
+    "packages/*/*/.cargo/*.toml",
+    "packages/*/.cargo/*.toml",
+]
+
+[formatting]
+align_entries  = true
+indent_string  = "    "
+reorder_arrays = true
+reorder_keys   = true

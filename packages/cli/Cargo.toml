@@ -1,0 +1,53 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-utilities"]
+description = "Command-line interface for trowser"
+edition     = { workspace = true }
+keywords    = ["browser", "cli", "terminal", "trowser"]
+license     = { workspace = true }
+name        = "trowser_cli"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+name = "trowser_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "trowser"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true, features = ["std"] }
+clap = { workspace = true, features = [
+    "derive",
+    "env",
+    "help",
+    "std",
+    "usage",
+] }
+serde_json = { workspace = true, features = ["std"] }
+tracing-subscriber = { workspace = true, optional = true, features = [
+    "env-filter",
+    "fmt",
+    "std",
+] }
+trowser_cli_schema = { workspace = true }
+trowser_client = { workspace = true }
+trowser_config = { workspace = true }
+trowser_ipc = { workspace = true }
+trowser_server = { workspace = true }
+trowser_terminal_image = { workspace = true }
+
+[features]
+default = []
+fail-on-warnings = [
+    "trowser_cli_schema/fail-on-warnings",
+    "trowser_client/fail-on-warnings",
+    "trowser_config/fail-on-warnings",
+    "trowser_ipc/fail-on-warnings",
+    "trowser_server/fail-on-warnings",
+    "trowser_terminal_image/fail-on-warnings",
+]
+profile-trace = ["dep:tracing-subscriber"]

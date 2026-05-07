@@ -1,0 +1,23 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-utilities"]
+description = "Client API for talking to the trowser daemon"
+edition     = { workspace = true }
+keywords    = ["client", "trowser"]
+license     = { workspace = true }
+name        = "trowser_client"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+thiserror      = { workspace = true }
+trowser_config = { workspace = true }
+trowser_ipc    = { workspace = true }
+
+[features]
+default = []
+fail-on-warnings = [
+    "trowser_config/fail-on-warnings",
+    "trowser_ipc/fail-on-warnings",
+]

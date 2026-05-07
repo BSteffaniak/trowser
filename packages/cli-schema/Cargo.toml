@@ -1,0 +1,24 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-utilities"]
+description = "CLI schema for trowser"
+edition     = { workspace = true }
+keywords    = ["cli", "trowser"]
+license     = { workspace = true }
+name        = "trowser_cli_schema"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+clap = { workspace = true, features = [
+    "derive",
+    "env",
+    "help",
+    "std",
+    "usage",
+] }
+
+[features]
+default          = []
+fail-on-warnings = []

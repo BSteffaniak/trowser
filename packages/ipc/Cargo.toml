@@ -1,0 +1,25 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-utilities"]
+description = "IPC protocol models for trowser"
+edition     = { workspace = true }
+keywords    = ["ipc", "protocol", "trowser"]
+license     = { workspace = true }
+name        = "trowser_ipc"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_codec             = { workspace = true }
+serde                  = { workspace = true, features = ["derive"] }
+trowser_render         = { workspace = true }
+trowser_session_models = { workspace = true }
+
+[features]
+default = []
+fail-on-warnings = [
+    "bmux_codec/fail-on-warnings",
+    "trowser_render/fail-on-warnings",
+    "trowser_session_models/fail-on-warnings",
+]

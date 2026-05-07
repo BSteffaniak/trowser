@@ -1,0 +1,86 @@
+[workspace]
+members = [
+    "packages/browser",
+    "packages/browser-cdp",
+    "packages/cli",
+    "packages/cli-schema",
+    "packages/client",
+    "packages/config",
+    "packages/ipc",
+    "packages/render",
+    "packages/server",
+    "packages/session/models",
+    "packages/terminal",
+    "packages/terminal-image",
+    "packages/trowser",
+]
+resolver = "2"
+
+[profile.release]
+codegen-units = 1
+lto           = false
+opt-level     = 3
+strip         = "symbols"
+
+[profile.debug-release]
+debug    = true
+inherits = "release"
+strip    = "none"
+
+[profile.release-lto]
+inherits = "release"
+lto      = "fat"
+
+[profile.release-lto-no-panic]
+inherits = "release-lto"
+panic    = "abort"
+
+[profile.small]
+inherits  = "release-lto-no-panic"
+opt-level = "z"
+
+[profile.fast]
+inherits  = "dev"
+opt-level = 0
+
+[workspace.package]
+authors    = ["Braden Steffaniak"]
+edition    = "2024"
+license    = "MPL-2.0"
+repository = "https://github.com/BSteffaniak/trowser"
+version    = "0.0.1-alpha.0"
+
+[workspace.dependencies]
+# Internal trowser packages
+trowser                = { version = "0.0.1-alpha.0", default-features = false, path = "packages/trowser" }
+trowser_browser        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/browser" }
+trowser_browser_cdp    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/browser-cdp" }
+trowser_cli            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli" }
+trowser_cli_schema     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli-schema" }
+trowser_client         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/client" }
+trowser_config         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config" }
+trowser_ipc            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ipc" }
+trowser_render         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/render" }
+trowser_server         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }
+trowser_session_models = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session/models" }
+trowser_terminal       = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal" }
+trowser_terminal_image = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal-image" }
+
+# Shared dependencies from bmux
+bmux_codec = { git = "https://github.com/BSteffaniak/bmux", branch = "master", package = "bmux_codec", default-features = false }
+
+# External dependencies
+anyhow = { version = "1.0.98", default-features = false }
+clap = { version = "4.5.40", default-features = false }
+dirs = { version = "6.0.0", default-features = false }
+profiling = { version = "1.0.17", default-features = false }
+serde = { version = "1.0.219", default-features = false, features = ["std"] }
+serde_json = { version = "1.0.140", default-features = false }
+thiserror = { version = "2.0.12", default-features = false }
+tokio = { version = "1.45.1", default-features = false }
+toml = { version = "0.8.23", default-features = false, features = [
+    "display",
+    "parse",
+] }
+tracing = { version = "0.1.44", default-features = false }
+tracing-subscriber = { version = "0.3.20", default-features = false }
