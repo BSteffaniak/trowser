@@ -138,24 +138,52 @@ pub fn discover_browser_binary(configured: Option<&PathBuf>) -> BrowserDiscovery
     BrowserDiscovery { binary, candidates }
 }
 
-/// Launches Chromium, navigates to a URL, and extracts a semantic page.
-///
-/// # Errors
-///
-/// Returns an error if Chromium cannot be launched, `CDP` cannot be reached,
-/// navigation fails, or semantic extraction fails.
-pub async fn fetch_semantic_page(config: &CdpBackendConfig, url: &str) -> CdpResult<SemanticPage> {
-    let discovery = discover_browser_binary(config.browser_binary.as_ref());
-    let browser_binary = discovery.binary.ok_or(CdpError::BrowserNotFound)?;
-    let port = allocate_local_port().map_err(CdpError::Port)?;
-    let profile = tempfile::Builder::new()
-        .prefix("trowser-cdp-")
-        .tempdir()
-        .map_err(CdpError::TempDir)?;
-    let mut browser = launch_browser(&browser_binary, profile.path(), port, config.headless)?;
+/// Persistent Chromium process controlled by `CDP`.
+pub struct CdpBrowser {
+    child: Child,
+    _profile: tempfile::TempDir,
+    port: u16,
+}
 
-    let result = async {
-        let ws_url = wait_for_page_ws_url(port).await?;
+impl std::fmt::Debug for CdpBrowser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CdpBrowser")
+            .field("port", &self.port)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CdpBrowser {
+    /// Launches a persistent Chromium process for repeated navigations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a browser binary cannot be found, a debug port cannot
+    /// be allocated, a profile directory cannot be created, or Chromium fails to spawn.
+    pub async fn launch(config: &CdpBackendConfig) -> CdpResult<Self> {
+        let discovery = discover_browser_binary(config.browser_binary.as_ref());
+        let browser_binary = discovery.binary.ok_or(CdpError::BrowserNotFound)?;
+        let port = allocate_local_port().map_err(CdpError::Port)?;
+        let profile = tempfile::Builder::new()
+            .prefix("trowser-cdp-")
+            .tempdir()
+            .map_err(CdpError::TempDir)?;
+        let child = launch_browser(&browser_binary, profile.path(), port, config.headless)?;
+        wait_for_devtools(port).await?;
+        Ok(Self {
+            child,
+            _profile: profile,
+            port,
+        })
+    }
+
+    /// Navigates a new `CDP` page target and extracts semantic content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if target creation, navigation, or extraction fails.
+    pub async fn fetch_semantic_page(&mut self, url: &str) -> CdpResult<SemanticPage> {
+        let ws_url = create_page_ws_url(self.port).await?;
         let mut cdp = CdpConnection::connect(&ws_url).await?;
         cdp.call("Page.enable", json!({})).await?;
         cdp.call("Runtime.enable", json!({})).await?;
@@ -167,9 +195,33 @@ pub async fn fetch_semantic_page(config: &CdpBackendConfig, url: &str) -> CdpRes
         .await;
         cdp.extract_semantic_page().await
     }
-    .await;
 
-    let _ = browser.kill().await;
+    /// Terminates the Chromium child process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if process termination fails.
+    pub async fn shutdown(&mut self) -> CdpResult<()> {
+        self.child.kill().await.map_err(CdpError::Launch)
+    }
+}
+
+impl Drop for CdpBrowser {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
+}
+
+/// Launches Chromium, navigates to a URL, and extracts a semantic page.
+///
+/// # Errors
+///
+/// Returns an error if Chromium cannot be launched, `CDP` cannot be reached,
+/// navigation fails, or semantic extraction fails.
+pub async fn fetch_semantic_page(config: &CdpBackendConfig, url: &str) -> CdpResult<SemanticPage> {
+    let mut browser = CdpBrowser::launch(config).await?;
+    let result = browser.fetch_semantic_page(url).await;
+    let _ = browser.shutdown().await;
     result
 }
 
@@ -211,19 +263,29 @@ struct DevToolsTarget {
     web_socket_debugger_url: String,
 }
 
-async fn wait_for_page_ws_url(port: u16) -> CdpResult<String> {
+async fn wait_for_devtools(port: u16) -> CdpResult<()> {
     let client = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{port}/json/new?about:blank");
+    let url = format!("http://127.0.0.1:{port}/json/version");
     for _ in 0..100 {
-        if let Ok(response) = client.put(&url).send().await
+        if let Ok(response) = client.get(&url).send().await
             && response.status().is_success()
         {
-            let target = response.json::<DevToolsTarget>().await?;
-            return Ok(target.web_socket_debugger_url);
+            return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Err(CdpError::DevToolsTimeout)
+}
+
+async fn create_page_ws_url(port: u16) -> CdpResult<String> {
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{port}/json/new?about:blank");
+    let response = client.put(&url).send().await?;
+    let target = response
+        .error_for_status()?
+        .json::<DevToolsTarget>()
+        .await?;
+    Ok(target.web_socket_debugger_url)
 }
 
 type WsStream =

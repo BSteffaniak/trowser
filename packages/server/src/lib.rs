@@ -11,7 +11,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify};
-use trowser_browser_cdp::{CdpBackendConfig, fetch_semantic_page};
+use trowser_browser_cdp::{CdpBackendConfig, CdpBrowser};
 use trowser_config::{ConfigPaths, TROWSER_DAEMON_READY_FILE_ENV, TrowserConfig};
 use trowser_ipc::{
     ClientHello, PROTOCOL_VERSION, ProtocolCapabilities, Request, Response, ServerHello,
@@ -47,6 +47,7 @@ pub struct TrowserServer {
     paths: ConfigPaths,
     config: TrowserConfig,
     state: Arc<Mutex<ServerState>>,
+    browser: Arc<Mutex<Option<CdpBrowser>>>,
     shutdown: Arc<Notify>,
 }
 
@@ -58,6 +59,7 @@ impl TrowserServer {
             paths,
             config,
             state: Arc::new(Mutex::new(ServerState::default())),
+            browser: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(Notify::new()),
         }
     }
@@ -126,6 +128,7 @@ impl TrowserServer {
                 }
             }
 
+            self.shutdown_browser().await;
             if socket_path.exists() {
                 tokio::fs::remove_file(&socket_path).await?;
             }
@@ -156,6 +159,7 @@ impl TrowserServer {
             Request::FollowLink { link_id } => self.handle_follow_link(link_id).await,
             Request::Snapshot { tab_id } => self.handle_snapshot(&tab_id).await,
             Request::Shutdown => {
+                self.shutdown_browser().await;
                 self.shutdown.notify_waiters();
                 Response::Ok
             }
@@ -232,12 +236,31 @@ impl TrowserServer {
         )
     }
 
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "browser mutex intentionally serializes access to the single persistent CDP process"
+    )]
     async fn fetch_page(&self, url: &str) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
-        let config = CdpBackendConfig {
-            browser_binary: self.config.browser.binary.clone(),
-            headless: self.config.browser.headless,
+        let mut browser = self.browser.lock().await;
+        if browser.is_none() {
+            let config = CdpBackendConfig {
+                browser_binary: self.config.browser.binary.clone(),
+                headless: self.config.browser.headless,
+            };
+            *browser = Some(CdpBrowser::launch(&config).await?);
+        }
+        let Some(browser) = browser.as_mut() else {
+            unreachable!("browser initialized above")
         };
-        fetch_semantic_page(&config, url).await
+        browser.fetch_semantic_page(url).await
+    }
+
+    async fn shutdown_browser(&self) {
+        let mut browser = self.browser.lock().await;
+        if let Some(browser) = browser.as_mut() {
+            let _ = browser.shutdown().await;
+        }
+        *browser = None;
     }
 
     async fn snapshot(&self) -> SessionSnapshot {
