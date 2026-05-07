@@ -157,6 +157,8 @@ impl TrowserServer {
             Request::Open { url } => self.handle_open(url).await,
             Request::ActiveSnapshot => self.handle_active_snapshot().await,
             Request::Reload => self.handle_reload().await,
+            Request::Back => self.handle_back().await,
+            Request::Forward => self.handle_forward().await,
             Request::ListTabs => Response::Tabs(self.snapshot().await),
             Request::FollowLink { link_id } => self.handle_follow_link(link_id).await,
             Request::Snapshot { tab_id } => self.handle_snapshot(&tab_id).await,
@@ -251,14 +253,45 @@ impl TrowserServer {
             };
         };
         let page = self
-            .fetch_page(&url)
+            .reload_page(&url)
             .await
             .unwrap_or_else(|error| error_page(&url, &error.to_string()));
-        let mut state = self.state.lock().await;
-        state.tabs.insert(tab_id.clone(), page);
-        state.active_tab = Some(tab_id.clone());
+        self.store_page(tab_id, page).await
+    }
+
+    async fn handle_back(&self) -> Response {
+        let Some(tab_id) = self.active_tab_id().await else {
+            return Response::Error {
+                message: "no active tab".to_string(),
+            };
+        };
+        match self.back_page().await {
+            Ok(page) => self.store_page(tab_id, page).await,
+            Err(error) => Response::Error {
+                message: error.to_string(),
+            },
+        }
+    }
+
+    async fn handle_forward(&self) -> Response {
+        let Some(tab_id) = self.active_tab_id().await else {
+            return Response::Error {
+                message: "no active tab".to_string(),
+            };
+        };
+        match self.forward_page().await {
+            Ok(page) => self.store_page(tab_id, page).await,
+            Err(error) => Response::Error {
+                message: error.to_string(),
+            },
+        }
+    }
+
+    async fn active_tab_id(&self) -> Option<TabId> {
+        let state = self.state.lock().await;
+        let tab_id = state.active_tab.clone();
         drop(state);
-        Response::Opened { tab_id }
+        tab_id
     }
 
     async fn active_tab_url(&self) -> Option<(TabId, String)> {
@@ -267,6 +300,14 @@ impl TrowserServer {
         let url = state.tabs.get(&tab_id)?.url.clone();
         drop(state);
         Some((tab_id, url))
+    }
+
+    async fn store_page(&self, tab_id: TabId, page: SemanticPage) -> Response {
+        let mut state = self.state.lock().await;
+        state.tabs.insert(tab_id.clone(), page);
+        state.active_tab = Some(tab_id.clone());
+        drop(state);
+        Response::Opened { tab_id }
     }
 
     async fn handle_snapshot(&self, tab_id: &TabId) -> Response {
@@ -296,6 +337,56 @@ impl TrowserServer {
             unreachable!("browser initialized above")
         };
         browser.fetch_semantic_page(url).await
+    }
+
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "browser mutex intentionally serializes access to the single persistent CDP process"
+    )]
+    async fn reload_page(
+        &self,
+        fallback_url: &str,
+    ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
+        let mut browser = self.browser.lock().await;
+        if browser.is_none() {
+            let config = CdpBackendConfig {
+                browser_binary: self.config.browser.binary.clone(),
+                headless: self.config.browser.headless,
+            };
+            *browser = Some(CdpBrowser::launch(&config).await?);
+            let Some(browser) = browser.as_mut() else {
+                unreachable!("browser initialized above")
+            };
+            return browser.fetch_semantic_page(fallback_url).await;
+        }
+        let Some(browser) = browser.as_mut() else {
+            unreachable!("browser checked above")
+        };
+        browser.reload().await
+    }
+
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "browser mutex intentionally serializes access to the single persistent CDP process"
+    )]
+    async fn back_page(&self) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
+        let mut browser = self.browser.lock().await;
+        let Some(browser) = browser.as_mut() else {
+            return Err(trowser_browser_cdp::CdpError::NavigationHistory);
+        };
+        browser.back().await
+    }
+
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "browser mutex intentionally serializes access to the single persistent CDP process"
+    )]
+    async fn forward_page(&self) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
+        let mut browser = self.browser.lock().await;
+        let Some(browser) = browser.as_mut() else {
+            return Err(trowser_browser_cdp::CdpError::NavigationHistory);
+        };
+        browser.forward().await
     }
 
     async fn shutdown_browser(&self) {

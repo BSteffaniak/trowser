@@ -56,6 +56,8 @@ pub async fn run() -> Result<u8> {
         Command::Server { command } => run_server(&command, &paths, cli.json).await,
         Command::Status => run_status(&paths, cli.json).await,
         Command::Follow { link_id } => run_follow(&paths, &config, link_id, cli.json).await,
+        Command::Back => run_navigation(&paths, &config, Request::Back, cli.json).await,
+        Command::Forward => run_navigation(&paths, &config, Request::Forward, cli.json).await,
         Command::Tabs => run_tabs(&paths, cli.json).await,
         Command::Paths => Ok(run_paths(&paths, cli.json)),
         Command::Doctor => Ok(run_doctor(&config, cli.json)),
@@ -149,6 +151,33 @@ async fn run_follow(
     Ok(0)
 }
 
+async fn run_navigation(
+    paths: &ConfigPaths,
+    config: &TrowserConfig,
+    request: Request,
+    json: bool,
+) -> Result<u8> {
+    let client = ensure_server(paths).await?;
+    let page = navigation_and_snapshot(&client, request).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&page)?);
+    } else {
+        let rendered = render_plain_text(
+            &page,
+            &TerminalRenderOptions {
+                width: config.render.max_width,
+                image_capabilities: detect_from_env(),
+            },
+        );
+        print!("{rendered}");
+    }
+    Ok(0)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "small crossterm input loop is clearer while interactive mode is still minimal"
+)]
 async fn run_interactive(
     paths: &ConfigPaths,
     config: &TrowserConfig,
@@ -162,7 +191,8 @@ async fn run_interactive(
     };
     let mut rendered = render_page_lines(&page, config);
     let mut offset = 0usize;
-    let mut message = String::from("q quit · j/k scroll · o open · f follow · r reload");
+    let mut message =
+        String::from("q quit · j/k scroll · o open · f follow · b back · F forward · r reload");
     let _guard = TerminalGuard::enter()?;
 
     loop {
@@ -226,6 +256,30 @@ async fn run_interactive(
                 }
             }
             KeyEvent {
+                code: KeyCode::Char('b') | KeyCode::Left,
+                ..
+            } => match back_and_snapshot(&client).await {
+                Ok(updated_page) => {
+                    page = updated_page;
+                    rendered = render_page_lines(&page, config);
+                    offset = 0;
+                    message = "back".to_string();
+                }
+                Err(error) => message = error.to_string(),
+            },
+            KeyEvent {
+                code: KeyCode::Char('F') | KeyCode::Right,
+                ..
+            } => match forward_and_snapshot(&client).await {
+                Ok(updated_page) => {
+                    page = updated_page;
+                    rendered = render_page_lines(&page, config);
+                    offset = 0;
+                    message = "forward".to_string();
+                }
+                Err(error) => message = error.to_string(),
+            },
+            KeyEvent {
                 code: KeyCode::Char('r'),
                 ..
             } => {
@@ -268,11 +322,27 @@ async fn follow_and_snapshot(
 }
 
 async fn reload_and_snapshot(client: &TrowserClient) -> Result<trowser_render::SemanticPage> {
-    let reloaded = client.send(&Request::Reload).await?;
-    let Response::Opened { tab_id } = reloaded else {
-        anyhow::bail!("unexpected reload response: {reloaded:?}");
-    };
-    snapshot_tab(client, tab_id).await
+    navigation_and_snapshot(client, Request::Reload).await
+}
+
+async fn back_and_snapshot(client: &TrowserClient) -> Result<trowser_render::SemanticPage> {
+    navigation_and_snapshot(client, Request::Back).await
+}
+
+async fn forward_and_snapshot(client: &TrowserClient) -> Result<trowser_render::SemanticPage> {
+    navigation_and_snapshot(client, Request::Forward).await
+}
+
+async fn navigation_and_snapshot(
+    client: &TrowserClient,
+    request: Request,
+) -> Result<trowser_render::SemanticPage> {
+    let response = client.send(&request).await?;
+    match response {
+        Response::Opened { tab_id } => snapshot_tab(client, tab_id).await,
+        Response::Error { message } => anyhow::bail!(message),
+        unexpected => anyhow::bail!("unexpected navigation response: {unexpected:?}"),
+    }
 }
 
 async fn snapshot_tab(

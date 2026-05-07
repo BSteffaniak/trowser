@@ -52,6 +52,10 @@ pub enum Command {
         /// Link id to follow.
         link_id: u32,
     },
+    /// Navigate the active tab backward.
+    Back,
+    /// Navigate the active tab forward.
+    Forward,
     /// List daemon tabs.
     Tabs,
     /// Print resolved paths.

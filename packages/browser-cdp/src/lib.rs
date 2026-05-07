@@ -111,6 +111,9 @@ pub enum CdpError {
     /// Expected `CDP` response field was missing.
     #[error("CDP response missing field: {0}")]
     MissingField(&'static str),
+    /// Requested browser history entry does not exist.
+    #[error("no matching browser navigation history entry")]
+    NavigationHistory,
     /// Extracted page data had an unexpected shape.
     #[error("CDP semantic extraction failed: {0}")]
     Extraction(String),
@@ -143,6 +146,7 @@ pub struct CdpBrowser {
     child: Child,
     _profile: tempfile::TempDir,
     port: u16,
+    active_page: Option<CdpPage>,
 }
 
 impl std::fmt::Debug for CdpBrowser {
@@ -174,26 +178,55 @@ impl CdpBrowser {
             child,
             _profile: profile,
             port,
+            active_page: None,
         })
     }
 
-    /// Navigates a new `CDP` page target and extracts semantic content.
+    /// Navigates the persistent active `CDP` page and extracts semantic content.
     ///
     /// # Errors
     ///
     /// Returns an error if target creation, navigation, or extraction fails.
     pub async fn fetch_semantic_page(&mut self, url: &str) -> CdpResult<SemanticPage> {
-        let ws_url = create_page_ws_url(self.port).await?;
-        let mut cdp = CdpConnection::connect(&ws_url).await?;
-        cdp.call("Page.enable", json!({})).await?;
-        cdp.call("Runtime.enable", json!({})).await?;
-        cdp.call("Page.navigate", json!({ "url": url })).await?;
-        let _ = tokio::time::timeout(
-            Duration::from_secs(15),
-            cdp.wait_for_event("Page.loadEventFired"),
-        )
-        .await;
-        cdp.extract_semantic_page().await
+        self.active_page().await?.navigate(url).await
+    }
+
+    /// Reloads the persistent active `CDP` page and extracts semantic content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the page target cannot be created, reload fails, or
+    /// extraction fails.
+    pub async fn reload(&mut self) -> CdpResult<SemanticPage> {
+        self.active_page().await?.reload().await
+    }
+
+    /// Navigates the persistent active `CDP` page backward in history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no back entry exists or `CDP` navigation/extraction fails.
+    pub async fn back(&mut self) -> CdpResult<SemanticPage> {
+        self.active_page().await?.back().await
+    }
+
+    /// Navigates the persistent active `CDP` page forward in history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no forward entry exists or `CDP` navigation/extraction fails.
+    pub async fn forward(&mut self) -> CdpResult<SemanticPage> {
+        self.active_page().await?.forward().await
+    }
+
+    async fn active_page(&mut self) -> CdpResult<&mut CdpPage> {
+        if self.active_page.is_none() {
+            self.active_page = Some(CdpPage::create(self.port).await?);
+        }
+        let Some(page) = self.active_page.as_mut() else {
+            unreachable!("active page initialized above")
+        };
+        Ok(page)
     }
 
     /// Terminates the Chromium child process.
@@ -209,6 +242,84 @@ impl CdpBrowser {
 impl Drop for CdpBrowser {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
+    }
+}
+
+struct CdpPage {
+    cdp: CdpConnection,
+}
+
+impl CdpPage {
+    async fn create(port: u16) -> CdpResult<Self> {
+        let ws_url = create_page_ws_url(port).await?;
+        let mut cdp = CdpConnection::connect(&ws_url).await?;
+        cdp.call("Page.enable", json!({})).await?;
+        cdp.call("Runtime.enable", json!({})).await?;
+        Ok(Self { cdp })
+    }
+
+    async fn navigate(&mut self, url: &str) -> CdpResult<SemanticPage> {
+        self.cdp
+            .call("Page.navigate", json!({ "url": url }))
+            .await?;
+        self.wait_for_page_load(Duration::from_secs(15)).await;
+        self.cdp.extract_semantic_page().await
+    }
+
+    async fn reload(&mut self) -> CdpResult<SemanticPage> {
+        self.cdp.call("Page.reload", json!({})).await?;
+        self.wait_for_page_load(Duration::from_secs(15)).await;
+        self.cdp.extract_semantic_page().await
+    }
+
+    async fn back(&mut self) -> CdpResult<SemanticPage> {
+        let entry_id = self.history_entry(-1).await?;
+        self.navigate_to_history_entry(entry_id).await
+    }
+
+    async fn forward(&mut self) -> CdpResult<SemanticPage> {
+        let entry_id = self.history_entry(1).await?;
+        self.navigate_to_history_entry(entry_id).await
+    }
+
+    async fn navigate_to_history_entry(&mut self, entry_id: i64) -> CdpResult<SemanticPage> {
+        self.cdp
+            .call(
+                "Page.navigateToHistoryEntry",
+                json!({ "entryId": entry_id }),
+            )
+            .await?;
+        self.wait_for_page_load(Duration::from_secs(2)).await;
+        self.cdp.extract_semantic_page().await
+    }
+
+    async fn history_entry(&mut self, offset: i64) -> CdpResult<i64> {
+        let history = self
+            .cdp
+            .call("Page.getNavigationHistory", json!({}))
+            .await?;
+        let current_index =
+            history
+                .get("currentIndex")
+                .and_then(Value::as_i64)
+                .ok_or(CdpError::MissingField(
+                    "Page.getNavigationHistory.currentIndex",
+                ))?;
+        let target_index = current_index + offset;
+        if target_index < 0 {
+            return Err(CdpError::NavigationHistory);
+        }
+        history
+            .get("entries")
+            .and_then(Value::as_array)
+            .and_then(|entries| entries.get(usize::try_from(target_index).ok()?))
+            .and_then(|entry| entry.get("id"))
+            .and_then(Value::as_i64)
+            .ok_or(CdpError::NavigationHistory)
+    }
+
+    async fn wait_for_page_load(&mut self, timeout: Duration) {
+        let _ = tokio::time::timeout(timeout, self.cdp.wait_for_event("Page.loadEventFired")).await;
     }
 }
 

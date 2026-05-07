@@ -63,6 +63,10 @@ pub enum Request {
     ActiveSnapshot,
     /// Reloads the active tab.
     Reload,
+    /// Navigates the active tab backward in browser history.
+    Back,
+    /// Navigates the active tab forward in browser history.
+    Forward,
     /// Lists known tabs.
     ListTabs,
     /// Follows a reader-mode link in the active tab.
