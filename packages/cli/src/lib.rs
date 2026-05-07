@@ -28,6 +28,7 @@ use trowser_client::{ClientError, TrowserClient};
 use trowser_config::{ConfigPaths, TROWSER_DAEMON_READY_FILE_ENV, TrowserConfig};
 use trowser_ipc::{Request, Response, ServerStatus};
 use trowser_server::TrowserServer;
+use trowser_session_models::ActionId;
 use trowser_terminal::{
     ControlHitboxAction, RenderedDocument, TerminalRenderOptions, render_document,
     render_plain_text,
@@ -312,6 +313,37 @@ async fn run_interactive(
                     ..
                 } => offset = rendered.lines.len().saturating_sub(1),
                 KeyEvent {
+                    code: KeyCode::Enter,
+                    ..
+                } => {
+                    if let Some((_, target)) = focused_action(&rendered, offset) {
+                        page = activate_click_target(&client, target).await?;
+                        rendered = render_page_document(&page, config);
+                        tab_status = tabs_status(&client).await.unwrap_or_default();
+                        offset = 0;
+                        message = "activated focused action".to_string();
+                    }
+                }
+                KeyEvent {
+                    code: KeyCode::Char('a'),
+                    ..
+                } => {
+                    if let Some((row, _)) = next_action(&rendered, offset.saturating_add(1), true) {
+                        offset = row;
+                        message = "focused next action".to_string();
+                    }
+                }
+                KeyEvent {
+                    code: KeyCode::Char('A'),
+                    ..
+                } => {
+                    if let Some((row, _)) = next_action(&rendered, offset.saturating_sub(1), false)
+                    {
+                        offset = row;
+                        message = "focused previous action".to_string();
+                    }
+                }
+                KeyEvent {
                     code: KeyCode::Char('/'),
                     ..
                 } => {
@@ -499,27 +531,33 @@ async fn run_interactive(
                 MouseEventKind::Down(MouseButton::Left) => {
                     if let Some(target) = target_at(&rendered, offset, mouse.row, mouse.column) {
                         match target {
-                            ClickTarget::Link(link_id) => {
-                                page = follow_and_snapshot(&client, link_id).await?;
+                            ClickTarget::Link { link_id, action_id } => {
+                                page = activate_or_follow_link(&client, link_id, action_id).await?;
                                 rendered = render_page_document(&page, config);
                                 offset = 0;
                                 message = format!("followed link {link_id}");
                             }
                             ClickTarget::Control {
                                 control_id,
+                                action_id,
                                 action: ControlHitboxAction::Click,
                             } => {
-                                page = click_and_snapshot(&client, control_id).await?;
+                                page = activate_or_click_control(&client, control_id, action_id)
+                                    .await?;
                                 rendered = render_page_document(&page, config);
                                 offset = 0;
                                 message = format!("clicked control {control_id}");
                             }
                             ClickTarget::Control {
                                 control_id,
+                                action_id,
                                 action: ControlHitboxAction::InputText,
                             } => {
                                 if let Some(text) = prompt_input("Text: ")? {
-                                    page = input_and_snapshot(&client, control_id, text).await?;
+                                    page = input_control_or_action(
+                                        &client, control_id, action_id, text,
+                                    )
+                                    .await?;
                                     rendered = render_page_document(&page, config);
                                     offset = 0;
                                     message = format!("input text into control {control_id}");
@@ -623,12 +661,49 @@ async fn click_and_snapshot(
     navigation_and_snapshot(client, Request::ClickControl { control_id }).await
 }
 
+async fn activate_or_follow_link(
+    client: &TrowserClient,
+    link_id: u32,
+    action_id: Option<ActionId>,
+) -> Result<trowser_render::SemanticPage> {
+    if let Some(action_id) = action_id {
+        navigation_and_snapshot(client, Request::ActivateAction { action_id }).await
+    } else {
+        follow_and_snapshot(client, link_id).await
+    }
+}
+
+async fn activate_or_click_control(
+    client: &TrowserClient,
+    control_id: u32,
+    action_id: Option<ActionId>,
+) -> Result<trowser_render::SemanticPage> {
+    if let Some(action_id) = action_id {
+        navigation_and_snapshot(client, Request::ActivateAction { action_id }).await
+    } else {
+        click_and_snapshot(client, control_id).await
+    }
+}
+
 async fn input_and_snapshot(
     client: &TrowserClient,
     control_id: u32,
     text: String,
 ) -> Result<trowser_render::SemanticPage> {
     navigation_and_snapshot(client, Request::InputText { control_id, text }).await
+}
+
+async fn input_control_or_action(
+    client: &TrowserClient,
+    control_id: u32,
+    action_id: Option<ActionId>,
+    text: String,
+) -> Result<trowser_render::SemanticPage> {
+    if let Some(action_id) = action_id {
+        navigation_and_snapshot(client, Request::InputTextAction { action_id, text }).await
+    } else {
+        input_and_snapshot(client, control_id, text).await
+    }
 }
 
 async fn navigation_and_snapshot(
@@ -789,13 +864,81 @@ fn find_line(
         .map(|(index, _)| index)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum ClickTarget {
-    Link(u32),
+    Link {
+        link_id: u32,
+        action_id: Option<ActionId>,
+    },
     Control {
         control_id: u32,
+        action_id: Option<ActionId>,
         action: ControlHitboxAction,
     },
+}
+
+async fn activate_click_target(
+    client: &TrowserClient,
+    target: ClickTarget,
+) -> Result<trowser_render::SemanticPage> {
+    match target {
+        ClickTarget::Link { link_id, action_id } => {
+            activate_or_follow_link(client, link_id, action_id).await
+        }
+        ClickTarget::Control {
+            control_id,
+            action_id,
+            action: ControlHitboxAction::Click,
+        } => activate_or_click_control(client, control_id, action_id).await,
+        ClickTarget::Control {
+            control_id,
+            action_id,
+            action: ControlHitboxAction::InputText,
+        } => {
+            let text = prompt_input("Text: ")?.unwrap_or_default();
+            input_control_or_action(client, control_id, action_id, text).await
+        }
+    }
+}
+
+fn focused_action(document: &RenderedDocument, offset: usize) -> Option<(usize, ClickTarget)> {
+    next_action(document, offset, true)
+}
+
+fn next_action(
+    document: &RenderedDocument,
+    start: usize,
+    forward: bool,
+) -> Option<(usize, ClickTarget)> {
+    let mut iter: Box<dyn Iterator<Item = (usize, &trowser_terminal::RenderedLine)>> = if forward {
+        Box::new(document.lines.iter().enumerate().skip(start))
+    } else {
+        Box::new(
+            document
+                .lines
+                .iter()
+                .enumerate()
+                .take(start.saturating_add(1))
+                .rev(),
+        )
+    };
+    iter.find_map(|(row, line)| line_target(line).map(|target| (row, target)))
+}
+
+fn line_target(line: &trowser_terminal::RenderedLine) -> Option<ClickTarget> {
+    line.links
+        .first()
+        .map(|link| ClickTarget::Link {
+            link_id: link.link_id,
+            action_id: link.action_id.clone(),
+        })
+        .or_else(|| {
+            line.controls.first().map(|control| ClickTarget::Control {
+                control_id: control.control_id,
+                action_id: control.action_id.clone(),
+                action: control.action,
+            })
+        })
 }
 
 fn target_at(
@@ -813,13 +956,17 @@ fn target_at(
     line.links
         .iter()
         .find(|link| link.contains(column))
-        .map(|link| ClickTarget::Link(link.link_id))
+        .map(|link| ClickTarget::Link {
+            link_id: link.link_id,
+            action_id: link.action_id.clone(),
+        })
         .or_else(|| {
             line.controls
                 .iter()
                 .find(|control| control.contains(column))
                 .map(|control| ClickTarget::Control {
                     control_id: control.control_id,
+                    action_id: control.action_id.clone(),
                     action: control.action,
                 })
         })

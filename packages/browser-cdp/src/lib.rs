@@ -23,7 +23,7 @@ use trowser_browser::{
     NavigateRequest,
 };
 use trowser_render::{BlockLayout, SemanticBlock, SemanticPage, SemanticRegion};
-use trowser_session_models::TabId;
+use trowser_session_models::{ActionId, TabId};
 
 /// Configuration for the Chromium/CDP backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,31 +241,33 @@ impl CdpBrowser {
         self.page_mut(tab_id)?.forward().await
     }
 
-    /// Activates/clicks a form control in a tab and extracts semantic content.
+    /// Activates/clicks a stable DOM action in a tab and extracts semantic content.
     ///
     /// # Errors
     ///
-    /// Returns an error if the control does not exist or `CDP` action/extraction fails.
-    pub async fn click_control(
+    /// Returns an error if the action does not exist or `CDP` action/extraction fails.
+    pub async fn activate_action(
         &mut self,
         tab_id: &TabId,
-        control_id: u32,
+        action_id: &ActionId,
     ) -> CdpResult<SemanticPage> {
-        self.page_mut(tab_id)?.click_control(control_id).await
+        self.page_mut(tab_id)?.activate_action(action_id).await
     }
 
-    /// Inputs text into a form control in a tab and extracts semantic content.
+    /// Inputs text into a stable DOM action in a tab and extracts semantic content.
     ///
     /// # Errors
     ///
-    /// Returns an error if the control does not exist or `CDP` action/extraction fails.
-    pub async fn input_text(
+    /// Returns an error if the action does not exist or `CDP` action/extraction fails.
+    pub async fn input_text_action(
         &mut self,
         tab_id: &TabId,
-        control_id: u32,
+        action_id: &ActionId,
         text: &str,
     ) -> CdpResult<SemanticPage> {
-        self.page_mut(tab_id)?.input_text(control_id, text).await
+        self.page_mut(tab_id)?
+            .input_text_action(action_id, text)
+            .await
     }
 
     /// Closes the browser page target for a tab.
@@ -343,14 +345,19 @@ impl CdpPage {
         self.navigate_to_history_entry(entry_id).await
     }
 
-    async fn click_control(&mut self, control_id: u32) -> CdpResult<SemanticPage> {
-        self.run_action(&click_control_js(control_id)).await?;
+    async fn activate_action(&mut self, action_id: &ActionId) -> CdpResult<SemanticPage> {
+        self.run_action(&activate_action_js(action_id)?).await?;
         self.wait_for_page_load(Duration::from_secs(2)).await;
         self.cdp.extract_semantic_page().await
     }
 
-    async fn input_text(&mut self, control_id: u32, text: &str) -> CdpResult<SemanticPage> {
-        self.run_action(&input_text_js(control_id, text)?).await?;
+    async fn input_text_action(
+        &mut self,
+        action_id: &ActionId,
+        text: &str,
+    ) -> CdpResult<SemanticPage> {
+        self.run_action(&input_text_action_js(action_id, text)?)
+            .await?;
         self.cdp.extract_semantic_page().await
     }
 
@@ -645,6 +652,7 @@ enum CdpSemanticBlock {
         region: SemanticRegion,
     },
     Link {
+        action_id: Option<ActionId>,
         text: String,
         url: String,
         layout: Option<BlockLayout>,
@@ -659,6 +667,7 @@ enum CdpSemanticBlock {
         region: SemanticRegion,
     },
     FormControl {
+        action_id: Option<ActionId>,
         label: String,
         control_type: String,
         value: String,
@@ -700,11 +709,13 @@ impl CdpSemanticBlock {
                 region,
             },
             Self::Link {
+                action_id,
                 text,
                 url,
                 layout,
                 region,
             } => SemanticBlock::Link {
+                action_id,
                 text,
                 url,
                 layout,
@@ -726,12 +737,14 @@ impl CdpSemanticBlock {
                 region,
             },
             Self::FormControl {
+                action_id,
                 label,
                 control_type,
                 value,
                 layout,
                 region,
             } => SemanticBlock::FormControl {
+                action_id,
                 label,
                 control_type,
                 value,
@@ -742,30 +755,29 @@ impl CdpSemanticBlock {
     }
 }
 
-fn click_control_js(control_id: u32) -> String {
-    format!(
+fn activate_action_js(action_id: &ActionId) -> CdpResult<String> {
+    let action_id = serde_json::to_string(action_id.as_str())?;
+    Ok(format!(
         r"
 (() => {{
-  const controls = trowserVisibleControls();
-  const el = controls[{}];
-  if (!el) return {{ ok: false, error: 'unknown control id {control_id}' }};
+  const el = window.__trowserActions && window.__trowserActions[{action_id}];
+  if (!el) return {{ ok: false, error: 'unknown action id' }};
   el.focus();
   el.click();
   return {{ ok: true }};
 }})()
-",
-        control_id.saturating_sub(1)
-    )
+"
+    ))
 }
 
-fn input_text_js(control_id: u32, text: &str) -> CdpResult<String> {
+fn input_text_action_js(action_id: &ActionId, text: &str) -> CdpResult<String> {
+    let action_id = serde_json::to_string(action_id.as_str())?;
     let text = serde_json::to_string(text)?;
     Ok(format!(
         r"
 (() => {{
-  const controls = trowserVisibleControls();
-  const el = controls[{}];
-  if (!el) return {{ ok: false, error: 'unknown control id {control_id}' }};
+  const el = window.__trowserActions && window.__trowserActions[{action_id}];
+  if (!el) return {{ ok: false, error: 'unknown action id' }};
   const tag = el.tagName.toLowerCase();
   if (tag === 'select') {{
     const value = {text};
@@ -782,8 +794,7 @@ fn input_text_js(control_id: u32, text: &str) -> CdpResult<String> {
   el.dispatchEvent(new Event('change', {{ bubbles: true }}));
   return {{ ok: true }};
 }})()
-",
-        control_id.saturating_sub(1)
+"
     ))
 }
 
@@ -818,6 +829,17 @@ const DOM_EXTRACTION_JS: &str = r#"
     if (tag === 'footer' || role === 'contentinfo') return 'Footer';
     return 'Main';
   };
+  window.__trowserActions = window.__trowserActions || {};
+  window.__trowserActionCounter = window.__trowserActionCounter || 1;
+  const actionId = (el) => {
+    let id = el.getAttribute('data-trowser-action-id');
+    if (!id) {
+      id = `a-${window.__trowserActionCounter++}`;
+      el.setAttribute('data-trowser-action-id', id);
+    }
+    window.__trowserActions[id] = el;
+    return id;
+  };
   const pushText = (kind, el, extra = {}) => {
     const text = clean(el.innerText || el.textContent || el.getAttribute('aria-label'));
     if (text) blocks.push({ kind, text, layout: layout(el), region: region(el), ...extra });
@@ -837,7 +859,7 @@ const DOM_EXTRACTION_JS: &str = r#"
       pushText('list_item', el);
     } else if (tag === 'a') {
       const text = clean(el.innerText || el.textContent || el.href);
-      if (text || el.href) blocks.push({ kind: 'link', text, url: el.href || '', layout: layout(el), region: region(el) });
+      if (text || el.href) blocks.push({ kind: 'link', action_id: actionId(el), text, url: el.href || '', layout: layout(el), region: region(el) });
     } else if (tag === 'img') {
       blocks.push({
         kind: 'image',
@@ -851,6 +873,7 @@ const DOM_EXTRACTION_JS: &str = r#"
     } else if (isControl(el)) {
       blocks.push({
         kind: 'form_control',
+        action_id: actionId(el),
         label: controlLabel(el),
         control_type: controlType(el),
         value: clean(el.value || ''),

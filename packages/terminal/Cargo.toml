@@ -12,11 +12,13 @@ version     = { workspace = true }
 
 [dependencies]
 trowser_render         = { workspace = true }
+trowser_session_models = { workspace = true }
 trowser_terminal_image = { workspace = true }
 
 [features]
 default = []
 fail-on-warnings = [
     "trowser_render/fail-on-warnings",
+    "trowser_session_models/fail-on-warnings",
     "trowser_terminal_image/fail-on-warnings",
 ]

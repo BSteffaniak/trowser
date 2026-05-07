@@ -42,6 +42,24 @@ impl PageId {
     }
 }
 
+/// Stable identifier for an actionable DOM element in a page.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ActionId(pub String);
+
+impl ActionId {
+    /// Creates a new action id from a string-like value.
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Returns the id as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Browser tab metadata shared between daemon and client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]

@@ -5,6 +5,7 @@
 //! Semantic render model and sanitization helpers for trowser.
 
 use serde::{Deserialize, Serialize};
+use trowser_session_models::ActionId;
 
 /// A sanitized page model suitable for terminal rendering.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -66,6 +67,8 @@ pub const NAV_SUMMARY_LINK_LIMIT: usize = 6;
 pub struct ReaderLink {
     /// One-based link id shown in terminal output.
     pub id: u32,
+    /// Stable DOM action id when this link maps to an actionable element.
+    pub action_id: Option<ActionId>,
     /// Link text.
     pub text: String,
     /// Link target URL.
@@ -96,6 +99,7 @@ pub enum SemanticBlock {
     },
     /// Link text plus target URL.
     Link {
+        action_id: Option<ActionId>,
         text: String,
         url: String,
         layout: Option<BlockLayout>,
@@ -112,6 +116,7 @@ pub enum SemanticBlock {
     },
     /// Form control placeholder.
     FormControl {
+        action_id: Option<ActionId>,
         label: String,
         control_type: String,
         value: String,
@@ -160,11 +165,18 @@ pub fn reader_links(page: &SemanticPage) -> Vec<ReaderLink> {
         )
         .enumerate()
         .filter_map(|(index, block)| {
-            let SemanticBlock::Link { text, url, .. } = block else {
+            let SemanticBlock::Link {
+                action_id,
+                text,
+                url,
+                ..
+            } = block
+            else {
                 return None;
             };
             Some(ReaderLink {
                 id: u32::try_from(index + 1).unwrap_or(u32::MAX),
+                action_id: action_id.clone(),
                 text: text.clone(),
                 url: url.clone(),
             })
@@ -272,11 +284,13 @@ fn sanitize_block(block: &SemanticBlock) -> SemanticBlock {
             region: *region,
         },
         SemanticBlock::Link {
+            action_id,
             text,
             url,
             layout,
             region,
         } => SemanticBlock::Link {
+            action_id: action_id.clone(),
             text: sanitize_terminal_text(text),
             url: sanitize_terminal_text(url),
             layout: *layout,
@@ -298,12 +312,14 @@ fn sanitize_block(block: &SemanticBlock) -> SemanticBlock {
             region: *region,
         },
         SemanticBlock::FormControl {
+            action_id,
             label,
             control_type,
             value,
             layout,
             region,
         } => SemanticBlock::FormControl {
+            action_id: action_id.clone(),
             label: sanitize_terminal_text(label),
             control_type: sanitize_terminal_text(control_type),
             value: sanitize_terminal_text(value),
@@ -347,6 +363,7 @@ mod tests {
             url: String::new(),
             title: String::new(),
             blocks: vec![SemanticBlock::Link {
+                action_id: None,
                 text: "Example".to_string(),
                 url: "https://example.com".to_string(),
                 layout: None,

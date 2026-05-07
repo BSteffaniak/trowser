@@ -8,6 +8,7 @@ use trowser_render::{
     NAV_SUMMARY_LINK_LIMIT, SemanticBlock, SemanticPage, SemanticRegion, reader_blocks,
     sanitize_page,
 };
+use trowser_session_models::ActionId;
 use trowser_terminal_image::TerminalImageCapabilities;
 
 const CSS_PX_PER_CELL_X: f64 = 9.0;
@@ -64,10 +65,12 @@ pub struct RenderedLine {
 }
 
 /// Clickable link range within a rendered line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkHitbox {
     /// One-based link id shown in terminal output.
     pub link_id: u32,
+    /// Stable DOM action id for this link when available.
+    pub action_id: Option<ActionId>,
     /// Inclusive start column.
     pub start_col: u16,
     /// Exclusive end column.
@@ -77,16 +80,18 @@ pub struct LinkHitbox {
 impl LinkHitbox {
     /// Returns true if a terminal column is inside this hitbox.
     #[must_use]
-    pub const fn contains(self, column: u16) -> bool {
+    pub const fn contains(&self, column: u16) -> bool {
         self.start_col <= column && column < self.end_col
     }
 }
 
 /// Clickable form-control range within a rendered line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlHitbox {
     /// One-based control id shown in terminal output.
     pub control_id: u32,
+    /// Stable DOM action id for this control when available.
+    pub action_id: Option<ActionId>,
     /// Default click behavior for this control.
     pub action: ControlHitboxAction,
     /// Inclusive start column.
@@ -98,7 +103,7 @@ pub struct ControlHitbox {
 impl ControlHitbox {
     /// Returns true if a terminal column is inside this hitbox.
     #[must_use]
-    pub const fn contains(self, column: u16) -> bool {
+    pub const fn contains(&self, column: u16) -> bool {
         self.start_col <= column && column < self.end_col
     }
 }
@@ -173,11 +178,11 @@ fn push_nav_summary_lines(
         links: Vec::new(),
         controls: Vec::new(),
     });
-    for (label, url) in nav_links {
+    for (action_id, label, url) in nav_links {
         let link_id = u32::try_from(*next_link_id).unwrap_or(u32::MAX);
         *next_link_id += 1;
         let value = format!("[{link_id}] {label} <{url}>");
-        push_wrapped_lines(document, &value, 0, width, Some(link_id));
+        push_wrapped_lines(document, &value, 0, width, Some((link_id, action_id)));
     }
     document.lines.push(RenderedLine::default());
 }
@@ -218,7 +223,12 @@ fn push_reader_block_lines(
                 None,
             );
         }
-        SemanticBlock::Link { text, url, .. } => {
+        SemanticBlock::Link {
+            action_id,
+            text,
+            url,
+            ..
+        } => {
             let label = if text.is_empty() {
                 url.as_str()
             } else {
@@ -232,7 +242,7 @@ fn push_reader_block_lines(
                 &value,
                 placement.indent,
                 placement.width,
-                Some(link_id),
+                Some((link_id, action_id.clone())),
             );
             document.lines.push(RenderedLine::default());
         }
@@ -248,6 +258,7 @@ fn push_reader_block_lines(
             push_text_lines(document, &output, None);
         }
         SemanticBlock::FormControl {
+            action_id,
             label,
             control_type,
             value,
@@ -266,6 +277,7 @@ fn push_reader_block_lines(
                 placement.indent,
                 placement.width,
                 control_id,
+                action_id.clone(),
                 control_action(control_type),
             );
             document.lines.push(RenderedLine::default());
@@ -273,18 +285,23 @@ fn push_reader_block_lines(
     }
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "small render metadata values are cloned into every wrapped hitbox line"
+)]
 fn push_wrapped_lines(
     document: &mut RenderedDocument,
     text: &str,
     indent: usize,
     width: usize,
-    link_id: Option<u32>,
+    link: Option<(u32, Option<ActionId>)>,
 ) {
     for line in wrap_lines(text, width) {
         let text = format!("{}{}", " ".repeat(indent), line);
-        let links = link_id.map_or_else(Vec::new, |link_id| {
+        let links = link.clone().map_or_else(Vec::new, |(link_id, action_id)| {
             vec![LinkHitbox {
                 link_id,
+                action_id,
                 start_col: u16::try_from(indent).unwrap_or(u16::MAX),
                 end_col: u16::try_from(text.chars().count()).unwrap_or(u16::MAX),
             }]
@@ -297,12 +314,17 @@ fn push_wrapped_lines(
     }
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "action ids are cloned into every wrapped hitbox line"
+)]
 fn push_wrapped_control_lines(
     document: &mut RenderedDocument,
     text: &str,
     indent: usize,
     width: usize,
     control_id: u32,
+    action_id: Option<ActionId>,
     action: ControlHitboxAction,
 ) {
     for line in wrap_lines(text, width) {
@@ -310,6 +332,7 @@ fn push_wrapped_control_lines(
         document.lines.push(RenderedLine {
             controls: vec![ControlHitbox {
                 control_id,
+                action_id: action_id.clone(),
                 action,
                 start_col: u16::try_from(indent).unwrap_or(u16::MAX),
                 end_col: u16::try_from(text.chars().count()).unwrap_or(u16::MAX),
@@ -328,12 +351,21 @@ fn control_action(control_type: &str) -> ControlHitboxAction {
     }
 }
 
-fn push_text_lines(document: &mut RenderedDocument, text: &str, link_id: Option<u32>) {
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "small render metadata values are cloned into every emitted line"
+)]
+fn push_text_lines(
+    document: &mut RenderedDocument,
+    text: &str,
+    link: Option<(u32, Option<ActionId>)>,
+) {
     for line in text.lines() {
         let end_col = u16::try_from(line.chars().count()).unwrap_or(u16::MAX);
-        let links = link_id.map_or_else(Vec::new, |link_id| {
+        let links = link.clone().map_or_else(Vec::new, |(link_id, action_id)| {
             vec![LinkHitbox {
                 link_id,
+                action_id,
                 start_col: 0,
                 end_col,
             }]
@@ -377,9 +409,13 @@ fn render_header(page: &SemanticPage, width: usize, output: &mut String) {
     output.push_str("\n\n");
 }
 
-fn nav_link_target(block: &SemanticBlock) -> Option<(String, String)> {
+fn nav_link_target(block: &SemanticBlock) -> Option<(Option<ActionId>, String, String)> {
     let SemanticBlock::Link {
-        text, url, region, ..
+        action_id,
+        text,
+        url,
+        region,
+        ..
     } = block
     else {
         return None;
@@ -390,6 +426,7 @@ fn nav_link_target(block: &SemanticBlock) -> Option<(String, String)> {
     }
 
     Some((
+        action_id.clone(),
         if text.is_empty() {
             url.clone()
         } else {

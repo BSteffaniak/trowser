@@ -11,11 +11,12 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-serde = { workspace = true, features = ["derive"] }
+serde                  = { workspace = true, features = ["derive"] }
+trowser_session_models = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true, features = ["std"] }
 
 [features]
 default          = []
-fail-on-warnings = []
+fail-on-warnings = ["trowser_session_models/fail-on-warnings"]

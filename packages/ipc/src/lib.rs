@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use trowser_render::SemanticPage;
-use trowser_session_models::{SessionSnapshot, TabId};
+use trowser_session_models::{ActionId, SessionSnapshot, TabId};
 
 /// Current trowser IPC protocol version.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -75,6 +75,10 @@ pub enum Request {
     Back,
     /// Navigates the active tab forward in browser history.
     Forward,
+    /// Activates/clicks a stable DOM action in the active tab.
+    ActivateAction { action_id: ActionId },
+    /// Inputs text into a stable DOM action in the active tab.
+    InputTextAction { action_id: ActionId, text: String },
     /// Activates/clicks a form control in the active tab.
     ClickControl { control_id: u32 },
     /// Inputs text into a form control in the active tab.

@@ -17,8 +17,8 @@ use trowser_ipc::{
     ClientHello, PROTOCOL_VERSION, ProtocolCapabilities, Request, Response, ServerHello,
     ServerStatus,
 };
-use trowser_render::{SemanticBlock, SemanticPage, SemanticRegion, reader_links};
-use trowser_session_models::{SessionSnapshot, TabId, TabSummary};
+use trowser_render::{SemanticBlock, SemanticPage, SemanticRegion, reader_blocks, reader_links};
+use trowser_session_models::{ActionId, SessionSnapshot, TabId, TabSummary};
 
 /// Daemon errors.
 #[derive(Debug, Error)]
@@ -171,6 +171,10 @@ impl TrowserServer {
             Request::Reload => self.handle_reload().await,
             Request::Back => self.handle_back().await,
             Request::Forward => self.handle_forward().await,
+            Request::ActivateAction { action_id } => self.handle_activate_action(action_id).await,
+            Request::InputTextAction { action_id, text } => {
+                self.handle_input_text_action(action_id, text).await
+            }
             Request::ClickControl { control_id } => self.handle_click_control(control_id).await,
             Request::InputText { control_id, text } => {
                 self.handle_input_text(control_id, text).await
@@ -219,11 +223,15 @@ impl TrowserServer {
     }
 
     async fn handle_follow_link(&self, link_id: u32) -> Response {
-        let Some((tab_id, url)) = self.follow_link_target(link_id).await else {
+        let Some((tab_id, action_id, url)) = self.follow_link_target(link_id).await else {
             return Response::Error {
                 message: format!("unknown link id {link_id}"),
             };
         };
+
+        if let Some(action_id) = action_id {
+            return self.handle_activate_action(action_id).await;
+        }
 
         let page = self
             .navigate_browser_tab(&tab_id, &url)
@@ -232,16 +240,31 @@ impl TrowserServer {
         self.store_page(tab_id, page).await
     }
 
-    async fn follow_link_target(&self, link_id: u32) -> Option<(TabId, String)> {
+    async fn follow_link_target(&self, link_id: u32) -> Option<(TabId, Option<ActionId>, String)> {
         let state = self.state.lock().await;
         let tab_id = state.active_tab.clone()?;
         let page = state.tabs.get(&tab_id)?.clone();
         drop(state);
         let target = reader_links(&page)
             .into_iter()
-            .find(|link| link.id == link_id)
-            .map(|link| link.url)?;
-        Some((tab_id, target))
+            .find(|link| link.id == link_id)?;
+        Some((tab_id, target.action_id, target.url))
+    }
+
+    async fn control_action_id(&self, control_id: u32) -> Option<ActionId> {
+        let state = self.state.lock().await;
+        let tab_id = state.active_tab.clone()?;
+        let page = state.tabs.get(&tab_id)?.clone();
+        drop(state);
+        reader_blocks(&page.blocks)
+            .into_iter()
+            .filter_map(|block| {
+                let SemanticBlock::FormControl { action_id, .. } = block else {
+                    return None;
+                };
+                action_id.clone()
+            })
+            .nth(usize::try_from(control_id.saturating_sub(1)).ok()?)
     }
 
     async fn handle_switch_tab(&self, tab_id: TabId) -> Response {
@@ -369,13 +392,13 @@ impl TrowserServer {
         }
     }
 
-    async fn handle_click_control(&self, control_id: u32) -> Response {
+    async fn handle_activate_action(&self, action_id: ActionId) -> Response {
         let Some(tab_id) = self.active_tab_id().await else {
             return Response::Error {
                 message: "no active tab".to_string(),
             };
         };
-        match self.click_control(&tab_id, control_id).await {
+        match self.activate_action(&tab_id, &action_id).await {
             Ok(page) => self.store_page(tab_id, page).await,
             Err(error) => Response::Error {
                 message: error.to_string(),
@@ -383,18 +406,36 @@ impl TrowserServer {
         }
     }
 
-    async fn handle_input_text(&self, control_id: u32, text: String) -> Response {
+    async fn handle_input_text_action(&self, action_id: ActionId, text: String) -> Response {
         let Some(tab_id) = self.active_tab_id().await else {
             return Response::Error {
                 message: "no active tab".to_string(),
             };
         };
-        match self.input_text(&tab_id, control_id, &text).await {
+        match self.input_text_action(&tab_id, &action_id, &text).await {
             Ok(page) => self.store_page(tab_id, page).await,
             Err(error) => Response::Error {
                 message: error.to_string(),
             },
         }
+    }
+
+    async fn handle_click_control(&self, control_id: u32) -> Response {
+        let Some(action_id) = self.control_action_id(control_id).await else {
+            return Response::Error {
+                message: format!("unknown control id {control_id}"),
+            };
+        };
+        self.handle_activate_action(action_id).await
+    }
+
+    async fn handle_input_text(&self, control_id: u32, text: String) -> Response {
+        let Some(action_id) = self.control_action_id(control_id).await else {
+            return Response::Error {
+                message: format!("unknown control id {control_id}"),
+            };
+        };
+        self.handle_input_text_action(action_id, text).await
     }
 
     async fn active_tab_id(&self) -> Option<TabId> {
@@ -540,10 +581,10 @@ impl TrowserServer {
         clippy::significant_drop_tightening,
         reason = "browser mutex intentionally serializes access to persistent CDP page targets"
     )]
-    async fn click_control(
+    async fn activate_action(
         &self,
         tab_id: &TabId,
-        control_id: u32,
+        action_id: &ActionId,
     ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
         let mut browser = self.browser.lock().await;
         let Some(browser) = browser.as_mut() else {
@@ -551,17 +592,17 @@ impl TrowserServer {
                 "browser is not connected".to_string(),
             ));
         };
-        browser.click_control(tab_id, control_id).await
+        browser.activate_action(tab_id, action_id).await
     }
 
     #[allow(
         clippy::significant_drop_tightening,
         reason = "browser mutex intentionally serializes access to persistent CDP page targets"
     )]
-    async fn input_text(
+    async fn input_text_action(
         &self,
         tab_id: &TabId,
-        control_id: u32,
+        action_id: &ActionId,
         text: &str,
     ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
         let mut browser = self.browser.lock().await;
@@ -570,7 +611,7 @@ impl TrowserServer {
                 "browser is not connected".to_string(),
             ));
         };
-        browser.input_text(tab_id, control_id, text).await
+        browser.input_text_action(tab_id, action_id, text).await
     }
 
     async fn shutdown_browser(&self) {

@@ -1535,6 +1535,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "serde",
  "serde_json",
+ "trowser_session_models",
 ]
 
 [[package]]
@@ -1564,6 +1565,7 @@ name = "trowser_terminal"
 version = "0.0.1-alpha.0"
 dependencies = [
  "trowser_render",
+ "trowser_session_models",
  "trowser_terminal_image",
 ]
 
