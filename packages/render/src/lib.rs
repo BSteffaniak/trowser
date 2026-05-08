@@ -38,8 +38,8 @@ impl SemanticViewport {
     #[must_use]
     pub fn from_terminal_cells(width_cells: u16, height_cells: u16) -> Self {
         Self {
-            width_px: u32::from(width_cells).saturating_mul(9).max(360),
-            height_px: u32::from(height_cells).saturating_mul(18).max(720),
+            width_px: u32::from(width_cells).saturating_mul(9).max(1),
+            height_px: u32::from(height_cells).saturating_mul(18).max(1),
         }
     }
 }

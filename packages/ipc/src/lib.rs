@@ -49,6 +49,15 @@ pub struct ViewportHint {
 }
 
 impl ViewportHint {
+    /// Creates a terminal viewport hint from visible content cells.
+    #[must_use]
+    pub const fn from_terminal_cells(width_cells: u16, height_cells: u16) -> Self {
+        Self {
+            width_cells,
+            height_cells,
+        }
+    }
+
     /// Converts this terminal viewport hint into CSS pixels.
     #[must_use]
     pub fn semantic_viewport(self) -> SemanticViewport {

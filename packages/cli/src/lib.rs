@@ -668,6 +668,25 @@ async fn run_interactive(
                 }
                 _ => {}
             },
+            Event::Resize(_, _) => {
+                rendered = render_page_document(&page, config, render_mode);
+                offset = offset.min(rendered.lines.len().saturating_sub(1));
+                let client_clone = client.clone();
+                match load_with_ui(&client, "resizing viewport", None, async move {
+                    active_snapshot(&client_clone).await
+                })
+                .await
+                {
+                    Ok(Some(updated_page)) => {
+                        page = updated_page;
+                        rendered = render_page_document(&page, config, render_mode);
+                        offset = 0;
+                        message = "resized viewport".to_string();
+                    }
+                    Ok(None) => message = "resize canceled".to_string(),
+                    Err(error) => message = error.to_string(),
+                }
+            }
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::ScrollDown => {
                     offset = offset
@@ -1078,16 +1097,23 @@ async fn tabs_status(client: &TrowserClient) -> Result<String> {
     Ok(format!("tab {active_index}/{}", snapshot.tabs.len()))
 }
 
-async fn active_snapshot_or_empty(client: &TrowserClient) -> trowser_render::SemanticPage {
+async fn active_snapshot(client: &TrowserClient) -> Result<trowser_render::SemanticPage> {
     match client
         .send(&Request::ActiveSnapshot {
             viewport: current_viewport_hint(),
         })
-        .await
+        .await?
     {
-        Ok(Response::ActiveSnapshot { page, .. }) => page,
-        _ => empty_page("Press o to open a URL."),
+        Response::ActiveSnapshot { page, .. } => Ok(page),
+        Response::Error { message } => anyhow::bail!(message),
+        unexpected => anyhow::bail!("unexpected active snapshot response: {unexpected:?}"),
     }
+}
+
+async fn active_snapshot_or_empty(client: &TrowserClient) -> trowser_render::SemanticPage {
+    active_snapshot(client)
+        .await
+        .unwrap_or_else(|_| empty_page("Press o to open a URL."))
 }
 
 fn empty_page(message: &str) -> trowser_render::SemanticPage {
@@ -1105,9 +1131,8 @@ fn empty_page(message: &str) -> trowser_render::SemanticPage {
 }
 
 fn current_viewport_hint() -> Option<ViewportHint> {
-    size().ok().map(|(width_cells, height_cells)| ViewportHint {
-        width_cells,
-        height_cells,
+    size().ok().map(|(width_cells, height_cells)| {
+        ViewportHint::from_terminal_cells(width_cells, viewport_body_height(height_cells))
     })
 }
 
@@ -1120,17 +1145,26 @@ const fn config_viewport_hint(config: &TrowserConfig) -> ViewportHint {
 
 fn render_page_document(
     page: &trowser_render::SemanticPage,
-    config: &TrowserConfig,
+    _config: &TrowserConfig,
     render_mode: RenderMode,
 ) -> RenderedDocument {
-    render_document_mode(
-        page,
-        &TerminalRenderOptions {
-            width: config.render.max_width,
-            image_capabilities: detect_from_env(),
-        },
-        render_mode,
-    )
+    render_document_mode(page, &current_terminal_render_options(), render_mode)
+}
+
+fn current_terminal_render_options() -> TerminalRenderOptions {
+    TerminalRenderOptions {
+        width: current_terminal_width(),
+        image_capabilities: detect_from_env(),
+    }
+}
+
+fn current_terminal_width() -> u16 {
+    size().map_or(80, |(width, _)| width.max(40))
+}
+
+const fn viewport_body_height(height_cells: u16) -> u16 {
+    let body_height = height_cells.saturating_sub(2);
+    if body_height == 0 { 1 } else { body_height }
 }
 
 fn draw_viewport(
