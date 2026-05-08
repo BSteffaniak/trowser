@@ -22,7 +22,9 @@ use trowser_browser::{
     BrowserBackend, BrowserCapabilities, BrowserError, BrowserResult, ExtractedPage,
     NavigateRequest,
 };
-use trowser_render::{BlockLayout, SemanticBlock, SemanticPage, SemanticRegion, TextRun};
+use trowser_render::{
+    BlockLayout, SemanticBlock, SemanticLayoutNode, SemanticPage, SemanticRegion, TextRun,
+};
 use trowser_session_models::{ActionId, TabId};
 
 /// Configuration for the Chromium/CDP backend.
@@ -727,6 +729,7 @@ impl CdpConnection {
             url: dom_page.url.clone(),
             title: dom_page.title.clone(),
             blocks,
+            layout_tree: None,
         }))
     }
 }
@@ -1248,6 +1251,7 @@ struct CdpSemanticPage {
     url: String,
     title: String,
     blocks: Vec<CdpSemanticBlock>,
+    layout_tree: Option<SemanticLayoutNode>,
 }
 
 impl CdpSemanticPage {
@@ -1260,6 +1264,7 @@ impl CdpSemanticPage {
                 .into_iter()
                 .map(CdpSemanticBlock::into_semantic_block)
                 .collect(),
+            layout_tree: self.layout_tree,
         }
     }
 }
@@ -1620,6 +1625,42 @@ const DOM_EXTRACTION_JS: &str = r#"
     const runs = inlineRuns(el);
     if (runs.length) blocks.push({ kind, runs, layout: layout(el), region: region(el), ...prefix });
   };
+  const layoutNode = (el, depth = 0) => {
+    if (!el || !visible(el) || depth > 8) return null;
+    const tag = el.tagName.toLowerCase();
+    const style = window.getComputedStyle(el);
+    const children = Array.from(el.children)
+      .filter((child) => visible(child))
+      .filter((child) => {
+        const childTag = child.tagName.toLowerCase();
+        const childStyle = window.getComputedStyle(child);
+        return depth < 2
+          || ['header','nav','main','article','section','aside','footer','form','ul','ol','li','p','blockquote','pre','table','a','button','input','textarea','select'].includes(childTag)
+          || ['flex','grid','table'].includes(childStyle.display)
+          || child.getAttribute('role');
+      })
+      .slice(0, 80)
+      .map((child) => layoutNode(child, depth + 1))
+      .filter(Boolean);
+    const actionable = tag === 'a' || isControl(el);
+    const runs = ['p','li','blockquote'].includes(tag) ? inlineRuns(el) : [];
+    const text = runs.length ? '' : clean(el.getAttribute('aria-label') || el.getAttribute('title') || (actionable ? el.innerText || el.textContent : ''));
+    return {
+      tag,
+      role: clean(el.getAttribute('role') || ''),
+      region: region(el),
+      layout: layout(el),
+      display: style ? style.display || '' : '',
+      text,
+      runs,
+      action_id: actionable ? actionId(el) : null,
+      url: tag === 'a' ? el.href || '' : '',
+      control_type: isControl(el) ? controlType(el) : '',
+      value: isControl(el) ? clean(el.value || '') : '',
+      children,
+    };
+  };
+
   const tableData = (table) => {
     const headerCells = Array.from(table.querySelectorAll('thead tr:first-child th'));
     const firstRowHeaders = headerCells.length ? headerCells : Array.from(table.querySelectorAll('tr:first-child th'));
@@ -1688,6 +1729,7 @@ const DOM_EXTRACTION_JS: &str = r#"
     url: location.href,
     title: document.title,
     blocks,
+    layout_tree: document.body ? layoutNode(document.body) : null,
   });
 })()
 "#;
@@ -1759,6 +1801,7 @@ impl BrowserBackend for CdpBackend {
                 url: String::new(),
                 title: "CDP backend requires async daemon extraction".to_string(),
                 blocks: Vec::new(),
+                layout_tree: None,
             },
         })
     }

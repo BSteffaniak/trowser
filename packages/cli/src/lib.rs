@@ -994,6 +994,7 @@ fn empty_page(message: &str) -> trowser_render::SemanticPage {
             layout: None,
             region: trowser_render::SemanticRegion::Main,
         }],
+        layout_tree: None,
     }
 }
 

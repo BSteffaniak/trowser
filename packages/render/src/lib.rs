@@ -17,6 +17,8 @@ pub struct SemanticPage {
     pub title: String,
     /// Ordered semantic blocks extracted from the browser backend.
     pub blocks: Vec<SemanticBlock>,
+    /// Optional browser-derived DOM/layout tree for layout-preserving rendering.
+    pub layout_tree: Option<SemanticLayoutNode>,
 }
 
 /// Browser-derived layout hint for a semantic block.
@@ -108,6 +110,44 @@ impl TextRun {
     #[must_use]
     pub fn is_link(&self) -> bool {
         self.url.as_ref().is_some_and(|url| !url.is_empty()) || self.action_id.is_some()
+    }
+}
+
+/// Browser-derived layout tree node used by layout-preserving renderers.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SemanticLayoutNode {
+    /// Lowercase DOM tag name or synthetic node name.
+    pub tag: String,
+    /// ARIA role when present.
+    pub role: String,
+    /// Browser semantic region for this node.
+    pub region: SemanticRegion,
+    /// Browser-derived geometry for this node.
+    pub layout: Option<BlockLayout>,
+    /// CSS display hint such as block/flex/grid.
+    pub display: String,
+    /// Direct visible text label for compact nodes.
+    pub text: String,
+    /// Inline text runs for text-bearing nodes.
+    pub runs: Vec<TextRun>,
+    /// Stable DOM action id when this node is actionable.
+    pub action_id: Option<ActionId>,
+    /// Link target URL when this node is a link.
+    pub url: String,
+    /// Control type when this node is a control.
+    pub control_type: String,
+    /// Current control value when available.
+    pub value: String,
+    /// Child layout nodes.
+    pub children: Vec<Self>,
+}
+
+impl SemanticLayoutNode {
+    /// Returns true when this node has useful geometry.
+    #[must_use]
+    pub fn has_layout(&self) -> bool {
+        self.layout.is_some_and(BlockLayout::is_non_empty)
     }
 }
 
@@ -349,6 +389,24 @@ pub fn sanitize_page(page: &SemanticPage) -> SemanticPage {
         url: sanitize_terminal_text(&page.url),
         title: sanitize_terminal_text(&page.title),
         blocks: page.blocks.iter().map(sanitize_block).collect(),
+        layout_tree: page.layout_tree.as_ref().map(sanitize_layout_node),
+    }
+}
+
+fn sanitize_layout_node(node: &SemanticLayoutNode) -> SemanticLayoutNode {
+    SemanticLayoutNode {
+        tag: sanitize_terminal_text(&node.tag),
+        role: sanitize_terminal_text(&node.role),
+        region: node.region,
+        layout: node.layout,
+        display: sanitize_terminal_text(&node.display),
+        text: sanitize_terminal_text(&node.text),
+        runs: node.runs.iter().map(sanitize_text_run).collect(),
+        action_id: node.action_id.clone(),
+        url: sanitize_terminal_text(&node.url),
+        control_type: sanitize_terminal_text(&node.control_type),
+        value: sanitize_terminal_text(&node.value),
+        children: node.children.iter().map(sanitize_layout_node).collect(),
     }
 }
 
@@ -612,6 +670,7 @@ mod tests {
                 layout: None,
                 region: SemanticRegion::Main,
             }],
+            layout_tree: None,
         };
 
         let links = reader_links(&page);

@@ -880,6 +880,7 @@ fn error_page(url: &str, error: &str) -> SemanticPage {
                 region: SemanticRegion::Main,
             },
         ],
+        layout_tree: None,
     }
 }
 

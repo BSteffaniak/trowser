@@ -7,8 +7,8 @@
 use std::collections::BTreeMap;
 
 use trowser_render::{
-    NAV_SUMMARY_LINK_LIMIT, SemanticBlock, SemanticPage, SemanticRegion, TextRun, TextRunStyle,
-    reader_blocks, sanitize_page,
+    NAV_SUMMARY_LINK_LIMIT, SemanticBlock, SemanticLayoutNode, SemanticPage, SemanticRegion,
+    TextRun, TextRunStyle, reader_blocks, sanitize_page,
 };
 use trowser_session_models::ActionId;
 use trowser_terminal_image::TerminalImageCapabilities;
@@ -43,6 +43,8 @@ pub enum RenderMode {
     Reader,
     /// Preserve more page chrome such as header/nav/footer.
     Page,
+    /// Emulate browser layout using DOM geometry and regions.
+    Browser,
     /// Show a compact headings/actions overview.
     Outline,
 }
@@ -52,8 +54,8 @@ impl RenderMode {
     #[must_use]
     pub const fn next(self) -> Self {
         match self {
-            Self::Reader => Self::Page,
-            Self::Page => Self::Outline,
+            Self::Reader | Self::Page => Self::Browser,
+            Self::Browser => Self::Outline,
             Self::Outline => Self::Reader,
         }
     }
@@ -64,6 +66,7 @@ impl RenderMode {
         match self {
             Self::Reader => "reader",
             Self::Page => "page",
+            Self::Browser => "browser",
             Self::Outline => "outline",
         }
     }
@@ -241,6 +244,14 @@ pub fn render_document_mode(
                 &mut document,
             );
         }
+        RenderMode::Browser => push_browser_layout_lines(
+            &page,
+            width,
+            options,
+            &mut next_link_id,
+            &mut next_control_id,
+            &mut document,
+        ),
         RenderMode::Outline => push_outline_lines(
             &page,
             &mut next_link_id,
@@ -402,6 +413,365 @@ fn normalize_document_spacing(document: &mut RenderedDocument) {
         lines.pop();
     }
     document.lines = lines;
+}
+
+fn push_browser_layout_lines(
+    page: &SemanticPage,
+    width: usize,
+    options: &TerminalRenderOptions,
+    next_link_id: &mut usize,
+    next_control_id: &mut usize,
+    document: &mut RenderedDocument,
+) {
+    if !page
+        .layout_tree
+        .as_ref()
+        .is_some_and(layout_tree_has_geometry)
+    {
+        let blocks = page.blocks.iter().collect::<Vec<_>>();
+        push_blocks_with_layout(
+            &blocks,
+            RenderMode::Page,
+            width,
+            options,
+            next_link_id,
+            next_control_id,
+            document,
+        );
+        return;
+    }
+
+    let regions = BrowserRegions::from_blocks(&page.blocks);
+    push_browser_full_width_panel(
+        "Top bar",
+        &regions.top,
+        width,
+        options,
+        next_link_id,
+        next_control_id,
+        document,
+    );
+    push_browser_content_panels(
+        &regions.main,
+        &regions.aside,
+        width,
+        options,
+        next_link_id,
+        next_control_id,
+        document,
+    );
+    push_browser_full_width_panel(
+        "Footer",
+        &regions.footer,
+        width,
+        options,
+        next_link_id,
+        next_control_id,
+        document,
+    );
+}
+
+fn layout_tree_has_geometry(node: &SemanticLayoutNode) -> bool {
+    node.has_layout() || node.children.iter().any(layout_tree_has_geometry)
+}
+
+#[derive(Debug, Default)]
+struct BrowserRegions<'a> {
+    top: Vec<&'a SemanticBlock>,
+    main: Vec<&'a SemanticBlock>,
+    aside: Vec<&'a SemanticBlock>,
+    footer: Vec<&'a SemanticBlock>,
+}
+
+impl<'a> BrowserRegions<'a> {
+    fn from_blocks(blocks: &'a [SemanticBlock]) -> Self {
+        let mut regions = Self::default();
+        for block in blocks {
+            match block.region() {
+                SemanticRegion::Header | SemanticRegion::Navigation => regions.top.push(block),
+                SemanticRegion::Aside => regions.aside.push(block),
+                SemanticRegion::Footer => regions.footer.push(block),
+                SemanticRegion::Main | SemanticRegion::Unknown => regions.main.push(block),
+            }
+        }
+        regions
+    }
+}
+
+fn push_browser_full_width_panel(
+    title: &str,
+    blocks: &[&SemanticBlock],
+    width: usize,
+    options: &TerminalRenderOptions,
+    next_link_id: &mut usize,
+    next_control_id: &mut usize,
+    document: &mut RenderedDocument,
+) {
+    if blocks.is_empty() {
+        return;
+    }
+    let panel = render_browser_panel(title, blocks, width, options, next_link_id, next_control_id);
+    document.lines.extend(panel.lines);
+    document.lines.push(RenderedLine::default());
+}
+
+fn push_browser_content_panels(
+    main_blocks: &[&SemanticBlock],
+    aside_blocks: &[&SemanticBlock],
+    width: usize,
+    options: &TerminalRenderOptions,
+    next_link_id: &mut usize,
+    next_control_id: &mut usize,
+    document: &mut RenderedDocument,
+) {
+    if main_blocks.is_empty() && aside_blocks.is_empty() {
+        return;
+    }
+    if aside_blocks.is_empty() || width < 96 {
+        push_browser_full_width_panel(
+            "Main",
+            main_blocks,
+            width,
+            options,
+            next_link_id,
+            next_control_id,
+            document,
+        );
+        push_browser_full_width_panel(
+            "Aside",
+            aside_blocks,
+            width,
+            options,
+            next_link_id,
+            next_control_id,
+            document,
+        );
+        return;
+    }
+
+    let aside_width = (width / 3).clamp(28, 44);
+    let main_width = width.saturating_sub(aside_width + 2).max(40);
+    let main = render_browser_panel(
+        "Main",
+        main_blocks,
+        main_width,
+        options,
+        next_link_id,
+        next_control_id,
+    );
+    let aside = render_browser_panel(
+        "Aside",
+        aside_blocks,
+        aside_width,
+        options,
+        next_link_id,
+        next_control_id,
+    );
+    document
+        .lines
+        .extend(combine_documents_side_by_side(&main, &aside, 2));
+    document.lines.push(RenderedLine::default());
+}
+
+fn render_browser_panel(
+    title: &str,
+    blocks: &[&SemanticBlock],
+    width: usize,
+    options: &TerminalRenderOptions,
+    next_link_id: &mut usize,
+    next_control_id: &mut usize,
+) -> RenderedDocument {
+    let inner_width = width.saturating_sub(4).max(MIN_BLOCK_WIDTH);
+    let mut content = RenderedDocument::default();
+    push_blocks_with_layout(
+        blocks,
+        RenderMode::Reader,
+        inner_width,
+        options,
+        next_link_id,
+        next_control_id,
+        &mut content,
+    );
+    normalize_document_spacing(&mut content);
+    box_document(title, &content, width)
+}
+
+fn box_document(title: &str, content: &RenderedDocument, width: usize) -> RenderedDocument {
+    let mut document = RenderedDocument::default();
+    document.lines.push(line_with_style(
+        box_top_line(title, width),
+        SpanStyle::Chrome,
+    ));
+    for line in &content.lines {
+        document.lines.push(box_content_line(line, width));
+    }
+    document.lines.push(line_with_style(
+        format!("╰{}╯", "─".repeat(width.saturating_sub(2))),
+        SpanStyle::Chrome,
+    ));
+    document
+}
+
+fn box_top_line(title: &str, width: usize) -> String {
+    let label = format!(" {title} ");
+    let fill = width.saturating_sub(label.chars().count() + 2);
+    format!("╭{label}{}╮", "─".repeat(fill))
+}
+
+fn box_content_line(line: &RenderedLine, width: usize) -> RenderedLine {
+    let inner_width = width.saturating_sub(4);
+    let clipped = truncate_for_cells(&line.text, inner_width);
+    let pad = inner_width.saturating_sub(clipped.chars().count());
+    let text = format!("│ {clipped}{} │", " ".repeat(pad));
+    RenderedLine {
+        spans: boxed_spans(line, &clipped, pad),
+        links: offset_links(&line.links, 2),
+        controls: offset_controls(&line.controls, 2),
+        text,
+    }
+}
+
+fn boxed_spans(line: &RenderedLine, clipped: &str, pad: usize) -> Vec<StyledSpan> {
+    let style = line
+        .spans
+        .first()
+        .map_or(SpanStyle::Normal, |span| span.style);
+    vec![
+        StyledSpan {
+            text: "│ ".to_string(),
+            style: SpanStyle::Chrome,
+        },
+        StyledSpan {
+            text: clipped.to_string(),
+            style,
+        },
+        StyledSpan {
+            text: format!("{} │", " ".repeat(pad)),
+            style: SpanStyle::Chrome,
+        },
+    ]
+}
+
+fn combine_documents_side_by_side(
+    left: &RenderedDocument,
+    right: &RenderedDocument,
+    gap: usize,
+) -> Vec<RenderedLine> {
+    let left_width = document_width(left);
+    let rows = left.lines.len().max(right.lines.len());
+    (0..rows)
+        .map(|row| combine_document_row(left, right, row, left_width, gap))
+        .collect()
+}
+
+fn combine_document_row(
+    left: &RenderedDocument,
+    right: &RenderedDocument,
+    row: usize,
+    left_width: usize,
+    gap: usize,
+) -> RenderedLine {
+    let left_line = left.lines.get(row).cloned().unwrap_or_default();
+    let right_line = right.lines.get(row).cloned().unwrap_or_default();
+    let filler = left_width.saturating_sub(left_line.text.chars().count()) + gap;
+    let text = format!(
+        "{}{}{}",
+        left_line.text,
+        " ".repeat(filler),
+        right_line.text
+    );
+    RenderedLine {
+        spans: combined_spans(&left_line, &right_line, filler),
+        links: combine_links(&left_line, &right_line, left_width + gap),
+        controls: combine_controls(&left_line, &right_line, left_width + gap),
+        text,
+    }
+}
+
+fn combined_spans(left: &RenderedLine, right: &RenderedLine, filler: usize) -> Vec<StyledSpan> {
+    let mut spans = if left.spans.is_empty() {
+        vec![StyledSpan {
+            text: left.text.clone(),
+            style: SpanStyle::Normal,
+        }]
+    } else {
+        left.spans.clone()
+    };
+    spans.push(StyledSpan {
+        text: " ".repeat(filler),
+        style: SpanStyle::Normal,
+    });
+    spans.extend(if right.spans.is_empty() {
+        vec![StyledSpan {
+            text: right.text.clone(),
+            style: SpanStyle::Normal,
+        }]
+    } else {
+        right.spans.clone()
+    });
+    spans
+}
+
+fn combine_links(left: &RenderedLine, right: &RenderedLine, offset: usize) -> Vec<LinkHitbox> {
+    left.links
+        .iter()
+        .cloned()
+        .chain(offset_links(&right.links, offset))
+        .collect()
+}
+
+fn combine_controls(
+    left: &RenderedLine,
+    right: &RenderedLine,
+    offset: usize,
+) -> Vec<ControlHitbox> {
+    left.controls
+        .iter()
+        .cloned()
+        .chain(offset_controls(&right.controls, offset))
+        .collect()
+}
+
+fn offset_links(links: &[LinkHitbox], offset: usize) -> Vec<LinkHitbox> {
+    links
+        .iter()
+        .map(|link| LinkHitbox {
+            link_id: link.link_id,
+            action_id: link.action_id.clone(),
+            start_col: offset_col(link.start_col, offset),
+            end_col: offset_col(link.end_col, offset),
+        })
+        .collect()
+}
+
+fn offset_controls(controls: &[ControlHitbox], offset: usize) -> Vec<ControlHitbox> {
+    controls
+        .iter()
+        .map(|control| ControlHitbox {
+            control_id: control.control_id,
+            action_id: control.action_id.clone(),
+            action: control.action,
+            start_col: offset_col(control.start_col, offset),
+            end_col: offset_col(control.end_col, offset),
+        })
+        .collect()
+}
+
+fn offset_col(column: u16, offset: usize) -> u16 {
+    column.saturating_add(u16::try_from(offset).unwrap_or(u16::MAX))
+}
+
+fn document_width(document: &RenderedDocument) -> usize {
+    document
+        .lines
+        .iter()
+        .map(|line| line.text.chars().count())
+        .max()
+        .unwrap_or_default()
+}
+
+fn truncate_for_cells(text: &str, width: usize) -> String {
+    text.chars().take(width).collect()
 }
 
 fn line_with_style(text: String, style: SpanStyle) -> RenderedLine {
@@ -1403,6 +1773,7 @@ mod tests {
                 layout: None,
                 region: SemanticRegion::Main,
             }],
+            layout_tree: None,
         };
 
         let rendered = render_plain_text(&page, &TerminalRenderOptions::default());
@@ -1425,6 +1796,7 @@ mod tests {
                 }),
                 region: SemanticRegion::Main,
             }],
+            layout_tree: None,
         };
 
         let rendered = render_plain_text(&page, &TerminalRenderOptions::default());
