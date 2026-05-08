@@ -313,7 +313,7 @@ async fn run_interactive(
     } else {
         active_snapshot_or_empty(&client).await
     };
-    let mut render_mode = RenderMode::Reader;
+    let mut render_mode = RenderMode::default();
     let mut rendered = render_page_document(&page, config, render_mode);
     let mut tab_status = tabs_status(&client).await.unwrap_or_default();
     let mut offset = page_scroll_offset(&page, &rendered);

@@ -39,11 +39,11 @@ impl Default for TerminalRenderOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RenderMode {
     /// Prioritize readable main/article content.
-    #[default]
     Reader,
     /// Preserve more page chrome such as header/nav/footer.
     Page,
     /// Emulate browser layout using DOM geometry and regions.
+    #[default]
     Browser,
     /// Show a compact headings/actions overview.
     Outline,
