@@ -75,6 +75,42 @@ pub struct ReaderLink {
     pub url: String,
 }
 
+/// Inline text style hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TextRunStyle {
+    /// Regular inline text.
+    #[default]
+    Normal,
+    /// Strong/bold inline text.
+    Strong,
+    /// Emphasized inline text.
+    Emphasis,
+    /// Inline code text.
+    Code,
+}
+
+/// Terminal-renderable inline text run.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TextRun {
+    /// Run text.
+    pub text: String,
+    /// Inline style hint.
+    pub style: TextRunStyle,
+    /// Link target URL when this run is clickable.
+    pub url: Option<String>,
+    /// Stable DOM action id when this run maps to an action.
+    pub action_id: Option<ActionId>,
+}
+
+impl TextRun {
+    /// Returns true when this run is a clickable link.
+    #[must_use]
+    pub fn is_link(&self) -> bool {
+        self.url.as_ref().is_some_and(|url| !url.is_empty()) || self.action_id.is_some()
+    }
+}
+
 /// Terminal-renderable semantic block.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SemanticBlock {
@@ -91,9 +127,46 @@ pub enum SemanticBlock {
         layout: Option<BlockLayout>,
         region: SemanticRegion,
     },
+    /// Paragraph/body text with inline links and styles.
+    RichParagraph {
+        runs: Vec<TextRun>,
+        layout: Option<BlockLayout>,
+        region: SemanticRegion,
+    },
     /// List item text.
     ListItem {
         text: String,
+        layout: Option<BlockLayout>,
+        region: SemanticRegion,
+    },
+    /// List item text with inline links and styles.
+    RichListItem {
+        runs: Vec<TextRun>,
+        layout: Option<BlockLayout>,
+        region: SemanticRegion,
+    },
+    /// Block quote text.
+    Quote {
+        runs: Vec<TextRun>,
+        layout: Option<BlockLayout>,
+        region: SemanticRegion,
+    },
+    /// Preformatted/code block text.
+    CodeBlock {
+        text: String,
+        language: Option<String>,
+        layout: Option<BlockLayout>,
+        region: SemanticRegion,
+    },
+    /// Simple table data.
+    Table {
+        headers: Vec<String>,
+        rows: Vec<Vec<String>>,
+        layout: Option<BlockLayout>,
+        region: SemanticRegion,
+    },
+    /// Horizontal rule / thematic break.
+    HorizontalRule {
         layout: Option<BlockLayout>,
         region: SemanticRegion,
     },
@@ -132,7 +205,13 @@ impl SemanticBlock {
         match self {
             Self::Heading { layout, .. }
             | Self::Paragraph { layout, .. }
+            | Self::RichParagraph { layout, .. }
             | Self::ListItem { layout, .. }
+            | Self::RichListItem { layout, .. }
+            | Self::Quote { layout, .. }
+            | Self::CodeBlock { layout, .. }
+            | Self::Table { layout, .. }
+            | Self::HorizontalRule { layout, .. }
             | Self::Link { layout, .. }
             | Self::Image { layout, .. }
             | Self::FormControl { layout, .. } => *layout,
@@ -145,7 +224,13 @@ impl SemanticBlock {
         match self {
             Self::Heading { region, .. }
             | Self::Paragraph { region, .. }
+            | Self::RichParagraph { region, .. }
             | Self::ListItem { region, .. }
+            | Self::RichListItem { region, .. }
+            | Self::Quote { region, .. }
+            | Self::CodeBlock { region, .. }
+            | Self::Table { region, .. }
+            | Self::HorizontalRule { region, .. }
             | Self::Link { region, .. }
             | Self::Image { region, .. }
             | Self::FormControl { region, .. } => *region,
@@ -156,35 +241,24 @@ impl SemanticBlock {
 /// Returns reader-mode link targets in the same order used by the terminal renderer.
 #[must_use]
 pub fn reader_links(page: &SemanticPage) -> Vec<ReaderLink> {
-    nav_link_blocks(&page.blocks)
+    nav_link_targets(&page.blocks)
         .into_iter()
         .chain(
             reader_blocks(&page.blocks)
                 .into_iter()
-                .filter(|block| matches!(block, SemanticBlock::Link { .. })),
+                .flat_map(link_targets_from_block),
         )
         .enumerate()
-        .filter_map(|(index, block)| {
-            let SemanticBlock::Link {
-                action_id,
-                text,
-                url,
-                ..
-            } = block
-            else {
-                return None;
-            };
-            Some(ReaderLink {
-                id: u32::try_from(index + 1).unwrap_or(u32::MAX),
-                action_id: action_id.clone(),
-                text: text.clone(),
-                url: url.clone(),
-            })
+        .map(|(index, (action_id, text, url))| ReaderLink {
+            id: u32::try_from(index + 1).unwrap_or(u32::MAX),
+            action_id,
+            text,
+            url,
         })
         .collect()
 }
 
-fn nav_link_blocks(blocks: &[SemanticBlock]) -> Vec<&SemanticBlock> {
+fn nav_link_targets(blocks: &[SemanticBlock]) -> Vec<(Option<ActionId>, String, String)> {
     blocks
         .iter()
         .filter(|block| {
@@ -193,10 +267,31 @@ fn nav_link_blocks(blocks: &[SemanticBlock]) -> Vec<&SemanticBlock> {
                 SemanticRegion::Header | SemanticRegion::Navigation
             )
         })
-        .filter(|block| matches!(block, SemanticBlock::Link { .. }))
         .filter(|block| !is_noise_block(block))
+        .flat_map(link_targets_from_block)
         .take(NAV_SUMMARY_LINK_LIMIT)
         .collect()
+}
+
+fn link_targets_from_block(block: &SemanticBlock) -> Vec<(Option<ActionId>, String, String)> {
+    match block {
+        SemanticBlock::Link {
+            action_id,
+            text,
+            url,
+            ..
+        } => vec![(action_id.clone(), text.clone(), url.clone())],
+        SemanticBlock::RichParagraph { runs, .. }
+        | SemanticBlock::RichListItem { runs, .. }
+        | SemanticBlock::Quote { runs, .. } => runs
+            .iter()
+            .filter_map(|run| {
+                let url = run.url.clone()?;
+                (!url.is_empty()).then(|| (run.action_id.clone(), run.text.clone(), url))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Returns semantic blocks prioritized for reader-mode rendering.
@@ -229,6 +324,11 @@ fn is_noise_block(block: &SemanticBlock) -> bool {
                     .is_some_and(|(width, height)| width <= 140 && height <= 40)
         }
         SemanticBlock::Link { text, url, .. } => text.trim().is_empty() && url.trim().is_empty(),
+        SemanticBlock::RichParagraph { runs, .. }
+        | SemanticBlock::RichListItem { runs, .. }
+        | SemanticBlock::Quote { runs, .. } => runs.iter().all(|run| run.text.trim().is_empty()),
+        SemanticBlock::CodeBlock { text, .. } => text.trim().is_empty(),
+        SemanticBlock::Table { headers, rows, .. } => headers.is_empty() && rows.is_empty(),
         _ => false,
     }
 }
@@ -274,12 +374,43 @@ fn sanitize_block(block: &SemanticBlock) -> SemanticBlock {
             layout: *layout,
             region: *region,
         },
+        SemanticBlock::RichParagraph {
+            runs,
+            layout,
+            region,
+        } => sanitize_rich_paragraph(runs, *layout, *region),
         SemanticBlock::ListItem {
             text,
             layout,
             region,
         } => SemanticBlock::ListItem {
             text: sanitize_terminal_text(text),
+            layout: *layout,
+            region: *region,
+        },
+        SemanticBlock::RichListItem {
+            runs,
+            layout,
+            region,
+        } => sanitize_rich_list_item(runs, *layout, *region),
+        SemanticBlock::Quote {
+            runs,
+            layout,
+            region,
+        } => sanitize_quote(runs, *layout, *region),
+        SemanticBlock::CodeBlock {
+            text,
+            language,
+            layout,
+            region,
+        } => sanitize_code_block(text, language.as_deref(), *layout, *region),
+        SemanticBlock::Table {
+            headers,
+            rows,
+            layout,
+            region,
+        } => sanitize_table(headers, rows, *layout, *region),
+        SemanticBlock::HorizontalRule { layout, region } => SemanticBlock::HorizontalRule {
             layout: *layout,
             region: *region,
         },
@@ -303,14 +434,7 @@ fn sanitize_block(block: &SemanticBlock) -> SemanticBlock {
             height,
             layout,
             region,
-        } => SemanticBlock::Image {
-            alt: sanitize_terminal_text(alt),
-            url: sanitize_terminal_text(url),
-            width: *width,
-            height: *height,
-            layout: *layout,
-            region: *region,
-        },
+        } => sanitize_image(alt, url, *width, *height, *layout, *region),
         SemanticBlock::FormControl {
             action_id,
             label,
@@ -318,14 +442,133 @@ fn sanitize_block(block: &SemanticBlock) -> SemanticBlock {
             value,
             layout,
             region,
-        } => SemanticBlock::FormControl {
-            action_id: action_id.clone(),
-            label: sanitize_terminal_text(label),
-            control_type: sanitize_terminal_text(control_type),
-            value: sanitize_terminal_text(value),
-            layout: *layout,
-            region: *region,
-        },
+        } => sanitize_form_control(
+            action_id.as_ref(),
+            label,
+            control_type,
+            value,
+            *layout,
+            *region,
+        ),
+    }
+}
+
+fn sanitize_image(
+    alt: &str,
+    url: &str,
+    width: Option<u32>,
+    height: Option<u32>,
+    layout: Option<BlockLayout>,
+    region: SemanticRegion,
+) -> SemanticBlock {
+    SemanticBlock::Image {
+        alt: sanitize_terminal_text(alt),
+        url: sanitize_terminal_text(url),
+        width,
+        height,
+        layout,
+        region,
+    }
+}
+
+fn sanitize_form_control(
+    action_id: Option<&ActionId>,
+    label: &str,
+    control_type: &str,
+    value: &str,
+    layout: Option<BlockLayout>,
+    region: SemanticRegion,
+) -> SemanticBlock {
+    SemanticBlock::FormControl {
+        action_id: action_id.cloned(),
+        label: sanitize_terminal_text(label),
+        control_type: sanitize_terminal_text(control_type),
+        value: sanitize_terminal_text(value),
+        layout,
+        region,
+    }
+}
+
+fn sanitize_rich_paragraph(
+    runs: &[TextRun],
+    layout: Option<BlockLayout>,
+    region: SemanticRegion,
+) -> SemanticBlock {
+    SemanticBlock::RichParagraph {
+        runs: runs.iter().map(sanitize_text_run).collect(),
+        layout,
+        region,
+    }
+}
+
+fn sanitize_rich_list_item(
+    runs: &[TextRun],
+    layout: Option<BlockLayout>,
+    region: SemanticRegion,
+) -> SemanticBlock {
+    SemanticBlock::RichListItem {
+        runs: runs.iter().map(sanitize_text_run).collect(),
+        layout,
+        region,
+    }
+}
+
+fn sanitize_quote(
+    runs: &[TextRun],
+    layout: Option<BlockLayout>,
+    region: SemanticRegion,
+) -> SemanticBlock {
+    SemanticBlock::Quote {
+        runs: runs.iter().map(sanitize_text_run).collect(),
+        layout,
+        region,
+    }
+}
+
+fn sanitize_code_block(
+    text: &str,
+    language: Option<&str>,
+    layout: Option<BlockLayout>,
+    region: SemanticRegion,
+) -> SemanticBlock {
+    SemanticBlock::CodeBlock {
+        text: sanitize_terminal_text(text),
+        language: language.map(sanitize_terminal_text),
+        layout,
+        region,
+    }
+}
+
+fn sanitize_table(
+    headers: &[String],
+    rows: &[Vec<String>],
+    layout: Option<BlockLayout>,
+    region: SemanticRegion,
+) -> SemanticBlock {
+    SemanticBlock::Table {
+        headers: headers
+            .iter()
+            .map(|value| sanitize_terminal_text(value))
+            .collect(),
+        rows: rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| sanitize_terminal_text(value))
+                    .collect()
+            })
+            .collect(),
+        layout,
+        region,
+    }
+}
+
+fn sanitize_text_run(run: &TextRun) -> TextRun {
+    TextRun {
+        text: sanitize_terminal_text(&run.text),
+        style: run.style,
+        url: run.url.as_ref().map(|value| sanitize_terminal_text(value)),
+        action_id: run.action_id.clone(),
     }
 }
 

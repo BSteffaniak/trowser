@@ -4,9 +4,11 @@
 
 //! Terminal rendering primitives for trowser.
 
+use std::collections::BTreeMap;
+
 use trowser_render::{
-    NAV_SUMMARY_LINK_LIMIT, SemanticBlock, SemanticPage, SemanticRegion, reader_blocks,
-    sanitize_page,
+    NAV_SUMMARY_LINK_LIMIT, SemanticBlock, SemanticPage, SemanticRegion, TextRun, TextRunStyle,
+    reader_blocks, sanitize_page,
 };
 use trowser_session_models::ActionId;
 use trowser_terminal_image::TerminalImageCapabilities;
@@ -125,6 +127,10 @@ pub enum SpanStyle {
     Control,
     /// Less important surrounding text.
     Dim,
+    /// Inline or block code text.
+    Code,
+    /// Quoted text.
+    Quote,
     /// Error/warning text.
     Error,
 }
@@ -274,7 +280,13 @@ fn push_nav_summary_lines(
     let nav_links = page
         .blocks
         .iter()
-        .filter_map(nav_link_target)
+        .filter(|block| {
+            matches!(
+                block.region(),
+                SemanticRegion::Header | SemanticRegion::Navigation
+            )
+        })
+        .flat_map(block_link_targets)
         .take(NAV_SUMMARY_LINK_LIMIT)
         .collect::<Vec<_>>();
 
@@ -366,19 +378,22 @@ fn push_reader_block_lines(
     let placement = ReaderPlacement::from_block(block, terminal_width);
     match block {
         SemanticBlock::Heading { level, text, .. } => {
-            document.lines.push(RenderedLine::default());
-            document.lines.push(line_with_style(
-                format!(
-                    "{}{} {text}",
-                    " ".repeat(placement.indent),
-                    "#".repeat(usize::from((*level).clamp(1, 6)))
-                ),
-                SpanStyle::Heading,
-            ));
-            document.lines.push(RenderedLine::default());
+            push_heading_lines(document, *level, text, placement);
         }
         SemanticBlock::Paragraph { text, .. } => {
             push_wrapped_lines(document, text, placement.indent, placement.width, None);
+            document.lines.push(RenderedLine::default());
+        }
+        SemanticBlock::RichParagraph { runs, .. } => {
+            push_rich_text_lines(
+                document,
+                runs,
+                "",
+                placement.indent,
+                placement.width,
+                next_link_id,
+                SpanStyle::Normal,
+            );
             document.lines.push(RenderedLine::default());
         }
         SemanticBlock::ListItem { text, .. } => {
@@ -390,64 +405,462 @@ fn push_reader_block_lines(
                 None,
             );
         }
+        SemanticBlock::RichListItem { runs, .. } => {
+            push_rich_text_lines(
+                document,
+                runs,
+                "• ",
+                placement.indent,
+                placement.width,
+                next_link_id,
+                SpanStyle::Normal,
+            );
+        }
+        SemanticBlock::Quote { runs, .. } => {
+            push_rich_text_lines(
+                document,
+                runs,
+                "│ ",
+                placement.indent,
+                placement.width,
+                next_link_id,
+                SpanStyle::Quote,
+            );
+            document.lines.push(RenderedLine::default());
+        }
+        SemanticBlock::CodeBlock { text, language, .. } => {
+            push_code_block_lines(document, text, language.as_deref(), placement);
+            document.lines.push(RenderedLine::default());
+        }
+        SemanticBlock::Table { headers, rows, .. } => {
+            push_table_lines(document, headers, rows, placement.width, placement.indent);
+            document.lines.push(RenderedLine::default());
+        }
+        SemanticBlock::HorizontalRule { .. } => push_horizontal_rule_lines(document, placement),
         SemanticBlock::Link {
             action_id,
             text,
             url,
             ..
-        } => {
-            let label = if text.is_empty() {
-                url.as_str()
-            } else {
-                text.as_str()
-            };
-            let link_id = u32::try_from(*next_link_id).unwrap_or(u32::MAX);
-            *next_link_id += 1;
-            let value = format!("[{link_id}] {label} <{url}>");
-            push_wrapped_lines(
-                document,
-                &value,
-                placement.indent,
-                placement.width,
-                Some((link_id, action_id.clone())),
-            );
-            document.lines.push(RenderedLine::default());
-        }
+        } => push_link_block_lines(
+            document,
+            action_id.as_ref(),
+            text,
+            url,
+            placement,
+            next_link_id,
+        ),
         SemanticBlock::Image {
             alt,
             url,
             width,
             height,
             ..
-        } => {
-            let mut output = String::new();
-            render_image_box(alt, url, *width, *height, placement, options, &mut output);
-            push_text_lines(document, &output, None);
-        }
+        } => push_image_block_lines(document, alt, url, *width, *height, placement, options),
         SemanticBlock::FormControl {
             action_id,
             label,
             control_type,
             value,
             ..
-        } => {
-            let control_id = u32::try_from(*next_control_id).unwrap_or(u32::MAX);
-            *next_control_id += 1;
-            let text = if value.is_empty() {
-                format!("[control {control_id}] {control_type} {label}")
+        } => push_form_control_block_lines(
+            document,
+            action_id.as_ref(),
+            label,
+            control_type,
+            value,
+            placement,
+            next_control_id,
+        ),
+    }
+}
+
+fn push_heading_lines(
+    document: &mut RenderedDocument,
+    level: u8,
+    text: &str,
+    placement: ReaderPlacement,
+) {
+    document.lines.push(RenderedLine::default());
+    document.lines.push(line_with_style(
+        format!(
+            "{}{} {text}",
+            " ".repeat(placement.indent),
+            "#".repeat(usize::from(level.clamp(1, 6)))
+        ),
+        SpanStyle::Heading,
+    ));
+    document.lines.push(RenderedLine::default());
+}
+
+fn push_horizontal_rule_lines(document: &mut RenderedDocument, placement: ReaderPlacement) {
+    document.lines.push(line_with_style(
+        format!(
+            "{}{}",
+            " ".repeat(placement.indent),
+            "─".repeat(placement.width.min(80))
+        ),
+        SpanStyle::Chrome,
+    ));
+    document.lines.push(RenderedLine::default());
+}
+
+fn push_link_block_lines(
+    document: &mut RenderedDocument,
+    action_id: Option<&ActionId>,
+    text: &str,
+    url: &str,
+    placement: ReaderPlacement,
+    next_link_id: &mut usize,
+) {
+    let label = if text.is_empty() { url } else { text };
+    let link_id = u32::try_from(*next_link_id).unwrap_or(u32::MAX);
+    *next_link_id += 1;
+    let value = format!("[{link_id}] {label} <{url}>");
+    push_wrapped_lines(
+        document,
+        &value,
+        placement.indent,
+        placement.width,
+        Some((link_id, action_id.cloned())),
+    );
+    document.lines.push(RenderedLine::default());
+}
+
+fn push_image_block_lines(
+    document: &mut RenderedDocument,
+    alt: &str,
+    url: &str,
+    width: Option<u32>,
+    height: Option<u32>,
+    placement: ReaderPlacement,
+    options: &TerminalRenderOptions,
+) {
+    let mut output = String::new();
+    render_image_box(alt, url, width, height, placement, options, &mut output);
+    push_text_lines(document, &output, None);
+}
+
+fn push_form_control_block_lines(
+    document: &mut RenderedDocument,
+    action_id: Option<&ActionId>,
+    label: &str,
+    control_type: &str,
+    value: &str,
+    placement: ReaderPlacement,
+    next_control_id: &mut usize,
+) {
+    let control_id = u32::try_from(*next_control_id).unwrap_or(u32::MAX);
+    *next_control_id += 1;
+    let text = if value.is_empty() {
+        format!("[control {control_id}] {control_type} {label}")
+    } else {
+        format!("[control {control_id}] {control_type} {label}: {value}")
+    };
+    push_wrapped_control_lines(
+        document,
+        &text,
+        placement.indent,
+        placement.width,
+        control_id,
+        action_id.cloned(),
+        control_action(control_type),
+    );
+    document.lines.push(RenderedLine::default());
+}
+
+#[derive(Debug, Clone)]
+struct InlineCell {
+    ch: char,
+    style: SpanStyle,
+    link: Option<(u32, Option<ActionId>)>,
+}
+
+fn push_rich_text_lines(
+    document: &mut RenderedDocument,
+    runs: &[TextRun],
+    prefix: &str,
+    indent: usize,
+    width: usize,
+    next_link_id: &mut usize,
+    default_style: SpanStyle,
+) {
+    let max_width = indent.saturating_add(width).max(MIN_BLOCK_WIDTH);
+    let prefix_cells = inline_cells(&" ".repeat(indent), SpanStyle::Normal, None)
+        .into_iter()
+        .chain(inline_cells(prefix, default_style, None))
+        .collect::<Vec<_>>();
+    let mut current = prefix_cells.clone();
+    let mut needs_space = false;
+
+    for run in rich_display_runs(runs, next_link_id, default_style) {
+        for word in run.text.split_whitespace() {
+            let mut word_cells = inline_cells(word, run.style, run.link.as_ref());
+            if word_cells.is_empty() {
+                continue;
+            }
+            let add_space = needs_space && current.len() > prefix_cells.len();
+            let needed = word_cells.len() + usize::from(add_space);
+            if current.len() > prefix_cells.len()
+                && current.len().saturating_add(needed) > max_width
+            {
+                push_inline_cells_line(document, &current);
+                current.clone_from(&prefix_cells);
+            }
+            if add_space && current.len() > prefix_cells.len() {
+                current.push(InlineCell {
+                    ch: ' ',
+                    style: default_style,
+                    link: None,
+                });
+            }
+            while current.len().saturating_add(word_cells.len()) > max_width
+                && current.len() == prefix_cells.len()
+                && !word_cells.is_empty()
+            {
+                let take = max_width.saturating_sub(current.len()).max(1);
+                let rest = word_cells.split_off(take.min(word_cells.len()));
+                current.extend(word_cells);
+                push_inline_cells_line(document, &current);
+                current.clone_from(&prefix_cells);
+                word_cells = rest;
+            }
+            current.extend(word_cells);
+            needs_space = true;
+        }
+    }
+
+    if current.len() > prefix_cells.len() || !prefix.is_empty() {
+        push_inline_cells_line(document, &current);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RichDisplayRun {
+    text: String,
+    style: SpanStyle,
+    link: Option<(u32, Option<ActionId>)>,
+}
+
+fn rich_display_runs(
+    runs: &[TextRun],
+    next_link_id: &mut usize,
+    default_style: SpanStyle,
+) -> Vec<RichDisplayRun> {
+    runs.iter()
+        .filter_map(|run| {
+            let text = run.text.trim();
+            if text.is_empty() {
+                return None;
+            }
+            if run.is_link() {
+                let link_id = u32::try_from(*next_link_id).unwrap_or(u32::MAX);
+                *next_link_id += 1;
+                Some(RichDisplayRun {
+                    text: format!("[{link_id}] {text}"),
+                    style: SpanStyle::Link,
+                    link: Some((link_id, run.action_id.clone())),
+                })
             } else {
-                format!("[control {control_id}] {control_type} {label}: {value}")
-            };
-            push_wrapped_control_lines(
+                Some(RichDisplayRun {
+                    text: text.to_string(),
+                    style: text_run_span_style(run.style, default_style),
+                    link: None,
+                })
+            }
+        })
+        .collect()
+}
+
+const fn text_run_span_style(style: TextRunStyle, default_style: SpanStyle) -> SpanStyle {
+    match style {
+        TextRunStyle::Normal => default_style,
+        TextRunStyle::Strong | TextRunStyle::Emphasis => SpanStyle::Heading,
+        TextRunStyle::Code => SpanStyle::Code,
+    }
+}
+
+fn inline_cells(
+    text: &str,
+    style: SpanStyle,
+    link: Option<&(u32, Option<ActionId>)>,
+) -> Vec<InlineCell> {
+    text.chars()
+        .map(|ch| InlineCell {
+            ch,
+            style,
+            link: link.cloned(),
+        })
+        .collect()
+}
+
+fn push_inline_cells_line(document: &mut RenderedDocument, cells: &[InlineCell]) {
+    let text = cells.iter().map(|cell| cell.ch).collect::<String>();
+    let spans = inline_spans(cells);
+    let links = inline_links(cells);
+    document.lines.push(RenderedLine {
+        text,
+        spans,
+        links,
+        controls: Vec::new(),
+    });
+}
+
+fn inline_spans(cells: &[InlineCell]) -> Vec<StyledSpan> {
+    let mut spans: Vec<StyledSpan> = Vec::new();
+    for cell in cells {
+        if let Some(span) = spans.last_mut()
+            && span.style == cell.style
+        {
+            span.text.push(cell.ch);
+            continue;
+        }
+        spans.push(StyledSpan {
+            text: cell.ch.to_string(),
+            style: cell.style,
+        });
+    }
+    spans
+}
+
+fn inline_links(cells: &[InlineCell]) -> Vec<LinkHitbox> {
+    let mut ranges: BTreeMap<u32, (Option<ActionId>, usize, usize)> = BTreeMap::new();
+    for (index, cell) in cells.iter().enumerate() {
+        if let Some((link_id, action_id)) = &cell.link {
+            ranges
+                .entry(*link_id)
+                .and_modify(|(_, _, end)| *end = index + 1)
+                .or_insert_with(|| (action_id.clone(), index, index + 1));
+        }
+    }
+    ranges
+        .into_iter()
+        .map(|(link_id, (action_id, start, end))| LinkHitbox {
+            link_id,
+            action_id,
+            start_col: u16::try_from(start).unwrap_or(u16::MAX),
+            end_col: u16::try_from(end).unwrap_or(u16::MAX),
+        })
+        .collect()
+}
+
+fn push_code_block_lines(
+    document: &mut RenderedDocument,
+    text: &str,
+    language: Option<&str>,
+    placement: ReaderPlacement,
+) {
+    let title = language.map_or_else(
+        || "code".to_string(),
+        |language| format!("code: {language}"),
+    );
+    document.lines.push(line_with_style(
+        format!(
+            "{}┌─ {title} {}",
+            " ".repeat(placement.indent),
+            "─".repeat(4)
+        ),
+        SpanStyle::Chrome,
+    ));
+    for raw_line in text.lines().take(160) {
+        let visible = raw_line
+            .chars()
+            .take(placement.width.saturating_sub(2))
+            .collect::<String>();
+        document.lines.push(line_with_style(
+            format!("{}│ {visible}", " ".repeat(placement.indent)),
+            SpanStyle::Code,
+        ));
+    }
+    document.lines.push(line_with_style(
+        format!(
+            "{}└{}",
+            " ".repeat(placement.indent),
+            "─".repeat(placement.width.min(72))
+        ),
+        SpanStyle::Chrome,
+    ));
+}
+
+fn push_table_lines(
+    document: &mut RenderedDocument,
+    headers: &[String],
+    rows: &[Vec<String>],
+    width: usize,
+    indent: usize,
+) {
+    let column_count = headers
+        .len()
+        .max(rows.iter().map(Vec::len).max().unwrap_or_default());
+    if column_count == 0 {
+        return;
+    }
+    if width < 50 || column_count > 4 {
+        push_stacked_table_lines(document, headers, rows, width, indent);
+        return;
+    }
+    let gap = 3usize;
+    let column_width =
+        width.saturating_sub(gap.saturating_mul(column_count.saturating_sub(1))) / column_count;
+    if !headers.is_empty() {
+        let line = table_row_line(headers, column_count, column_width, gap, indent);
+        document
+            .lines
+            .push(line_with_style(line, SpanStyle::Heading));
+        document.lines.push(line_with_style(
+            format!("{}{}", " ".repeat(indent), "─".repeat(width.min(100))),
+            SpanStyle::Chrome,
+        ));
+    }
+    for row in rows.iter().take(80) {
+        let line = table_row_line(row, column_count, column_width, gap, indent);
+        document
+            .lines
+            .push(line_with_style(line, SpanStyle::Normal));
+    }
+}
+
+fn table_row_line(
+    cells: &[String],
+    column_count: usize,
+    column_width: usize,
+    gap: usize,
+    indent: usize,
+) -> String {
+    let mut output = " ".repeat(indent);
+    for index in 0..column_count {
+        if index > 0 {
+            output.push_str(&" ".repeat(gap));
+        }
+        let cell = cells.get(index).map_or("", String::as_str);
+        output.push_str(&fit_line(cell, column_width, ' '));
+    }
+    output
+}
+
+fn push_stacked_table_lines(
+    document: &mut RenderedDocument,
+    headers: &[String],
+    rows: &[Vec<String>],
+    width: usize,
+    indent: usize,
+) {
+    for (row_index, row) in rows.iter().take(40).enumerate() {
+        document.lines.push(line_with_style(
+            format!("{}row {}", " ".repeat(indent), row_index + 1),
+            SpanStyle::Chrome,
+        ));
+        for (index, cell) in row.iter().enumerate() {
+            let label = headers
+                .get(index)
+                .map_or_else(|| format!("col {}", index + 1), Clone::clone);
+            push_wrapped_lines(
                 document,
-                &text,
-                placement.indent,
-                placement.width,
-                control_id,
-                action_id.clone(),
-                control_action(control_type),
+                &format!("{label}: {cell}"),
+                indent.saturating_add(2),
+                width.saturating_sub(2),
+                None,
             );
-            document.lines.push(RenderedLine::default());
         }
     }
 }
@@ -597,31 +1010,43 @@ fn render_header(page: &SemanticPage, width: usize, output: &mut String) {
     output.push_str("\n\n");
 }
 
-fn nav_link_target(block: &SemanticBlock) -> Option<(Option<ActionId>, String, String)> {
-    let SemanticBlock::Link {
-        action_id,
-        text,
-        url,
-        region,
-        ..
-    } = block
-    else {
-        return None;
-    };
-
-    if !matches!(region, SemanticRegion::Header | SemanticRegion::Navigation) {
-        return None;
+fn block_link_targets(block: &SemanticBlock) -> Vec<(Option<ActionId>, String, String)> {
+    match block {
+        SemanticBlock::Link {
+            action_id,
+            text,
+            url,
+            ..
+        } => vec![(
+            action_id.clone(),
+            if text.is_empty() {
+                url.clone()
+            } else {
+                text.clone()
+            },
+            url.clone(),
+        )],
+        SemanticBlock::RichParagraph { runs, .. }
+        | SemanticBlock::RichListItem { runs, .. }
+        | SemanticBlock::Quote { runs, .. } => runs
+            .iter()
+            .filter_map(|run| {
+                let url = run.url.clone()?;
+                (!url.is_empty()).then(|| {
+                    (
+                        run.action_id.clone(),
+                        if run.text.is_empty() {
+                            url.clone()
+                        } else {
+                            run.text.clone()
+                        },
+                        url,
+                    )
+                })
+            })
+            .collect(),
+        _ => Vec::new(),
     }
-
-    Some((
-        action_id.clone(),
-        if text.is_empty() {
-            url.clone()
-        } else {
-            text.clone()
-        },
-        url.clone(),
-    ))
 }
 
 #[derive(Debug, Clone, Copy)]

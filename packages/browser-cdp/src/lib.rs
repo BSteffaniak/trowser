@@ -22,7 +22,7 @@ use trowser_browser::{
     BrowserBackend, BrowserCapabilities, BrowserError, BrowserResult, ExtractedPage,
     NavigateRequest,
 };
-use trowser_render::{BlockLayout, SemanticBlock, SemanticPage, SemanticRegion};
+use trowser_render::{BlockLayout, SemanticBlock, SemanticPage, SemanticRegion, TextRun};
 use trowser_session_models::{ActionId, TabId};
 
 /// Configuration for the Chromium/CDP backend.
@@ -960,6 +960,18 @@ fn merge_dom_action_ids(blocks: &mut [SemanticBlock], dom_blocks: &[SemanticBloc
             } if action_id.is_none() => {
                 *action_id = matching_dom_link_action(text, url, dom_blocks, &mut used_links);
             }
+            SemanticBlock::RichParagraph { runs, .. }
+            | SemanticBlock::RichListItem { runs, .. }
+            | SemanticBlock::Quote { runs, .. } => {
+                for run in runs {
+                    if run.action_id.is_none()
+                        && let Some(url) = &run.url
+                    {
+                        run.action_id =
+                            matching_dom_link_action(&run.text, url, dom_blocks, &mut used_links);
+                    }
+                }
+            }
             SemanticBlock::FormControl {
                 action_id,
                 label,
@@ -988,20 +1000,37 @@ fn matching_dom_link_action(
         if used.contains(&index) {
             return None;
         }
-        let SemanticBlock::Link {
-            action_id,
-            text: dom_text,
-            url: dom_url,
-            ..
-        } = block
-        else {
-            return None;
+        let candidates = match block {
+            SemanticBlock::Link {
+                action_id,
+                text: dom_text,
+                url: dom_url,
+                ..
+            } => vec![(action_id.clone(), dom_text.as_str(), dom_url.as_str())],
+            SemanticBlock::RichParagraph { runs, .. }
+            | SemanticBlock::RichListItem { runs, .. }
+            | SemanticBlock::Quote { runs, .. } => runs
+                .iter()
+                .filter_map(|run| {
+                    Some((
+                        run.action_id.clone(),
+                        run.text.as_str(),
+                        run.url.as_deref()?,
+                    ))
+                })
+                .collect(),
+            _ => Vec::new(),
         };
-        let matches = (!url.is_empty() && url == dom_url) || normalized_match(text, dom_text);
-        matches.then(|| {
-            used.insert(index);
-            action_id.clone()
-        })?
+        candidates
+            .into_iter()
+            .find_map(|(action_id, dom_text, dom_url)| {
+                let matches =
+                    (!url.is_empty() && url == dom_url) || normalized_match(text, dom_text);
+                matches.then(|| {
+                    used.insert(index);
+                    action_id
+                })?
+            })
     })
 }
 
@@ -1074,8 +1103,39 @@ enum CdpSemanticBlock {
         layout: Option<BlockLayout>,
         region: SemanticRegion,
     },
+    RichParagraph {
+        runs: Vec<TextRun>,
+        layout: Option<BlockLayout>,
+        region: SemanticRegion,
+    },
     ListItem {
         text: String,
+        layout: Option<BlockLayout>,
+        region: SemanticRegion,
+    },
+    RichListItem {
+        runs: Vec<TextRun>,
+        layout: Option<BlockLayout>,
+        region: SemanticRegion,
+    },
+    Quote {
+        runs: Vec<TextRun>,
+        layout: Option<BlockLayout>,
+        region: SemanticRegion,
+    },
+    CodeBlock {
+        text: String,
+        language: Option<String>,
+        layout: Option<BlockLayout>,
+        region: SemanticRegion,
+    },
+    Table {
+        headers: Vec<String>,
+        rows: Vec<Vec<String>>,
+        layout: Option<BlockLayout>,
+        region: SemanticRegion,
+    },
+    HorizontalRule {
         layout: Option<BlockLayout>,
         region: SemanticRegion,
     },
@@ -1105,6 +1165,10 @@ enum CdpSemanticBlock {
 }
 
 impl CdpSemanticBlock {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "exhaustive wire DTO to backend-neutral semantic model mapping"
+    )]
     fn into_semantic_block(self) -> SemanticBlock {
         match self {
             Self::Heading {
@@ -1127,6 +1191,15 @@ impl CdpSemanticBlock {
                 layout,
                 region,
             },
+            Self::RichParagraph {
+                runs,
+                layout,
+                region,
+            } => SemanticBlock::RichParagraph {
+                runs,
+                layout,
+                region,
+            },
             Self::ListItem {
                 text,
                 layout,
@@ -1136,6 +1209,49 @@ impl CdpSemanticBlock {
                 layout,
                 region,
             },
+            Self::RichListItem {
+                runs,
+                layout,
+                region,
+            } => SemanticBlock::RichListItem {
+                runs,
+                layout,
+                region,
+            },
+            Self::Quote {
+                runs,
+                layout,
+                region,
+            } => SemanticBlock::Quote {
+                runs,
+                layout,
+                region,
+            },
+            Self::CodeBlock {
+                text,
+                language,
+                layout,
+                region,
+            } => SemanticBlock::CodeBlock {
+                text,
+                language,
+                layout,
+                region,
+            },
+            Self::Table {
+                headers,
+                rows,
+                layout,
+                region,
+            } => SemanticBlock::Table {
+                headers,
+                rows,
+                layout,
+                region,
+            },
+            Self::HorizontalRule { layout, region } => {
+                SemanticBlock::HorizontalRule { layout, region }
+            }
             Self::Link {
                 action_id,
                 text,
@@ -1268,23 +1384,105 @@ const DOM_EXTRACTION_JS: &str = r#"
     window.__trowserActions[id] = el;
     return id;
   };
-  const pushText = (kind, el, extra = {}) => {
-    const text = clean(el.innerText || el.textContent || el.getAttribute('aria-label'));
-    if (text) blocks.push({ kind, text, layout: layout(el), region: region(el), ...extra });
-  };
   const controlSelector = 'input,textarea,button,select,[role="button"],[role="menuitem"],[aria-haspopup],[aria-expanded],[onclick]';
   const isControl = (el) => el.matches(controlSelector) && !el.matches('a[href]');
   const controlType = (el) => clean(el.getAttribute('role') || el.type || el.tagName.toLowerCase());
   const controlLabel = (el) => clean(el.labels && el.labels[0] ? el.labels[0].innerText : (el.getAttribute('aria-label') || el.getAttribute('title') || el.name || el.placeholder || el.innerText || el.textContent));
   window.trowserVisibleControls = () => Array.from(document.body.querySelectorAll(controlSelector)).filter((el) => visible(el) && isControl(el));
 
-  for (const el of document.body.querySelectorAll(`h1,h2,h3,h4,h5,h6,p,a,img,li,${controlSelector}`)) {
+  const pushText = (kind, el, extra = {}) => {
+    const text = clean(el.innerText || el.textContent || el.getAttribute('aria-label'));
+    if (text) blocks.push({ kind, text, layout: layout(el), region: region(el), ...extra });
+  };
+  const mergeRuns = (runs) => {
+    const merged = [];
+    for (const run of runs) {
+      const text = clean(run.text);
+      if (!text) continue;
+      const last = merged[merged.length - 1];
+      if (last && last.style === run.style && last.url === run.url && last.action_id === run.action_id) {
+        last.text = `${last.text} ${text}`;
+      } else {
+        merged.push({ text, style: run.style || 'Normal', url: run.url || null, action_id: run.action_id || null });
+      }
+    }
+    return merged;
+  };
+  const inlineRuns = (root, inheritedStyle = 'Normal') => {
+    const runs = [];
+    const walk = (node, style) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        runs.push({ text: node.textContent || '', style, url: null, action_id: null });
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      const el = node;
+      if (!visible(el)) return;
+      const tag = el.tagName.toLowerCase();
+      if (tag === 'br') {
+        runs.push({ text: ' ', style, url: null, action_id: null });
+        return;
+      }
+      if (tag === 'a') {
+        const text = clean(el.innerText || el.textContent || el.href);
+        if (text || el.href) runs.push({ text: text || el.href, style: 'Normal', url: el.href || '', action_id: actionId(el) });
+        return;
+      }
+      if (isControl(el) || tag === 'img' || tag === 'svg') return;
+      const childStyle = tag === 'strong' || tag === 'b'
+        ? 'Strong'
+        : tag === 'em' || tag === 'i'
+          ? 'Emphasis'
+          : tag === 'code'
+            ? 'Code'
+            : style;
+      for (const child of el.childNodes) walk(child, childStyle);
+    };
+    for (const child of root.childNodes) walk(child, inheritedStyle);
+    return mergeRuns(runs);
+  };
+  const pushRich = (kind, el, prefix = {}) => {
+    const runs = inlineRuns(el);
+    if (runs.length) blocks.push({ kind, runs, layout: layout(el), region: region(el), ...prefix });
+  };
+  const tableData = (table) => {
+    const headerCells = Array.from(table.querySelectorAll('thead tr:first-child th'));
+    const firstRowHeaders = headerCells.length ? headerCells : Array.from(table.querySelectorAll('tr:first-child th'));
+    const headers = firstRowHeaders.map((cell) => clean(cell.innerText || cell.textContent)).filter(Boolean);
+    const rows = Array.from(table.querySelectorAll('tr')).map((row) => {
+      const cells = Array.from(row.querySelectorAll('td,th')).map((cell) => clean(cell.innerText || cell.textContent));
+      return cells;
+    }).filter((row, index) => row.some(Boolean) && !(headers.length && index === 0 && row.every((cell, cellIndex) => cell === headers[cellIndex])));
+    return { headers, rows };
+  };
+
+  const selector = `h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,table,hr,a,img,${controlSelector}`;
+  for (const el of document.body.querySelectorAll(selector)) {
     if (!visible(el)) continue;
     const tag = el.tagName.toLowerCase();
+    if (tag === 'a' && el.closest('p,li,blockquote,table')) continue;
+    if (!isControl(el) && tag !== 'a') {
+      const parentBlock = el.parentElement && el.parentElement.closest('p,li,blockquote,pre,table');
+      if (parentBlock) continue;
+    }
     if (/^h[1-6]$/.test(tag)) {
       pushText('heading', el, { level: Number(tag.slice(1)) });
+    } else if (tag === 'p') {
+      pushRich('rich_paragraph', el);
     } else if (tag === 'li') {
-      pushText('list_item', el);
+      pushRich('rich_list_item', el);
+    } else if (tag === 'blockquote') {
+      pushRich('quote', el);
+    } else if (tag === 'pre') {
+      const code = el.querySelector('code');
+      const language = code ? Array.from(code.classList).find((name) => name.startsWith('language-')) : null;
+      const text = (el.innerText || el.textContent || '').replace(/\n{4,}/g, '\n\n\n').trimEnd();
+      if (text) blocks.push({ kind: 'code_block', text, language: language ? language.replace(/^language-/, '') : null, layout: layout(el), region: region(el) });
+    } else if (tag === 'table') {
+      const data = tableData(el);
+      if (data.headers.length || data.rows.length) blocks.push({ kind: 'table', headers: data.headers, rows: data.rows, layout: layout(el), region: region(el) });
+    } else if (tag === 'hr') {
+      blocks.push({ kind: 'horizontal_rule', layout: layout(el), region: region(el) });
     } else if (tag === 'a') {
       const text = clean(el.innerText || el.textContent || el.href);
       if (text || el.href) blocks.push({ kind: 'link', action_id: actionId(el), text, url: el.href || '', layout: layout(el), region: region(el) });
@@ -1308,8 +1506,6 @@ const DOM_EXTRACTION_JS: &str = r#"
         layout: layout(el),
         region: region(el),
       });
-    } else {
-      pushText('paragraph', el);
     }
   }
 

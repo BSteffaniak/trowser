@@ -1114,6 +1114,8 @@ fn queue_span_style<W: Write>(out: &mut W, style: SpanStyle) -> Result<()> {
             SetAttribute(Attribute::Bold)
         )?,
         SpanStyle::Dim => queue!(out, SetForegroundColor(Color::DarkGrey))?,
+        SpanStyle::Code => queue!(out, SetForegroundColor(Color::Green))?,
+        SpanStyle::Quote => queue!(out, SetForegroundColor(Color::DarkGrey))?,
         SpanStyle::Error => queue!(
             out,
             SetForegroundColor(Color::Red),
