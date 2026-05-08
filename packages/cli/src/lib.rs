@@ -1874,7 +1874,13 @@ async fn run_tabs(paths: &ConfigPaths, json: bool) -> Result<u8> {
     } else {
         for tab in &snapshot.tabs {
             let marker = if tab.active { "*" } else { " " };
-            println!("{marker} {} {} {}", tab.id.as_str(), tab.title, tab.url);
+            let lifecycle = if tab.sleeping { " sleeping" } else { "" };
+            println!(
+                "{marker} {}{lifecycle} {} {}",
+                tab.id.as_str(),
+                tab.title,
+                tab.url
+            );
         }
     }
 

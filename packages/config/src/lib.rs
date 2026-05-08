@@ -108,6 +108,10 @@ pub struct ResourcePolicyConfig {
     ///
     /// `None` means unlimited tabs.
     pub max_tabs: Option<usize>,
+    /// Optional maximum awake browser tabs before inactive tabs are put to sleep.
+    ///
+    /// `None` keeps every tab backed by a live browser target.
+    pub max_awake_tabs: Option<usize>,
     /// Block image requests by default.
     pub block_images: bool,
     /// Block video/audio requests by default.
@@ -124,6 +128,7 @@ impl Default for ResourcePolicyConfig {
     fn default() -> Self {
         Self {
             max_tabs: None,
+            max_awake_tabs: Some(8),
             block_images: false,
             block_video: true,
             block_fonts: false,
@@ -174,16 +179,21 @@ mod tests {
     use super::{ResourcePolicyConfig, TrowserConfig};
 
     #[test]
-    fn resource_policy_defaults_to_unlimited_tabs() {
-        assert_eq!(ResourcePolicyConfig::default().max_tabs, None);
+    fn resource_policy_defaults_to_unlimited_logical_tabs() {
+        let resources = ResourcePolicyConfig::default();
+
+        assert_eq!(resources.max_tabs, None);
+        assert_eq!(resources.max_awake_tabs, Some(8));
     }
 
     #[test]
-    fn config_accepts_explicit_max_tabs() {
-        let config = toml::from_str::<TrowserConfig>("[resources]\nmax_tabs = 12\n")
-            .expect("config should parse");
+    fn config_accepts_explicit_tab_limits() {
+        let config =
+            toml::from_str::<TrowserConfig>("[resources]\nmax_tabs = 12\nmax_awake_tabs = 3\n")
+                .expect("config should parse");
 
         assert_eq!(config.resources.max_tabs, Some(12));
+        assert_eq!(config.resources.max_awake_tabs, Some(3));
     }
 }
 

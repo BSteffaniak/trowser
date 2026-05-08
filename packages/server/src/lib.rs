@@ -4,7 +4,7 @@
 
 //! Daemon runtime for trowser.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,12 +37,72 @@ pub enum ServerError {
 /// Result alias for daemon operations.
 pub type ServerResult<T> = Result<T, ServerError>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabLifecycle {
+    Awake,
+    Sleeping,
+}
+
+impl TabLifecycle {
+    const fn is_sleeping(self) -> bool {
+        matches!(self, Self::Sleeping)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TabEntry {
+    url: String,
+    title: String,
+    cached_page: Option<SemanticPage>,
+    lifecycle: TabLifecycle,
+    last_active_seq: u64,
+}
+
+impl TabEntry {
+    fn awake_from_page(page: SemanticPage, last_active_seq: u64) -> Self {
+        Self {
+            url: page.url.clone(),
+            title: page.title.clone(),
+            cached_page: Some(page),
+            lifecycle: TabLifecycle::Awake,
+            last_active_seq,
+        }
+    }
+
+    fn sleeping_from_summary(tab: &TabSummary, last_active_seq: u64) -> Self {
+        Self {
+            url: tab.url.clone(),
+            title: tab.title.clone(),
+            cached_page: None,
+            lifecycle: TabLifecycle::Sleeping,
+            last_active_seq,
+        }
+    }
+
+    fn update_page(&mut self, page: SemanticPage, last_active_seq: u64) {
+        self.url.clone_from(&page.url);
+        self.title.clone_from(&page.title);
+        self.cached_page = Some(page);
+        self.lifecycle = TabLifecycle::Awake;
+        self.last_active_seq = last_active_seq;
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct ServerState {
-    tabs: BTreeMap<TabId, SemanticPage>,
+    tabs: BTreeMap<TabId, TabEntry>,
     active_tab: Option<TabId>,
     next_tab_id: u64,
-    canceled_requests: std::collections::BTreeSet<String>,
+    activity_seq: u64,
+    canceled_requests: BTreeSet<String>,
+}
+
+impl ServerState {
+    const fn next_activity_seq(&mut self) -> u64 {
+        let seq = self.activity_seq;
+        self.activity_seq = self.activity_seq.saturating_add(1);
+        seq
+    }
 }
 
 /// Daemon runtime state.
@@ -324,7 +384,12 @@ impl TrowserServer {
     }
 
     async fn handle_follow_link(&self, link_id: u32, viewport: Option<ViewportHint>) -> Response {
-        let Some((tab_id, action_id, url)) = self.follow_link_target(link_id).await else {
+        let mut target = self.follow_link_target(link_id).await;
+        if target.is_none() {
+            let _ = self.handle_active_snapshot(viewport).await;
+            target = self.follow_link_target(link_id).await;
+        }
+        let Some((tab_id, action_id, url)) = target else {
             return Response::Error {
                 message: format!("unknown link id {link_id}"),
             };
@@ -344,7 +409,7 @@ impl TrowserServer {
     async fn follow_link_target(&self, link_id: u32) -> Option<(TabId, Option<ActionId>, String)> {
         let state = self.state.lock().await;
         let tab_id = state.active_tab.clone()?;
-        let page = state.tabs.get(&tab_id)?.clone();
+        let page = state.tabs.get(&tab_id)?.cached_page.clone()?;
         drop(state);
         let target = reader_links(&page)
             .into_iter()
@@ -355,7 +420,7 @@ impl TrowserServer {
     async fn control_action_id(&self, control_id: u32) -> Option<ActionId> {
         let state = self.state.lock().await;
         let tab_id = state.active_tab.clone()?;
-        let page = state.tabs.get(&tab_id)?.clone();
+        let page = state.tabs.get(&tab_id)?.cached_page.clone()?;
         drop(state);
         reader_blocks(&page.blocks)
             .into_iter()
@@ -370,13 +435,16 @@ impl TrowserServer {
 
     async fn handle_switch_tab(&self, tab_id: TabId) -> Response {
         let mut state = self.state.lock().await;
-        if !state.tabs.contains_key(&tab_id) {
+        let seq = state.next_activity_seq();
+        let Some(tab) = state.tabs.get_mut(&tab_id) else {
             return Response::Error {
                 message: format!("unknown tab {}", tab_id.as_str()),
             };
-        }
+        };
+        tab.last_active_seq = seq;
         state.active_tab = Some(tab_id.clone());
         drop(state);
+        self.sleep_excess_tabs().await;
         let _ = self.save_session_to_disk().await;
         Response::Opened { tab_id }
     }
@@ -463,8 +531,13 @@ impl TrowserServer {
             (current_index + usize::try_from(offset).unwrap_or(0)) % tabs.len()
         };
         let tab_id = tabs[target_index].clone();
+        let seq = state.next_activity_seq();
+        if let Some(tab) = state.tabs.get_mut(&tab_id) {
+            tab.last_active_seq = seq;
+        }
         state.active_tab = Some(tab_id.clone());
         drop(state);
+        self.sleep_excess_tabs().await;
         let _ = self.save_session_to_disk().await;
         Response::Opened { tab_id }
     }
@@ -476,19 +549,28 @@ impl TrowserServer {
                 message: "no active tab".to_string(),
             };
         };
-        let Some(page) = state.tabs.get(&tab_id).cloned() else {
+        let Some(tab) = state.tabs.get(&tab_id) else {
             return Response::Error {
                 message: format!("unknown active tab {}", tab_id.as_str()),
             };
         };
+        let semantic_viewport = viewport.map(ViewportHint::semantic_viewport);
+        let cached_page = tab.cached_page.clone();
+        let needs_refresh = cached_page.as_ref().is_none_or(|page| {
+            tab.lifecycle.is_sleeping()
+                || semantic_viewport.is_some_and(|viewport| page.viewport != Some(viewport))
+        });
+        let url = tab.url.clone();
         drop(state);
-        if let Some(viewport) = viewport
-            && page.viewport != Some(viewport.semantic_viewport())
-        {
-            return self
-                .refresh_tab_snapshot(tab_id, page.url.clone(), viewport.semantic_viewport())
+        if needs_refresh {
+            let page = self
+                .refresh_tab_page(tab_id.clone(), &url, semantic_viewport)
                 .await;
+            return Response::ActiveSnapshot { tab_id, page };
         }
+        let Some(page) = cached_page else {
+            unreachable!("refresh required when active cached page is missing")
+        };
         Response::ActiveSnapshot { tab_id, page }
     }
 
@@ -592,7 +674,7 @@ impl TrowserServer {
     }
 
     async fn handle_click_control(&self, control_id: u32) -> Response {
-        let Some(action_id) = self.control_action_id(control_id).await else {
+        let Some(action_id) = self.control_action_id_after_wake(control_id).await else {
             return Response::Error {
                 message: format!("unknown control id {control_id}"),
             };
@@ -601,12 +683,21 @@ impl TrowserServer {
     }
 
     async fn handle_input_text(&self, control_id: u32, text: String) -> Response {
-        let Some(action_id) = self.control_action_id(control_id).await else {
+        let Some(action_id) = self.control_action_id_after_wake(control_id).await else {
             return Response::Error {
                 message: format!("unknown control id {control_id}"),
             };
         };
         self.handle_input_text_action(action_id, text, None).await
+    }
+
+    async fn control_action_id_after_wake(&self, control_id: u32) -> Option<ActionId> {
+        let mut action_id = self.control_action_id(control_id).await;
+        if action_id.is_none() {
+            let _ = self.handle_active_snapshot(None).await;
+            action_id = self.control_action_id(control_id).await;
+        }
+        action_id
     }
 
     async fn active_tab_id(&self) -> Option<TabId> {
@@ -624,53 +715,66 @@ impl TrowserServer {
         Some((tab_id, url))
     }
 
-    async fn refresh_tab_snapshot(
+    async fn refresh_tab_page(
         &self,
         tab_id: TabId,
-        url: String,
-        viewport: SemanticViewport,
-    ) -> Response {
+        url: &str,
+        viewport: Option<SemanticViewport>,
+    ) -> SemanticPage {
         let page = self
-            .reload_page(&tab_id, &url, Some(viewport))
+            .reload_page(&tab_id, url, viewport)
             .await
-            .unwrap_or_else(|error| error_page(&url, &error.to_string()));
-        self.store_page(tab_id, page).await
+            .unwrap_or_else(|error| error_page(url, &error.to_string()));
+        self.store_page_state(tab_id, page.clone()).await;
+        self.sleep_excess_tabs().await;
+        let _ = self.save_session_to_disk().await;
+        page
     }
 
     async fn store_page(&self, tab_id: TabId, page: SemanticPage) -> Response {
-        let mut state = self.state.lock().await;
-        state.tabs.insert(tab_id.clone(), page);
-        state.active_tab = Some(tab_id.clone());
-        drop(state);
+        self.store_page_state(tab_id.clone(), page).await;
+        self.sleep_excess_tabs().await;
         let _ = self.save_session_to_disk().await;
         Response::Opened { tab_id }
     }
 
+    async fn store_page_state(&self, tab_id: TabId, page: SemanticPage) {
+        let mut state = self.state.lock().await;
+        let seq = state.next_activity_seq();
+        if let Some(tab) = state.tabs.get_mut(&tab_id) {
+            tab.update_page(page, seq);
+        } else {
+            state
+                .tabs
+                .insert(tab_id.clone(), TabEntry::awake_from_page(page, seq));
+        }
+        state.active_tab = Some(tab_id);
+    }
+
     async fn handle_snapshot(&self, tab_id: &TabId, viewport: Option<ViewportHint>) -> Response {
         let state = self.state.lock().await;
-        let Some(page) = state.tabs.get(tab_id).cloned() else {
+        let Some(tab) = state.tabs.get(tab_id) else {
             return Response::Error {
                 message: format!("unknown tab {}", tab_id.as_str()),
             };
         };
+        let semantic_viewport = viewport.map(ViewportHint::semantic_viewport);
+        let cached_page = tab.cached_page.clone();
+        let needs_refresh = cached_page.as_ref().is_none_or(|page| {
+            tab.lifecycle.is_sleeping()
+                || semantic_viewport.is_some_and(|viewport| page.viewport != Some(viewport))
+        });
+        let url = tab.url.clone();
         drop(state);
-        if let Some(viewport) = viewport
-            && page.viewport != Some(viewport.semantic_viewport())
-        {
-            let response = self
-                .refresh_tab_snapshot(tab_id.clone(), page.url, viewport.semantic_viewport())
+        if needs_refresh {
+            let page = self
+                .refresh_tab_page(tab_id.clone(), &url, semantic_viewport)
                 .await;
-            let Response::Opened { tab_id } = response else {
-                return response;
-            };
-            let state = self.state.lock().await;
-            return state.tabs.get(&tab_id).cloned().map_or_else(
-                || Response::Error {
-                    message: format!("unknown tab {}", tab_id.as_str()),
-                },
-                |page| Response::Snapshot { page },
-            );
+            return Response::Snapshot { page };
         }
+        let Some(page) = cached_page else {
+            unreachable!("refresh required when cached page is missing")
+        };
         Response::Snapshot { page }
     }
 
@@ -716,6 +820,88 @@ impl TrowserServer {
         browser.navigate_tab(tab_id, url, viewport).await
     }
 
+    async fn ensure_browser_tab_awake(
+        &self,
+        tab_id: &TabId,
+        viewport: Option<SemanticViewport>,
+    ) -> Result<(), trowser_browser_cdp::CdpError> {
+        let state = self.state.lock().await;
+        let Some(tab) = state.tabs.get(tab_id) else {
+            return Err(trowser_browser_cdp::CdpError::PageAction(format!(
+                "unknown tab {}",
+                tab_id.as_str()
+            )));
+        };
+        let needs_wake = tab.lifecycle.is_sleeping() || tab.cached_page.is_none();
+        let url = tab.url.clone();
+        drop(state);
+
+        if needs_wake {
+            let page = self.reload_page(tab_id, &url, viewport).await?;
+            self.store_page_state(tab_id.clone(), page).await;
+        }
+        Ok(())
+    }
+
+    async fn sleep_excess_tabs(&self) {
+        let Some(max_awake_tabs) = self.config.resources.max_awake_tabs else {
+            return;
+        };
+
+        let tabs_to_sleep = {
+            let state = self.state.lock().await;
+            let awake_count = state
+                .tabs
+                .values()
+                .filter(|tab| tab.lifecycle == TabLifecycle::Awake)
+                .count();
+            let sleep_count = awake_count.saturating_sub(max_awake_tabs);
+            if sleep_count == 0 {
+                return;
+            }
+
+            let mut candidates = state
+                .tabs
+                .iter()
+                .filter(|(tab_id, tab)| {
+                    state.active_tab.as_ref() != Some(*tab_id)
+                        && tab.lifecycle == TabLifecycle::Awake
+                })
+                .map(|(tab_id, tab)| (tab.last_active_seq, tab_id.clone()))
+                .collect::<Vec<_>>();
+            drop(state);
+            candidates.sort_by_key(|(last_active_seq, tab_id)| (*last_active_seq, tab_id.clone()));
+            candidates
+                .into_iter()
+                .take(sleep_count)
+                .map(|(_, tab_id)| tab_id)
+                .collect::<Vec<_>>()
+        };
+
+        if tabs_to_sleep.is_empty() {
+            return;
+        }
+
+        {
+            let mut browser = self.browser.lock().await;
+            if let Some(browser) = browser.as_mut() {
+                for tab_id in &tabs_to_sleep {
+                    let _ = browser.close_tab(tab_id).await;
+                }
+            }
+        }
+
+        let mut state = self.state.lock().await;
+        let active_tab = state.active_tab.clone();
+        for tab_id in tabs_to_sleep {
+            if active_tab.as_ref() != Some(&tab_id)
+                && let Some(tab) = state.tabs.get_mut(&tab_id)
+            {
+                tab.lifecycle = TabLifecycle::Sleeping;
+            }
+        }
+    }
+
     #[allow(
         clippy::significant_drop_tightening,
         reason = "browser mutex intentionally serializes access to persistent CDP page targets"
@@ -759,6 +945,7 @@ impl TrowserServer {
         tab_id: &TabId,
         viewport: Option<SemanticViewport>,
     ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
+        self.ensure_browser_tab_awake(tab_id, viewport).await?;
         let mut browser = self.browser.lock().await;
         let Some(browser) = browser.as_mut() else {
             return Err(trowser_browser_cdp::CdpError::NavigationHistory);
@@ -775,6 +962,7 @@ impl TrowserServer {
         tab_id: &TabId,
         viewport: Option<SemanticViewport>,
     ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
+        self.ensure_browser_tab_awake(tab_id, viewport).await?;
         let mut browser = self.browser.lock().await;
         let Some(browser) = browser.as_mut() else {
             return Err(trowser_browser_cdp::CdpError::NavigationHistory);
@@ -792,6 +980,7 @@ impl TrowserServer {
         action_id: &ActionId,
         viewport: Option<SemanticViewport>,
     ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
+        self.ensure_browser_tab_awake(tab_id, viewport).await?;
         let mut browser = self.browser.lock().await;
         let Some(browser) = browser.as_mut() else {
             return Err(trowser_browser_cdp::CdpError::PageAction(
@@ -812,6 +1001,7 @@ impl TrowserServer {
         text: &str,
         viewport: Option<SemanticViewport>,
     ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
+        self.ensure_browser_tab_awake(tab_id, viewport).await?;
         let mut browser = self.browser.lock().await;
         let Some(browser) = browser.as_mut() else {
             return Err(trowser_browser_cdp::CdpError::PageAction(
@@ -882,22 +1072,29 @@ impl TrowserServer {
             state.tabs.clear();
             state.active_tab = None;
             state.next_tab_id = next_tab_id_after(&snapshot);
+            state.activity_seq = 0;
         }
 
-        for tab in &snapshot.tabs {
-            let page = self
-                .open_browser_tab(tab.id.clone(), &tab.url, None)
-                .await
-                .unwrap_or_else(|error| error_page(&tab.url, &error.to_string()));
+        {
             let mut state = self.state.lock().await;
-            state.tabs.insert(tab.id.clone(), page);
-            drop(state);
+            for tab in &snapshot.tabs {
+                let seq = state.next_activity_seq();
+                state
+                    .tabs
+                    .insert(tab.id.clone(), TabEntry::sleeping_from_summary(tab, seq));
+            }
         }
         let active_tab = snapshot
             .active_tab
             .filter(|tab_id| snapshot.tabs.iter().any(|tab| &tab.id == tab_id))
             .or_else(|| snapshot.tabs.first().map(|tab| tab.id.clone()));
         let mut state = self.state.lock().await;
+        if let Some(tab_id) = &active_tab {
+            let seq = state.next_activity_seq();
+            if let Some(tab) = state.tabs.get_mut(tab_id) {
+                tab.last_active_seq = seq;
+            }
+        }
         state.active_tab.clone_from(&active_tab);
         drop(state);
         Ok(active_tab)
@@ -908,11 +1105,12 @@ impl TrowserServer {
         let tabs = state
             .tabs
             .iter()
-            .map(|(id, page)| TabSummary {
+            .map(|(id, tab)| TabSummary {
                 id: id.clone(),
-                url: page.url.clone(),
-                title: page.title.clone(),
+                url: tab.url.clone(),
+                title: tab.title.clone(),
                 active: state.active_tab.as_ref() == Some(id),
+                sleeping: tab.lifecycle.is_sleeping(),
             })
             .collect();
 
@@ -1026,4 +1224,55 @@ where
     let mut bytes = vec![0_u8; len];
     stream.read_exact(&mut bytes).await?;
     bmux_codec::from_bytes(&bytes).map_err(ServerError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TabEntry, TabLifecycle, TrowserServer};
+    use trowser_config::{ConfigPaths, TrowserConfig};
+    use trowser_render::SemanticPage;
+    use trowser_session_models::TabId;
+
+    #[tokio::test]
+    async fn sleep_excess_tabs_sleeps_lru_inactive_tabs() {
+        let mut config = TrowserConfig::default();
+        config.resources.max_awake_tabs = Some(1);
+        let server = TrowserServer::new(ConfigPaths::resolve(), config);
+        let active_tab = TabId::new("tab-2");
+
+        {
+            let mut state = server.state.lock().await;
+            for index in 0..3 {
+                let tab_id = TabId::new(format!("tab-{index}"));
+                state.tabs.insert(
+                    tab_id,
+                    TabEntry::awake_from_page(
+                        SemanticPage {
+                            url: format!("https://example.com/{index}"),
+                            title: format!("tab {index}"),
+                            ..SemanticPage::default()
+                        },
+                        index,
+                    ),
+                );
+            }
+            state.active_tab = Some(active_tab.clone());
+        }
+
+        server.sleep_excess_tabs().await;
+
+        let state = server.state.lock().await;
+        let sleeping_tabs = ["tab-0", "tab-1"]
+            .into_iter()
+            .map(|tab_id| state.tabs.get(&TabId::new(tab_id)).map(|tab| tab.lifecycle))
+            .collect::<Vec<_>>();
+        let active_lifecycle = state.tabs.get(&active_tab).map(|tab| tab.lifecycle);
+        drop(state);
+
+        assert_eq!(
+            sleeping_tabs,
+            vec![Some(TabLifecycle::Sleeping), Some(TabLifecycle::Sleeping)]
+        );
+        assert_eq!(active_lifecycle, Some(TabLifecycle::Awake));
+    }
 }

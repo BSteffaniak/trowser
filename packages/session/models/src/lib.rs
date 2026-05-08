@@ -72,6 +72,8 @@ pub struct TabSummary {
     pub title: String,
     /// Whether this tab is currently selected by the daemon session.
     pub active: bool,
+    /// Whether this tab is not backed by a live browser target.
+    pub sleeping: bool,
 }
 
 impl Default for TabSummary {
@@ -81,6 +83,7 @@ impl Default for TabSummary {
             url: String::new(),
             title: String::new(),
             active: false,
+            sleeping: false,
         }
     }
 }
