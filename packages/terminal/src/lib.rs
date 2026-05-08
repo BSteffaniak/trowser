@@ -33,6 +33,40 @@ impl Default for TerminalRenderOptions {
     }
 }
 
+/// Terminal presentation mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RenderMode {
+    /// Prioritize readable main/article content.
+    #[default]
+    Reader,
+    /// Preserve more page chrome such as header/nav/footer.
+    Page,
+    /// Show a compact headings/actions overview.
+    Outline,
+}
+
+impl RenderMode {
+    /// Returns the next render mode in the interactive cycle.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Reader => Self::Page,
+            Self::Page => Self::Outline,
+            Self::Outline => Self::Reader,
+        }
+    }
+
+    /// Returns a short label for status bars.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Reader => "reader",
+            Self::Page => "page",
+            Self::Outline => "outline",
+        }
+    }
+}
+
 /// A rendered terminal document with optional hit-test metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RenderedDocument {
@@ -58,10 +92,41 @@ impl RenderedDocument {
 pub struct RenderedLine {
     /// Visible line text.
     pub text: String,
+    /// Styled spans for terminal presentation.
+    pub spans: Vec<StyledSpan>,
     /// Link hitboxes on this line.
     pub links: Vec<LinkHitbox>,
     /// Form-control hitboxes on this line.
     pub controls: Vec<ControlHitbox>,
+}
+
+/// A styled text span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StyledSpan {
+    /// Span text.
+    pub text: String,
+    /// Span style class.
+    pub style: SpanStyle,
+}
+
+/// Semantic style classes used by terminal clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpanStyle {
+    /// Regular text.
+    #[default]
+    Normal,
+    /// Browser chrome / borders.
+    Chrome,
+    /// Heading text.
+    Heading,
+    /// Link/action text.
+    Link,
+    /// Form-control/action text.
+    Control,
+    /// Less important surrounding text.
+    Dim,
+    /// Error/warning text.
+    Error,
 }
 
 /// Clickable link range within a rendered line.
@@ -126,25 +191,57 @@ pub fn render_plain_text(page: &SemanticPage, options: &TerminalRenderOptions) -
 /// Renders a semantic page into terminal lines plus link hit-test metadata.
 #[must_use]
 pub fn render_document(page: &SemanticPage, options: &TerminalRenderOptions) -> RenderedDocument {
+    render_document_mode(page, options, RenderMode::Reader)
+}
+
+/// Renders a semantic page in the requested presentation mode.
+#[must_use]
+pub fn render_document_mode(
+    page: &SemanticPage,
+    options: &TerminalRenderOptions,
+    mode: RenderMode,
+) -> RenderedDocument {
     let page = sanitize_page(page);
     let width = usize::from(options.width.max(40));
     let mut document = RenderedDocument::default();
 
     push_header_lines(&page, width, &mut document);
 
-    let blocks = reader_blocks(&page.blocks);
     let mut next_link_id = 1usize;
     let mut next_control_id = 1usize;
-    push_nav_summary_lines(&page, width, &mut next_link_id, &mut document);
-    for block in blocks {
-        push_reader_block_lines(
-            block,
+    match mode {
+        RenderMode::Reader => {
+            push_nav_summary_lines(&page, width, &mut next_link_id, &mut document);
+            for block in reader_blocks(&page.blocks) {
+                push_reader_block_lines(
+                    block,
+                    &mut next_link_id,
+                    &mut next_control_id,
+                    width,
+                    options,
+                    &mut document,
+                );
+            }
+        }
+        RenderMode::Page => {
+            for block in &page.blocks {
+                push_reader_block_lines(
+                    block,
+                    &mut next_link_id,
+                    &mut next_control_id,
+                    width,
+                    options,
+                    &mut document,
+                );
+            }
+        }
+        RenderMode::Outline => push_outline_lines(
+            &page,
             &mut next_link_id,
             &mut next_control_id,
             width,
-            options,
             &mut document,
-        );
+        ),
     }
 
     document
@@ -154,6 +251,18 @@ fn push_header_lines(page: &SemanticPage, width: usize, document: &mut RenderedD
     let mut output = String::new();
     render_header(page, width, &mut output);
     push_text_lines(document, &output, None);
+}
+
+fn line_with_style(text: String, style: SpanStyle) -> RenderedLine {
+    RenderedLine {
+        spans: vec![StyledSpan {
+            text: text.clone(),
+            style,
+        }],
+        text,
+        links: Vec::new(),
+        controls: Vec::new(),
+    }
 }
 
 fn push_nav_summary_lines(
@@ -173,16 +282,75 @@ fn push_nav_summary_lines(
         return;
     }
 
-    document.lines.push(RenderedLine {
-        text: "nav:".to_string(),
-        links: Vec::new(),
-        controls: Vec::new(),
-    });
+    document
+        .lines
+        .push(line_with_style("nav:".to_string(), SpanStyle::Chrome));
     for (action_id, label, url) in nav_links {
         let link_id = u32::try_from(*next_link_id).unwrap_or(u32::MAX);
         *next_link_id += 1;
         let value = format!("[{link_id}] {label} <{url}>");
         push_wrapped_lines(document, &value, 0, width, Some((link_id, action_id)));
+    }
+    document.lines.push(RenderedLine::default());
+}
+
+fn push_outline_lines(
+    page: &SemanticPage,
+    next_link_id: &mut usize,
+    next_control_id: &mut usize,
+    width: usize,
+    document: &mut RenderedDocument,
+) {
+    document
+        .lines
+        .push(line_with_style("outline:".to_string(), SpanStyle::Chrome));
+    for block in &page.blocks {
+        match block {
+            SemanticBlock::Heading { level, text, .. } => document.lines.push(line_with_style(
+                format!(
+                    "{}{} {text}",
+                    "  ".repeat(usize::from(level.saturating_sub(1))),
+                    "#"
+                ),
+                SpanStyle::Heading,
+            )),
+            SemanticBlock::Link {
+                action_id,
+                text,
+                url,
+                ..
+            } => {
+                let label = if text.is_empty() { url } else { text };
+                let link_id = u32::try_from(*next_link_id).unwrap_or(u32::MAX);
+                *next_link_id += 1;
+                push_wrapped_lines(
+                    document,
+                    &format!("[{link_id}] link {label}"),
+                    0,
+                    width,
+                    Some((link_id, action_id.clone())),
+                );
+            }
+            SemanticBlock::FormControl {
+                action_id,
+                label,
+                control_type,
+                ..
+            } => {
+                let control_id = u32::try_from(*next_control_id).unwrap_or(u32::MAX);
+                *next_control_id += 1;
+                push_wrapped_control_lines(
+                    document,
+                    &format!("[control {control_id}] {control_type} {label}"),
+                    0,
+                    width,
+                    control_id,
+                    action_id.clone(),
+                    control_action(control_type),
+                );
+            }
+            _ => {}
+        }
     }
     document.lines.push(RenderedLine::default());
 }
@@ -199,15 +367,14 @@ fn push_reader_block_lines(
     match block {
         SemanticBlock::Heading { level, text, .. } => {
             document.lines.push(RenderedLine::default());
-            document.lines.push(RenderedLine {
-                text: format!(
+            document.lines.push(line_with_style(
+                format!(
                     "{}{} {text}",
                     " ".repeat(placement.indent),
                     "#".repeat(usize::from((*level).clamp(1, 6)))
                 ),
-                links: Vec::new(),
-                controls: Vec::new(),
-            });
+                SpanStyle::Heading,
+            ));
             document.lines.push(RenderedLine::default());
         }
         SemanticBlock::Paragraph { text, .. } => {
@@ -307,6 +474,14 @@ fn push_wrapped_lines(
             }]
         });
         document.lines.push(RenderedLine {
+            spans: vec![StyledSpan {
+                text: text.clone(),
+                style: if links.is_empty() {
+                    SpanStyle::Normal
+                } else {
+                    SpanStyle::Link
+                },
+            }],
             text,
             links,
             controls: Vec::new(),
@@ -330,6 +505,10 @@ fn push_wrapped_control_lines(
     for line in wrap_lines(text, width) {
         let text = format!("{}{}", " ".repeat(indent), line);
         document.lines.push(RenderedLine {
+            spans: vec![StyledSpan {
+                text: text.clone(),
+                style: SpanStyle::Control,
+            }],
             controls: vec![ControlHitbox {
                 control_id,
                 action_id: action_id.clone(),
@@ -370,8 +549,17 @@ fn push_text_lines(
                 end_col,
             }]
         });
+        let text = line.to_string();
         document.lines.push(RenderedLine {
-            text: line.to_string(),
+            spans: vec![StyledSpan {
+                text: text.clone(),
+                style: if links.is_empty() {
+                    SpanStyle::Normal
+                } else {
+                    SpanStyle::Link
+                },
+            }],
+            text,
             links,
             controls: Vec::new(),
         });

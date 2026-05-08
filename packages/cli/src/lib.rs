@@ -18,7 +18,7 @@ use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton,
     MouseEventKind, poll, read,
 };
-use crossterm::style::Print;
+use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::terminal::{
     BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate, EnterAlternateScreen,
     LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
@@ -32,8 +32,8 @@ use trowser_ipc::{Request, Response, ServerStatus};
 use trowser_server::TrowserServer;
 use trowser_session_models::ActionId;
 use trowser_terminal::{
-    ControlHitboxAction, RenderedDocument, TerminalRenderOptions, render_document,
-    render_plain_text,
+    ControlHitboxAction, RenderMode, RenderedDocument, SpanStyle, TerminalRenderOptions,
+    render_document_mode, render_plain_text,
 };
 use trowser_terminal_image::detect_from_env;
 
@@ -274,17 +274,18 @@ async fn run_interactive(
     } else {
         active_snapshot_or_empty(&client).await
     };
-    let mut rendered = render_page_document(&page, config);
+    let mut render_mode = RenderMode::Reader;
+    let mut rendered = render_page_document(&page, config, render_mode);
     let mut tab_status = tabs_status(&client).await.unwrap_or_default();
     let mut offset = 0usize;
     let mut search_query = String::new();
     let mut message = String::from(
-        "q quit · j/k scroll · o/t open tab · Tab switch · x close · f follow · i input · c click · b back · F forward · r reload",
+        "q quit · j/k scroll · m mode · o/t open tab · Tab switch · x close · f follow · i input · c click · b back · F forward · r reload",
     );
     let _guard = TerminalGuard::enter()?;
 
     loop {
-        draw_viewport(&page, &rendered, offset, &message, &tab_status)?;
+        draw_viewport(&page, &rendered, offset, &message, &tab_status, render_mode)?;
         match read()? {
             Event::Key(key) => match key {
                 KeyEvent {
@@ -314,6 +315,15 @@ async fn run_interactive(
                     ..
                 } => offset = 0,
                 KeyEvent {
+                    code: KeyCode::Char('m'),
+                    ..
+                } => {
+                    render_mode = render_mode.next();
+                    rendered = render_page_document(&page, config, render_mode);
+                    offset = 0;
+                    message = format!("render mode: {}", render_mode.label());
+                }
+                KeyEvent {
                     code: KeyCode::Char('G'),
                     ..
                 } => offset = rendered.lines.len().saturating_sub(1),
@@ -330,7 +340,7 @@ async fn run_interactive(
                             .await?
                         {
                             page = updated_page;
-                            rendered = render_page_document(&page, config);
+                            rendered = render_page_document(&page, config, render_mode);
                             tab_status = tabs_status(&client).await.unwrap_or_default();
                             offset = 0;
                             message = "activated focused action".to_string();
@@ -418,7 +428,7 @@ async fn run_interactive(
                         .await?
                         {
                             page = updated_page;
-                            rendered = render_page_document(&page, config);
+                            rendered = render_page_document(&page, config, render_mode);
                             tab_status = tabs_status(&client).await.unwrap_or_default();
                             offset = 0;
                             message = format!("opened {url}");
@@ -432,7 +442,7 @@ async fn run_interactive(
                 } => match next_tab_and_snapshot(&client).await {
                     Ok(updated_page) => {
                         page = updated_page;
-                        rendered = render_page_document(&page, config);
+                        rendered = render_page_document(&page, config, render_mode);
                         tab_status = tabs_status(&client).await.unwrap_or_default();
                         offset = 0;
                         message = "next tab".to_string();
@@ -445,7 +455,7 @@ async fn run_interactive(
                 } => match previous_tab_and_snapshot(&client).await {
                     Ok(updated_page) => {
                         page = updated_page;
-                        rendered = render_page_document(&page, config);
+                        rendered = render_page_document(&page, config, render_mode);
                         tab_status = tabs_status(&client).await.unwrap_or_default();
                         offset = 0;
                         message = "previous tab".to_string();
@@ -458,7 +468,7 @@ async fn run_interactive(
                 } => match close_active_tab_and_snapshot(&client).await {
                     Ok(updated_page) => {
                         page = updated_page;
-                        rendered = render_page_document(&page, config);
+                        rendered = render_page_document(&page, config, render_mode);
                         tab_status = tabs_status(&client).await.unwrap_or_default();
                         offset = 0;
                         message = "closed tab".to_string();
@@ -473,7 +483,7 @@ async fn run_interactive(
                     match switch_tab_index_and_snapshot(&client, index).await {
                         Ok(updated_page) => {
                             page = updated_page;
-                            rendered = render_page_document(&page, config);
+                            rendered = render_page_document(&page, config, render_mode);
                             tab_status = tabs_status(&client).await.unwrap_or_default();
                             offset = 0;
                             message = format!("switched to tab {index}");
@@ -498,7 +508,7 @@ async fn run_interactive(
                         .await?
                         {
                             page = updated_page;
-                            rendered = render_page_document(&page, config);
+                            rendered = render_page_document(&page, config, render_mode);
                             offset = 0;
                             message = format!("followed link {link_id}");
                         } else {
@@ -524,7 +534,7 @@ async fn run_interactive(
                         .await?
                         {
                             page = updated_page;
-                            rendered = render_page_document(&page, config);
+                            rendered = render_page_document(&page, config, render_mode);
                             offset = 0;
                             message = format!("input text into control {control_id}");
                         } else {
@@ -550,7 +560,7 @@ async fn run_interactive(
                         .await?
                         {
                             page = updated_page;
-                            rendered = render_page_document(&page, config);
+                            rendered = render_page_document(&page, config, render_mode);
                             offset = 0;
                             message = format!("clicked control {control_id}");
                         } else {
@@ -570,7 +580,7 @@ async fn run_interactive(
                     {
                         Ok(Some(updated_page)) => {
                             page = updated_page;
-                            rendered = render_page_document(&page, config);
+                            rendered = render_page_document(&page, config, render_mode);
                             offset = 0;
                             message = "back".to_string();
                         }
@@ -590,7 +600,7 @@ async fn run_interactive(
                     {
                         Ok(Some(updated_page)) => {
                             page = updated_page;
-                            rendered = render_page_document(&page, config);
+                            rendered = render_page_document(&page, config, render_mode);
                             offset = 0;
                             message = "forward".to_string();
                         }
@@ -610,7 +620,7 @@ async fn run_interactive(
                         .await?
                     {
                         page = updated_page;
-                        rendered = render_page_document(&page, config);
+                        rendered = render_page_document(&page, config, render_mode);
                         offset = 0;
                         message = "reloaded".to_string();
                     } else {
@@ -643,7 +653,7 @@ async fn run_interactive(
                                 .await?
                                 {
                                     page = updated_page;
-                                    rendered = render_page_document(&page, config);
+                                    rendered = render_page_document(&page, config, render_mode);
                                     offset = 0;
                                     message = format!("followed link {link_id}");
                                 } else {
@@ -672,7 +682,7 @@ async fn run_interactive(
                                 .await?
                                 {
                                     page = updated_page;
-                                    rendered = render_page_document(&page, config);
+                                    rendered = render_page_document(&page, config, render_mode);
                                     offset = 0;
                                     message = format!("clicked control {control_id}");
                                 } else {
@@ -703,7 +713,7 @@ async fn run_interactive(
                                     .await?
                                     {
                                         page = updated_page;
-                                        rendered = render_page_document(&page, config);
+                                        rendered = render_page_document(&page, config, render_mode);
                                         offset = 0;
                                         message = format!("input text into control {control_id}");
                                     } else {
@@ -990,13 +1000,15 @@ fn empty_page(message: &str) -> trowser_render::SemanticPage {
 fn render_page_document(
     page: &trowser_render::SemanticPage,
     config: &TrowserConfig,
+    render_mode: RenderMode,
 ) -> RenderedDocument {
-    render_document(
+    render_document_mode(
         page,
         &TerminalRenderOptions {
             width: config.render.max_width,
             image_capabilities: detect_from_env(),
         },
+        render_mode,
     )
 }
 
@@ -1006,6 +1018,7 @@ fn draw_viewport(
     offset: usize,
     message: &str,
     tab_status: &str,
+    render_mode: RenderMode,
 ) -> Result<()> {
     let (width, height) = size()?;
     let body_height = height.saturating_sub(2);
@@ -1016,7 +1029,10 @@ fn draw_viewport(
     } else {
         page.title.as_str()
     };
-    let header = format!("trowser | {tab_status} | {scroll}% | {title}");
+    let header = format!(
+        "trowser | {tab_status} | {} | {scroll}% | {title}",
+        render_mode.label()
+    );
 
     queue!(out, BeginSynchronizedUpdate, Hide)?;
     queue!(
@@ -1027,16 +1043,15 @@ fn draw_viewport(
     )?;
 
     for row in 0..body_height {
-        let line = document
-            .lines
-            .get(offset + usize::from(row))
-            .map_or("", |line| line.text.as_str());
+        let line = document.lines.get(offset + usize::from(row));
         queue!(
             out,
             MoveTo(0, row.saturating_add(1)),
-            Clear(ClearType::CurrentLine),
-            Print(truncate_for_terminal(line, width))
+            Clear(ClearType::CurrentLine)
         )?;
+        if let Some(line) = line {
+            queue_styled_line(&mut out, line, width)?;
+        }
     }
 
     queue!(
@@ -1047,6 +1062,64 @@ fn draw_viewport(
         EndSynchronizedUpdate
     )?;
     out.flush()?;
+    Ok(())
+}
+
+fn queue_styled_line<W: Write>(
+    out: &mut W,
+    line: &trowser_terminal::RenderedLine,
+    width: u16,
+) -> Result<()> {
+    let mut used = 0usize;
+    let spans = if line.spans.is_empty() {
+        vec![trowser_terminal::StyledSpan {
+            text: line.text.clone(),
+            style: SpanStyle::Normal,
+        }]
+    } else {
+        line.spans.clone()
+    };
+    for span in spans {
+        if used >= usize::from(width) {
+            break;
+        }
+        let remaining = usize::from(width) - used;
+        let text = span.text.chars().take(remaining).collect::<String>();
+        used += text.chars().count();
+        queue_span_style(out, span.style)?;
+        queue!(out, Print(text))?;
+    }
+    queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
+    Ok(())
+}
+
+fn queue_span_style<W: Write>(out: &mut W, style: SpanStyle) -> Result<()> {
+    queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
+    match style {
+        SpanStyle::Normal => {}
+        SpanStyle::Chrome => queue!(out, SetForegroundColor(Color::DarkGrey))?,
+        SpanStyle::Heading => queue!(
+            out,
+            SetForegroundColor(Color::Yellow),
+            SetAttribute(Attribute::Bold)
+        )?,
+        SpanStyle::Link => queue!(
+            out,
+            SetForegroundColor(Color::Blue),
+            SetAttribute(Attribute::Underlined)
+        )?,
+        SpanStyle::Control => queue!(
+            out,
+            SetForegroundColor(Color::Cyan),
+            SetAttribute(Attribute::Bold)
+        )?,
+        SpanStyle::Dim => queue!(out, SetForegroundColor(Color::DarkGrey))?,
+        SpanStyle::Error => queue!(
+            out,
+            SetForegroundColor(Color::Red),
+            SetAttribute(Attribute::Bold)
+        )?,
+    }
     Ok(())
 }
 
