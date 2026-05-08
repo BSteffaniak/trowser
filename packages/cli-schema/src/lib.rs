@@ -21,7 +21,7 @@ pub struct Cli {
     /// Output machine-readable JSON when supported.
     #[arg(long, global = true)]
     pub json: bool,
-    /// Command to run. With no command, trowser opens the terminal UI placeholder.
+    /// Command to run. With no command, trowser opens interactive terminal browser mode.
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -29,13 +29,13 @@ pub struct Cli {
 /// Top-level trowser commands.
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
-    /// Open a URL in trowser.
+    /// Open a URL in interactive trowser mode by default.
     Open {
         /// URL to open.
         url: String,
-        /// Stay in an interactive terminal viewport after opening.
-        #[arg(long, short = 'i')]
-        interactive: bool,
+        /// Render once to stdout and exit instead of entering interactive mode.
+        #[arg(long)]
+        non_interactive: bool,
     },
     /// Start interactive terminal browser mode.
     Interactive,

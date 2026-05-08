@@ -56,13 +56,14 @@ pub async fn run() -> Result<u8> {
     let config = TrowserConfig::load(&paths)?;
 
     match cli.command.unwrap_or(Command::Interactive) {
-        Command::Open { url, interactive } if interactive => {
-            run_interactive(&paths, &config, Some(url)).await
-        }
         Command::Open {
             url,
-            interactive: _,
-        } => run_open(&paths, &config, &url, cli.json).await,
+            non_interactive,
+        } if non_interactive || cli.json => run_open(&paths, &config, &url, cli.json).await,
+        Command::Open {
+            url,
+            non_interactive: _,
+        } => run_interactive(&paths, &config, Some(url)).await,
         Command::Interactive => run_interactive(&paths, &config, None).await,
         Command::Server { command } => run_server(&command, &paths, cli.json).await,
         Command::Session { command } => run_session(&command, &paths, cli.json).await,
