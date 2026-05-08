@@ -104,8 +104,10 @@ impl Default for RenderConfig {
     reason = "config booleans map directly to independent resource classes"
 )]
 pub struct ResourcePolicyConfig {
-    /// Maximum active tabs before the daemon should reject or suspend tabs.
-    pub max_tabs: usize,
+    /// Optional maximum active tabs before the daemon should reject new tabs.
+    ///
+    /// `None` means unlimited tabs.
+    pub max_tabs: Option<usize>,
     /// Block image requests by default.
     pub block_images: bool,
     /// Block video/audio requests by default.
@@ -121,7 +123,7 @@ pub struct ResourcePolicyConfig {
 impl Default for ResourcePolicyConfig {
     fn default() -> Self {
         Self {
-            max_tabs: 8,
+            max_tabs: None,
             block_images: false,
             block_video: true,
             block_fonts: false,
@@ -164,6 +166,24 @@ impl TrowserConfig {
             source,
         })?;
         toml::from_str(&contents).map_err(|source| ConfigError::Parse { path, source })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ResourcePolicyConfig, TrowserConfig};
+
+    #[test]
+    fn resource_policy_defaults_to_unlimited_tabs() {
+        assert_eq!(ResourcePolicyConfig::default().max_tabs, None);
+    }
+
+    #[test]
+    fn config_accepts_explicit_max_tabs() {
+        let config = toml::from_str::<TrowserConfig>("[resources]\nmax_tabs = 12\n")
+            .expect("config should parse");
+
+        assert_eq!(config.resources.max_tabs, Some(12));
     }
 }
 

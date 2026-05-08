@@ -255,12 +255,11 @@ impl TrowserServer {
                 message: format!("request {request_id} canceled"),
             };
         }
-        if self.open_tab_count().await >= self.config.resources.max_tabs {
+        if let Some(max_tabs) = self.config.resources.max_tabs
+            && self.open_tab_count().await >= max_tabs
+        {
             return Response::Error {
-                message: format!(
-                    "maximum tab count ({}) reached",
-                    self.config.resources.max_tabs
-                ),
+                message: format!("maximum tab count ({max_tabs}) reached"),
             };
         }
         let tab_id = self.allocate_tab_id().await;
