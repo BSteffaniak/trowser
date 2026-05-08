@@ -11,7 +11,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify};
-use trowser_browser_cdp::{CdpBackendConfig, CdpBrowser};
+use trowser_browser_cdp::{CdpBackendConfig, CdpBrowser, CdpResourcePolicy};
 use trowser_config::{ConfigPaths, TROWSER_DAEMON_READY_FILE_ENV, TrowserConfig};
 use trowser_ipc::{
     ClientHello, PROTOCOL_VERSION, ProtocolCapabilities, Request, Response, ServerHello,
@@ -39,6 +39,7 @@ struct ServerState {
     tabs: BTreeMap<TabId, SemanticPage>,
     active_tab: Option<TabId>,
     next_tab_id: u64,
+    canceled_requests: std::collections::BTreeSet<String>,
 }
 
 /// Daemon runtime state.
@@ -163,6 +164,8 @@ impl TrowserServer {
             Request::Hello(hello) => Self::handle_hello(&hello),
             Request::Status => Response::Status(self.status()),
             Request::Open { url } => self.handle_open(url).await,
+            Request::Navigate { request_id, url } => self.handle_navigate(request_id, url).await,
+            Request::Cancel { request_id } => self.handle_cancel(request_id).await,
             Request::SwitchTab { tab_id } => self.handle_switch_tab(tab_id).await,
             Request::CloseTab { tab_id } => self.handle_close_tab(tab_id).await,
             Request::NextTab => self.handle_next_tab().await,
@@ -206,12 +209,55 @@ impl TrowserServer {
     }
 
     async fn handle_open(&self, url: String) -> Response {
+        self.open_url(url, None).await
+    }
+
+    async fn handle_navigate(&self, request_id: String, url: String) -> Response {
+        self.open_url(url, Some(request_id)).await
+    }
+
+    async fn open_url(&self, url: String, request_id: Option<String>) -> Response {
+        if let Some(request_id) = request_id.as_ref()
+            && self.is_request_canceled(request_id).await
+        {
+            return Response::Error {
+                message: format!("request {request_id} canceled"),
+            };
+        }
         let tab_id = self.allocate_tab_id().await;
         let page = self
             .open_browser_tab(tab_id.clone(), &url)
             .await
             .unwrap_or_else(|error| error_page(&url, &error.to_string()));
+        if let Some(request_id) = request_id.as_ref()
+            && self.take_canceled_request(request_id).await
+        {
+            return Response::Error {
+                message: format!("request {request_id} canceled"),
+            };
+        }
         self.store_page(tab_id, page).await
+    }
+
+    async fn handle_cancel(&self, request_id: String) -> Response {
+        let mut state = self.state.lock().await;
+        state.canceled_requests.insert(request_id);
+        drop(state);
+        Response::Ok
+    }
+
+    async fn is_request_canceled(&self, request_id: &str) -> bool {
+        let state = self.state.lock().await;
+        let canceled = state.canceled_requests.contains(request_id);
+        drop(state);
+        canceled
+    }
+
+    async fn take_canceled_request(&self, request_id: &str) -> bool {
+        let mut state = self.state.lock().await;
+        let canceled = state.canceled_requests.remove(request_id);
+        drop(state);
+        canceled
     }
 
     async fn allocate_tab_id(&self) -> TabId {
@@ -482,10 +528,7 @@ impl TrowserServer {
     ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
         let mut browser = self.browser.lock().await;
         if browser.is_none() {
-            let config = CdpBackendConfig {
-                browser_binary: self.config.browser.binary.clone(),
-                headless: self.config.browser.headless,
-            };
+            let config = self.cdp_config();
             *browser = Some(CdpBrowser::launch(&config).await?);
         }
         let Some(browser) = browser.as_mut() else {
@@ -505,10 +548,7 @@ impl TrowserServer {
     ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
         let mut browser = self.browser.lock().await;
         if browser.is_none() {
-            let config = CdpBackendConfig {
-                browser_binary: self.config.browser.binary.clone(),
-                headless: self.config.browser.headless,
-            };
+            let config = self.cdp_config();
             *browser = Some(CdpBrowser::launch(&config).await?);
         }
         let Some(browser) = browser.as_mut() else {
@@ -528,10 +568,7 @@ impl TrowserServer {
     ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
         let mut browser = self.browser.lock().await;
         if browser.is_none() {
-            let config = CdpBackendConfig {
-                browser_binary: self.config.browser.binary.clone(),
-                headless: self.config.browser.headless,
-            };
+            let config = self.cdp_config();
             *browser = Some(CdpBrowser::launch(&config).await?);
             let Some(browser) = browser.as_mut() else {
                 unreachable!("browser initialized above")
@@ -612,6 +649,24 @@ impl TrowserServer {
             ));
         };
         browser.input_text_action(tab_id, action_id, text).await
+    }
+
+    fn cdp_config(&self) -> CdpBackendConfig {
+        CdpBackendConfig {
+            browser_binary: self.config.browser.binary.clone(),
+            headless: self.config.browser.headless,
+            resource_policy: self.resource_policy(),
+        }
+    }
+
+    const fn resource_policy(&self) -> CdpResourcePolicy {
+        CdpResourcePolicy {
+            block_images: self.config.resources.block_images,
+            block_media: self.config.resources.block_video,
+            block_fonts: self.config.resources.block_fonts,
+            block_ads: self.config.resources.block_ads,
+            block_trackers: self.config.resources.block_trackers,
+        }
     }
 
     async fn shutdown_browser(&self) {

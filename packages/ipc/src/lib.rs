@@ -59,6 +59,10 @@ pub enum Request {
     Status,
     /// Opens a new tab to a URL.
     Open { url: String },
+    /// Opens a new tab to a URL with a cancellable request id.
+    Navigate { request_id: String, url: String },
+    /// Cancels or marks stale a cancellable request.
+    Cancel { request_id: String },
     /// Switches to a tab.
     SwitchTab { tab_id: TabId },
     /// Closes a tab.

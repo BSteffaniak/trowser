@@ -96,13 +96,23 @@ impl Default for RenderConfig {
 /// Resource and memory policy configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "config booleans map directly to independent resource classes"
+)]
 pub struct ResourcePolicyConfig {
     /// Maximum active tabs before the daemon should reject or suspend tabs.
     pub max_tabs: usize,
     /// Block image requests by default.
     pub block_images: bool,
-    /// Block video requests by default.
+    /// Block video/audio requests by default.
     pub block_video: bool,
+    /// Block web font requests by default.
+    pub block_fonts: bool,
+    /// Block common ad URL patterns by default.
+    pub block_ads: bool,
+    /// Block common tracker URL patterns by default.
+    pub block_trackers: bool,
 }
 
 impl Default for ResourcePolicyConfig {
@@ -111,6 +121,9 @@ impl Default for ResourcePolicyConfig {
             max_tabs: 8,
             block_images: false,
             block_video: true,
+            block_fonts: false,
+            block_ads: true,
+            block_trackers: true,
         }
     }
 }

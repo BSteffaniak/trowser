@@ -32,6 +32,8 @@ pub struct CdpBackendConfig {
     pub browser_binary: Option<PathBuf>,
     /// Whether to launch the browser in headless mode.
     pub headless: bool,
+    /// Resource blocking policy applied to new page targets.
+    pub resource_policy: CdpResourcePolicy,
 }
 
 impl Default for CdpBackendConfig {
@@ -39,6 +41,38 @@ impl Default for CdpBackendConfig {
         Self {
             browser_binary: None,
             headless: true,
+            resource_policy: CdpResourcePolicy::default(),
+        }
+    }
+}
+
+/// Resource blocking policy for Chromium page targets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "resource policy booleans map directly to independent CDP URL pattern groups"
+)]
+pub struct CdpResourcePolicy {
+    /// Block image requests.
+    pub block_images: bool,
+    /// Block media requests.
+    pub block_media: bool,
+    /// Block web font requests.
+    pub block_fonts: bool,
+    /// Block common ad URL patterns.
+    pub block_ads: bool,
+    /// Block common tracker URL patterns.
+    pub block_trackers: bool,
+}
+
+impl Default for CdpResourcePolicy {
+    fn default() -> Self {
+        Self {
+            block_images: false,
+            block_media: true,
+            block_fonts: false,
+            block_ads: true,
+            block_trackers: true,
         }
     }
 }
@@ -151,6 +185,7 @@ pub struct CdpBrowser {
     child: Child,
     _profile: tempfile::TempDir,
     port: u16,
+    resource_policy: CdpResourcePolicy,
     pages: BTreeMap<TabId, CdpPage>,
 }
 
@@ -183,6 +218,7 @@ impl CdpBrowser {
             child,
             _profile: profile,
             port,
+            resource_policy: config.resource_policy.clone(),
             pages: BTreeMap::new(),
         })
     }
@@ -196,7 +232,7 @@ impl CdpBrowser {
         if self.pages.contains_key(&tab_id) {
             self.close_tab(&tab_id).await?;
         }
-        let mut page = CdpPage::create(self.port).await?;
+        let mut page = CdpPage::create(self.port, &self.resource_policy).await?;
         let semantic_page = page.navigate(url).await?;
         self.pages.insert(tab_id, page);
         Ok(semantic_page)
@@ -310,12 +346,13 @@ struct CdpPage {
 }
 
 impl CdpPage {
-    async fn create(port: u16) -> CdpResult<Self> {
+    async fn create(port: u16, resource_policy: &CdpResourcePolicy) -> CdpResult<Self> {
         let target = create_page_target(port).await?;
         let mut cdp = CdpConnection::connect(&target.web_socket_debugger_url).await?;
         cdp.call("Page.enable", json!({})).await?;
         cdp.call("Runtime.enable", json!({})).await?;
         cdp.call("Accessibility.enable", json!({})).await?;
+        configure_resource_policy(&mut cdp, resource_policy).await?;
         Ok(Self {
             target_id: target.id,
             cdp,
@@ -517,6 +554,55 @@ async fn close_page_target(port: u16, target_id: &str) -> CdpResult<()> {
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn configure_resource_policy(
+    cdp: &mut CdpConnection,
+    policy: &CdpResourcePolicy,
+) -> CdpResult<()> {
+    let blocked_urls = blocked_url_patterns(policy);
+    if blocked_urls.is_empty() {
+        return Ok(());
+    }
+    cdp.call("Network.enable", json!({})).await?;
+    cdp.call("Network.setBlockedURLs", json!({ "urls": blocked_urls }))
+        .await?;
+    Ok(())
+}
+
+fn blocked_url_patterns(policy: &CdpResourcePolicy) -> Vec<&'static str> {
+    let mut patterns = Vec::new();
+    if policy.block_images {
+        patterns.extend([
+            "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.avif", "*.svg",
+        ]);
+    }
+    if policy.block_media {
+        patterns.extend([
+            "*.mp4", "*.webm", "*.mov", "*.m4v", "*.mp3", "*.wav", "*.ogg",
+        ]);
+    }
+    if policy.block_fonts {
+        patterns.extend(["*.woff", "*.woff2", "*.ttf", "*.otf"]);
+    }
+    if policy.block_ads {
+        patterns.extend([
+            "*://*/ads/*",
+            "*://*/adservice/*",
+            "*doubleclick.net/*",
+            "*googlesyndication.com/*",
+        ]);
+    }
+    if policy.block_trackers {
+        patterns.extend([
+            "*google-analytics.com/*",
+            "*googletagmanager.com/*",
+            "*facebook.net/*",
+            "*hotjar.com/*",
+            "*segment.com/*",
+        ]);
+    }
+    patterns
+}
 
 struct CdpConnection {
     socket: WsStream,

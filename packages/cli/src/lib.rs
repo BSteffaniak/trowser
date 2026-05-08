@@ -5,8 +5,10 @@
 //! Command-line interface for trowser.
 
 use std::fs::OpenOptions;
+use std::future::Future;
 use std::io::{ErrorKind, Write, stdout};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -14,7 +16,7 @@ use clap::Parser;
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton,
-    MouseEventKind, read,
+    MouseEventKind, poll, read,
 };
 use crossterm::style::Print;
 use crossterm::terminal::{
@@ -36,6 +38,8 @@ use trowser_terminal::{
 use trowser_terminal_image::detect_from_env;
 
 mod trace;
+
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Runs the trowser CLI.
 ///
@@ -384,11 +388,32 @@ async fn run_interactive(
                     ..
                 } => {
                     if let Some(url) = prompt_input("Open URL: ")? {
-                        page = open_and_snapshot(&client, &url).await?;
-                        rendered = render_page_document(&page, config);
-                        tab_status = tabs_status(&client).await.unwrap_or_default();
-                        offset = 0;
-                        message = format!("opened {url}");
+                        let request_id = next_request_id();
+                        let client_clone = client.clone();
+                        let url_clone = url.clone();
+                        if let Some(updated_page) = load_with_ui(
+                            &client,
+                            &format!("loading {url}"),
+                            Some(request_id.clone()),
+                            async move {
+                                navigate_and_snapshot_with_request(
+                                    &client_clone,
+                                    request_id,
+                                    url_clone,
+                                )
+                                .await
+                            },
+                        )
+                        .await?
+                        {
+                            page = updated_page;
+                            rendered = render_page_document(&page, config);
+                            tab_status = tabs_status(&client).await.unwrap_or_default();
+                            offset = 0;
+                            message = format!("opened {url}");
+                        } else {
+                            message = "load canceled".to_string();
+                        }
                     }
                 }
                 KeyEvent {
@@ -575,6 +600,10 @@ async fn run_interactive(
     Ok(0)
 }
 
+fn next_request_id() -> String {
+    format!("cli-{}", REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
 async fn open_and_snapshot(
     client: &TrowserClient,
     url: &str,
@@ -588,6 +617,63 @@ async fn open_and_snapshot(
         anyhow::bail!("unexpected open response: {opened:?}");
     };
     snapshot_tab(client, tab_id).await
+}
+
+async fn navigate_and_snapshot_with_request(
+    client: &TrowserClient,
+    request_id: String,
+    url: String,
+) -> Result<trowser_render::SemanticPage> {
+    let opened = client.send(&Request::Navigate { request_id, url }).await?;
+    let Response::Opened { tab_id } = opened else {
+        anyhow::bail!("unexpected navigate response: {opened:?}");
+    };
+    snapshot_tab(client, tab_id).await
+}
+
+async fn load_with_ui<F>(
+    client: &TrowserClient,
+    label: &str,
+    request_id: Option<String>,
+    future: F,
+) -> Result<Option<trowser_render::SemanticPage>>
+where
+    F: Future<Output = Result<trowser_render::SemanticPage>> + Send + 'static,
+{
+    let handle = tokio::spawn(future);
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let mut frame = 0usize;
+    while !handle.is_finished() {
+        draw_loading_status(label, frames[frame % frames.len()])?;
+        frame += 1;
+        if poll(Duration::from_millis(80))?
+            && let Event::Key(key) = read()?
+            && key.code == KeyCode::Esc
+        {
+            if let Some(request_id) = request_id {
+                let _ = client.send(&Request::Cancel { request_id }).await;
+            }
+            handle.abort();
+            return Ok(None);
+        }
+    }
+    Ok(Some(handle.await??))
+}
+
+fn draw_loading_status(label: &str, frame: &str) -> Result<()> {
+    let (width, height) = size()?;
+    let mut out = stdout();
+    queue!(
+        out,
+        MoveTo(0, height.saturating_sub(1)),
+        Clear(ClearType::CurrentLine),
+        Print(truncate_for_terminal(
+            &format!("{frame} {label} · Esc cancel"),
+            width,
+        ))
+    )?;
+    out.flush()?;
+    Ok(())
 }
 
 async fn follow_and_snapshot(
