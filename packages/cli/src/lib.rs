@@ -25,7 +25,7 @@ use crossterm::terminal::{
 };
 use crossterm::{execute, queue};
 use trowser_browser_cdp::discover_browser_binary;
-use trowser_cli_schema::{Cli, Command, ServerCommand};
+use trowser_cli_schema::{Cli, Command, ServerCommand, SessionCommand};
 use trowser_client::{ClientError, TrowserClient};
 use trowser_config::{ConfigPaths, TROWSER_DAEMON_READY_FILE_ENV, TrowserConfig};
 use trowser_ipc::{Request, Response, ServerStatus};
@@ -65,6 +65,7 @@ pub async fn run() -> Result<u8> {
         } => run_open(&paths, &config, &url, cli.json).await,
         Command::Interactive => run_interactive(&paths, &config, None).await,
         Command::Server { command } => run_server(&command, &paths, cli.json).await,
+        Command::Session { command } => run_session(&command, &paths, cli.json).await,
         Command::Status => run_status(&paths, cli.json).await,
         Command::Follow { link_id } => run_follow(&paths, &config, link_id, cli.json).await,
         Command::Back => run_navigation(&paths, &config, Request::Back, cli.json).await,
@@ -1247,6 +1248,35 @@ impl Drop for TerminalGuard {
         let _ = disable_raw_mode();
         let _ = execute!(stdout(), Show, DisableMouseCapture, LeaveAlternateScreen);
     }
+}
+
+async fn run_session(command: &SessionCommand, paths: &ConfigPaths, json: bool) -> Result<u8> {
+    let client = ensure_server(paths).await?;
+    let request = match command {
+        SessionCommand::Save => Request::SaveSession,
+        SessionCommand::Restore => Request::RestoreSession,
+        SessionCommand::Clear => Request::ClearSession,
+    };
+    let response = client.send(&request).await?;
+    match response {
+        Response::Ok => {
+            if json {
+                println!("{}", serde_json::json!({ "ok": true }));
+            } else {
+                println!("ok");
+            }
+        }
+        Response::Opened { tab_id } => {
+            if json {
+                println!("{}", serde_json::json!({ "active_tab": tab_id.as_str() }));
+            } else {
+                println!("restored session; active tab {}", tab_id.as_str());
+            }
+        }
+        Response::Error { message } => anyhow::bail!(message),
+        unexpected => anyhow::bail!("unexpected session response: {unexpected:?}"),
+    }
+    Ok(0)
 }
 
 async fn run_server(command: &ServerCommand, paths: &ConfigPaths, json: bool) -> Result<u8> {

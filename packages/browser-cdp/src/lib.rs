@@ -34,6 +34,8 @@ pub struct CdpBackendConfig {
     pub headless: bool,
     /// Resource blocking policy applied to new page targets.
     pub resource_policy: CdpResourcePolicy,
+    /// Optional persistent Chromium user-data-dir.
+    pub profile_dir: Option<PathBuf>,
 }
 
 impl Default for CdpBackendConfig {
@@ -42,6 +44,7 @@ impl Default for CdpBackendConfig {
             browser_binary: None,
             headless: true,
             resource_policy: CdpResourcePolicy::default(),
+            profile_dir: None,
         }
     }
 }
@@ -183,7 +186,7 @@ pub fn discover_browser_binary(configured: Option<&PathBuf>) -> BrowserDiscovery
 /// Persistent Chromium process controlled by `CDP`.
 pub struct CdpBrowser {
     child: Child,
-    _profile: tempfile::TempDir,
+    _profile: Option<tempfile::TempDir>,
     port: u16,
     resource_policy: CdpResourcePolicy,
     pages: BTreeMap<TabId, CdpPage>,
@@ -208,11 +211,17 @@ impl CdpBrowser {
         let discovery = discover_browser_binary(config.browser_binary.as_ref());
         let browser_binary = discovery.binary.ok_or(CdpError::BrowserNotFound)?;
         let port = allocate_local_port().map_err(CdpError::Port)?;
-        let profile = tempfile::Builder::new()
-            .prefix("trowser-cdp-")
-            .tempdir()
-            .map_err(CdpError::TempDir)?;
-        let child = launch_browser(&browser_binary, profile.path(), port, config.headless)?;
+        let (profile_path, profile) = if let Some(profile_dir) = &config.profile_dir {
+            std::fs::create_dir_all(profile_dir).map_err(CdpError::TempDir)?;
+            (profile_dir.clone(), None)
+        } else {
+            let profile = tempfile::Builder::new()
+                .prefix("trowser-cdp-")
+                .tempdir()
+                .map_err(CdpError::TempDir)?;
+            (profile.path().to_path_buf(), Some(profile))
+        };
+        let child = launch_browser(&browser_binary, &profile_path, port, config.headless)?;
         wait_for_devtools(port).await?;
         Ok(Self {
             child,

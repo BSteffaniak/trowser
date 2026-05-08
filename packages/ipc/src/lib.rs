@@ -89,6 +89,12 @@ pub enum Request {
     InputText { control_id: u32, text: String },
     /// Lists known tabs.
     ListTabs,
+    /// Saves the current session snapshot.
+    SaveSession,
+    /// Restores the persisted session snapshot.
+    RestoreSession,
+    /// Clears the persisted session snapshot.
+    ClearSession,
     /// Follows a reader-mode link in the active tab.
     FollowLink { link_id: u32 },
     /// Returns a semantic snapshot for a tab.

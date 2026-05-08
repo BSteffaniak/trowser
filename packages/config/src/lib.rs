@@ -59,6 +59,8 @@ pub struct BrowserConfig {
     pub binary: Option<PathBuf>,
     /// Launch backend in headless mode when supported.
     pub headless: bool,
+    /// Browser profile mode/name: `default`, `temporary`, `private`, or a custom persistent profile name.
+    pub profile: String,
 }
 
 impl Default for BrowserConfig {
@@ -67,6 +69,7 @@ impl Default for BrowserConfig {
             backend: "chromium-cdp".to_string(),
             binary: None,
             headless: true,
+            profile: "default".to_string(),
         }
     }
 }
@@ -254,6 +257,18 @@ impl ConfigPaths {
     #[must_use]
     pub fn daemon_pid_path(&self) -> PathBuf {
         self.runtime_dir.join("daemon.pid")
+    }
+
+    /// Returns the persisted session snapshot path.
+    #[must_use]
+    pub fn session_file(&self) -> PathBuf {
+        self.state_dir.join(&self.runtime_name).join("session.json")
+    }
+
+    /// Returns the root directory for persistent Chromium profiles.
+    #[must_use]
+    pub fn profiles_dir(&self) -> PathBuf {
+        self.data_dir.join("profiles")
     }
 }
 

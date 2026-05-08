@@ -109,6 +109,7 @@ impl TrowserServer {
             let listener = tokio::net::UnixListener::bind(&socket_path)?;
             let pid_path = self.paths.daemon_pid_path();
             write_pid_file(&pid_path).await?;
+            let _ = self.restore_session_from_disk().await;
             write_ready_file_if_requested(&socket_path).await?;
             let mut terminate =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -184,6 +185,9 @@ impl TrowserServer {
                 self.handle_input_text(control_id, text).await
             }
             Request::ListTabs => Response::Tabs(self.snapshot().await),
+            Request::SaveSession => self.handle_save_session().await,
+            Request::RestoreSession => self.handle_restore_session().await,
+            Request::ClearSession => self.handle_clear_session().await,
             Request::FollowLink { link_id } => self.handle_follow_link(link_id).await,
             Request::Snapshot { tab_id } => self.handle_snapshot(&tab_id).await,
             Request::Shutdown => {
@@ -344,7 +348,38 @@ impl TrowserServer {
         }
         state.active_tab = Some(tab_id.clone());
         drop(state);
+        let _ = self.save_session_to_disk().await;
         Response::Opened { tab_id }
+    }
+
+    async fn handle_save_session(&self) -> Response {
+        self.save_session_to_disk().await.map_or_else(
+            |error| Response::Error {
+                message: error.to_string(),
+            },
+            |()| Response::Ok,
+        )
+    }
+
+    async fn handle_restore_session(&self) -> Response {
+        match self.restore_session_from_disk().await {
+            Ok(Some(tab_id)) => Response::Opened { tab_id },
+            Ok(None) => Response::Ok,
+            Err(error) => Response::Error {
+                message: error.to_string(),
+            },
+        }
+    }
+
+    async fn handle_clear_session(&self) -> Response {
+        let path = self.paths.session_file();
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Response::Ok,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Response::Ok,
+            Err(error) => Response::Error {
+                message: error.to_string(),
+            },
+        }
     }
 
     async fn handle_close_tab(&self, tab_id: TabId) -> Response {
@@ -366,6 +401,7 @@ impl TrowserServer {
         }
         let active_tab = state.active_tab.clone();
         drop(state);
+        let _ = self.save_session_to_disk().await;
         active_tab.map_or(Response::Ok, |tab_id| Response::Opened { tab_id })
     }
 
@@ -400,6 +436,7 @@ impl TrowserServer {
         let tab_id = tabs[target_index].clone();
         state.active_tab = Some(tab_id.clone());
         drop(state);
+        let _ = self.save_session_to_disk().await;
         Response::Opened { tab_id }
     }
 
@@ -526,6 +563,7 @@ impl TrowserServer {
         state.tabs.insert(tab_id.clone(), page);
         state.active_tab = Some(tab_id.clone());
         drop(state);
+        let _ = self.save_session_to_disk().await;
         Response::Opened { tab_id }
     }
 
@@ -678,6 +716,14 @@ impl TrowserServer {
             browser_binary: self.config.browser.binary.clone(),
             headless: self.config.browser.headless,
             resource_policy: self.resource_policy(),
+            profile_dir: self.profile_dir(),
+        }
+    }
+
+    fn profile_dir(&self) -> Option<std::path::PathBuf> {
+        match self.config.browser.profile.as_str() {
+            "temporary" | "private" => None,
+            profile => Some(self.paths.profiles_dir().join(profile)),
         }
     }
 
@@ -699,6 +745,52 @@ impl TrowserServer {
         *browser = None;
     }
 
+    async fn save_session_to_disk(&self) -> std::io::Result<()> {
+        let snapshot = self.snapshot().await;
+        let path = self.paths.session_file();
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let json = serde_json::to_vec_pretty(&snapshot).map_err(std::io::Error::other)?;
+        tokio::fs::write(path, json).await
+    }
+
+    async fn restore_session_from_disk(&self) -> std::io::Result<Option<TabId>> {
+        let path = self.paths.session_file();
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let snapshot =
+            serde_json::from_slice::<SessionSnapshot>(&bytes).map_err(std::io::Error::other)?;
+        self.shutdown_browser().await;
+        {
+            let mut state = self.state.lock().await;
+            state.tabs.clear();
+            state.active_tab = None;
+            state.next_tab_id = next_tab_id_after(&snapshot);
+        }
+
+        for tab in &snapshot.tabs {
+            let page = self
+                .open_browser_tab(tab.id.clone(), &tab.url)
+                .await
+                .unwrap_or_else(|error| error_page(&tab.url, &error.to_string()));
+            let mut state = self.state.lock().await;
+            state.tabs.insert(tab.id.clone(), page);
+            drop(state);
+        }
+        let active_tab = snapshot
+            .active_tab
+            .filter(|tab_id| snapshot.tabs.iter().any(|tab| &tab.id == tab_id))
+            .or_else(|| snapshot.tabs.first().map(|tab| tab.id.clone()));
+        let mut state = self.state.lock().await;
+        state.active_tab.clone_from(&active_tab);
+        drop(state);
+        Ok(active_tab)
+    }
+
     async fn snapshot(&self) -> SessionSnapshot {
         let state = self.state.lock().await;
         let tabs = state
@@ -717,6 +809,16 @@ impl TrowserServer {
             active_tab: state.active_tab.clone(),
         }
     }
+}
+
+fn next_tab_id_after(snapshot: &SessionSnapshot) -> u64 {
+    snapshot
+        .tabs
+        .iter()
+        .filter_map(|tab| tab.id.as_str().strip_prefix("tab-"))
+        .filter_map(|suffix| suffix.parse::<u64>().ok())
+        .max()
+        .map_or(0, |value| value.saturating_add(1))
 }
 
 async fn write_pid_file(pid_path: &Path) -> ServerResult<()> {

@@ -45,6 +45,12 @@ pub enum Command {
         #[command(subcommand)]
         command: ServerCommand,
     },
+    /// Manage persisted trowser sessions.
+    Session {
+        /// Session command.
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
     /// Print daemon/client status.
     Status,
     /// Follow a numbered link from the active page.
@@ -88,6 +94,17 @@ pub enum Command {
     Paths,
     /// Print terminal capability information.
     Doctor,
+}
+
+/// Session commands.
+#[derive(Debug, Clone, Subcommand)]
+pub enum SessionCommand {
+    /// Save the current session snapshot.
+    Save,
+    /// Restore the persisted session snapshot.
+    Restore,
+    /// Clear the persisted session snapshot.
+    Clear,
 }
 
 /// Daemon commands.
