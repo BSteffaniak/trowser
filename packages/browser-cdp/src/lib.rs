@@ -457,9 +457,13 @@ impl CdpPage {
     }
 
     async fn activate_action(&mut self, action_id: &ActionId) -> CdpResult<SemanticPage> {
-        self.run_action(&activate_action_js(action_id)?).await?;
-        self.wait_for_page_load(Duration::from_secs(2)).await;
-        self.cdp.extract_semantic_page(self.viewport).await
+        match self.run_action(&activate_action_js(action_id)?).await? {
+            CdpActionOutcome::Navigate(url) => self.navigate(&url).await,
+            CdpActionOutcome::Clicked => {
+                self.wait_for_page_load(Duration::from_secs(2)).await;
+                self.cdp.extract_semantic_page(self.viewport).await
+            }
+        }
     }
 
     async fn input_text_action(
@@ -467,12 +471,13 @@ impl CdpPage {
         action_id: &ActionId,
         text: &str,
     ) -> CdpResult<SemanticPage> {
-        self.run_action(&input_text_action_js(action_id, text)?)
+        let _ = self
+            .run_action(&input_text_action_js(action_id, text)?)
             .await?;
         self.cdp.extract_semantic_page(self.viewport).await
     }
 
-    async fn run_action(&mut self, expression: &str) -> CdpResult<()> {
+    async fn run_action(&mut self, expression: &str) -> CdpResult<CdpActionOutcome> {
         let result = self
             .cdp
             .call(
@@ -484,12 +489,20 @@ impl CdpPage {
                 }),
             )
             .await?;
-        let value = result
-            .get("result")
-            .and_then(|value| value.get("value"))
-            .ok_or(CdpError::MissingField("Runtime.evaluate.result.value"))?;
+        if let Some(message) = runtime_exception_message(&result) {
+            return Err(CdpError::PageAction(message));
+        }
+        let Some(value) = result.get("result").and_then(|value| value.get("value")) else {
+            return Ok(CdpActionOutcome::Clicked);
+        };
         if value.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-            return Ok(());
+            return Ok(value
+                .get("navigate")
+                .and_then(Value::as_str)
+                .filter(|url| !url.trim().is_empty())
+                .map_or(CdpActionOutcome::Clicked, |url| {
+                    CdpActionOutcome::Navigate(url.to_string())
+                }));
         }
         let message = value
             .get("error")
@@ -677,6 +690,11 @@ fn blocked_url_patterns(policy: &CdpResourcePolicy) -> Vec<&'static str> {
     patterns
 }
 
+enum CdpActionOutcome {
+    Clicked,
+    Navigate(String),
+}
+
 struct CdpConnection {
     socket: WsStream,
     next_id: u64,
@@ -757,6 +775,23 @@ impl CdpConnection {
     }
 
     async fn extract_dom_page(&mut self) -> CdpResult<SemanticPage> {
+        let mut last_error = None;
+        for delay in [0_u64, 100, 250, 500] {
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            match self.try_extract_dom_page().await {
+                Ok(page) => return Ok(page),
+                Err(error) if is_transient_runtime_evaluate_error(&error) => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or(CdpError::MissingField("Runtime.evaluate.result.value")))
+    }
+
+    async fn try_extract_dom_page(&mut self) -> CdpResult<SemanticPage> {
         let result = self
             .call(
                 "Runtime.evaluate",
@@ -767,6 +802,9 @@ impl CdpConnection {
                 }),
             )
             .await?;
+        if let Some(message) = runtime_exception_message(&result) {
+            return Err(CdpError::Extraction(message));
+        }
         let page_json = result
             .get("result")
             .and_then(|value| value.get("value"))
@@ -844,6 +882,40 @@ struct CdpMessage {
     method: Option<String>,
     result: Option<Value>,
     error: Option<Value>,
+}
+
+fn runtime_exception_message(result: &Value) -> Option<String> {
+    let details = result.get("exceptionDetails")?;
+    details
+        .get("exception")
+        .and_then(|exception| exception.get("description"))
+        .and_then(Value::as_str)
+        .or_else(|| details.get("text").and_then(Value::as_str))
+        .or_else(|| {
+            details
+                .get("exception")
+                .and_then(|exception| exception.get("value"))
+                .and_then(Value::as_str)
+        })
+        .map(ToString::to_string)
+}
+
+fn is_transient_runtime_evaluate_error(error: &CdpError) -> bool {
+    match error {
+        CdpError::MissingField("Runtime.evaluate.result.value") => true,
+        CdpError::Extraction(message) | CdpError::Method { message, .. } => {
+            is_transient_runtime_message(message)
+        }
+        _ => false,
+    }
+}
+
+fn is_transient_runtime_message(message: &str) -> bool {
+    let message = message.to_lowercase();
+    message.contains("context")
+        || message.contains("destroy")
+        || message.contains("navigat")
+        || message.contains("execution")
 }
 
 fn merge_accessibility_page(
@@ -1554,6 +1626,8 @@ fn activate_action_js(action_id: &ActionId) -> CdpResult<String> {
 (() => {{
   const el = window.__trowserActions && window.__trowserActions[{action_id}];
   if (!el) return {{ ok: false, error: 'unknown action id' }};
+  const anchor = el.closest && el.closest('a[href]');
+  if (anchor && anchor.href) return {{ ok: true, navigate: anchor.href }};
   el.focus();
   el.click();
   return {{ ok: true }};
