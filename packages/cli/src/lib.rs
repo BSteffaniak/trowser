@@ -321,11 +321,21 @@ async fn run_interactive(
                     ..
                 } => {
                     if let Some((_, target)) = focused_action(&rendered, offset) {
-                        page = activate_click_target(&client, target).await?;
-                        rendered = render_page_document(&page, config);
-                        tab_status = tabs_status(&client).await.unwrap_or_default();
-                        offset = 0;
-                        message = "activated focused action".to_string();
+                        let client_clone = client.clone();
+                        if let Some(updated_page) =
+                            load_with_ui(&client, "activating action", None, async move {
+                                activate_click_target(&client_clone, target).await
+                            })
+                            .await?
+                        {
+                            page = updated_page;
+                            rendered = render_page_document(&page, config);
+                            tab_status = tabs_status(&client).await.unwrap_or_default();
+                            offset = 0;
+                            message = "activated focused action".to_string();
+                        } else {
+                            message = "action canceled".to_string();
+                        }
                     }
                 }
                 KeyEvent {
@@ -477,10 +487,22 @@ async fn run_interactive(
                     if let Some(raw) = prompt_input("Follow link: ")?
                         && let Ok(link_id) = raw.trim().parse::<u32>()
                     {
-                        page = follow_and_snapshot(&client, link_id).await?;
-                        rendered = render_page_document(&page, config);
-                        offset = 0;
-                        message = format!("followed link {link_id}");
+                        let client_clone = client.clone();
+                        if let Some(updated_page) = load_with_ui(
+                            &client,
+                            &format!("following link {link_id}"),
+                            None,
+                            async move { follow_and_snapshot(&client_clone, link_id).await },
+                        )
+                        .await?
+                        {
+                            page = updated_page;
+                            rendered = render_page_document(&page, config);
+                            offset = 0;
+                            message = format!("followed link {link_id}");
+                        } else {
+                            message = "follow canceled".to_string();
+                        }
                     }
                 }
                 KeyEvent {
@@ -491,10 +513,22 @@ async fn run_interactive(
                         && let Ok(control_id) = raw.trim().parse::<u32>()
                         && let Some(text) = prompt_input("Text: ")?
                     {
-                        page = input_and_snapshot(&client, control_id, text).await?;
-                        rendered = render_page_document(&page, config);
-                        offset = 0;
-                        message = format!("input text into control {control_id}");
+                        let client_clone = client.clone();
+                        if let Some(updated_page) = load_with_ui(
+                            &client,
+                            &format!("input into control {control_id}"),
+                            None,
+                            async move { input_and_snapshot(&client_clone, control_id, text).await },
+                        )
+                        .await?
+                        {
+                            page = updated_page;
+                            rendered = render_page_document(&page, config);
+                            offset = 0;
+                            message = format!("input text into control {control_id}");
+                        } else {
+                            message = "input canceled".to_string();
+                        }
                     }
                 }
                 KeyEvent {
@@ -505,44 +539,82 @@ async fn run_interactive(
                     if let Some(raw) = prompt_input("Click control: ")?
                         && let Ok(control_id) = raw.trim().parse::<u32>()
                     {
-                        page = click_and_snapshot(&client, control_id).await?;
-                        rendered = render_page_document(&page, config);
-                        offset = 0;
-                        message = format!("clicked control {control_id}");
+                        let client_clone = client.clone();
+                        if let Some(updated_page) = load_with_ui(
+                            &client,
+                            &format!("clicking control {control_id}"),
+                            None,
+                            async move { click_and_snapshot(&client_clone, control_id).await },
+                        )
+                        .await?
+                        {
+                            page = updated_page;
+                            rendered = render_page_document(&page, config);
+                            offset = 0;
+                            message = format!("clicked control {control_id}");
+                        } else {
+                            message = "click canceled".to_string();
+                        }
                     }
                 }
                 KeyEvent {
                     code: KeyCode::Char('b') | KeyCode::Left,
                     ..
-                } => match back_and_snapshot(&client).await {
-                    Ok(updated_page) => {
-                        page = updated_page;
-                        rendered = render_page_document(&page, config);
-                        offset = 0;
-                        message = "back".to_string();
+                } => {
+                    let client_clone = client.clone();
+                    match load_with_ui(&client, "back", None, async move {
+                        back_and_snapshot(&client_clone).await
+                    })
+                    .await
+                    {
+                        Ok(Some(updated_page)) => {
+                            page = updated_page;
+                            rendered = render_page_document(&page, config);
+                            offset = 0;
+                            message = "back".to_string();
+                        }
+                        Ok(None) => message = "back canceled".to_string(),
+                        Err(error) => message = error.to_string(),
                     }
-                    Err(error) => message = error.to_string(),
-                },
+                }
                 KeyEvent {
                     code: KeyCode::Char('F') | KeyCode::Right,
                     ..
-                } => match forward_and_snapshot(&client).await {
-                    Ok(updated_page) => {
-                        page = updated_page;
-                        rendered = render_page_document(&page, config);
-                        offset = 0;
-                        message = "forward".to_string();
+                } => {
+                    let client_clone = client.clone();
+                    match load_with_ui(&client, "forward", None, async move {
+                        forward_and_snapshot(&client_clone).await
+                    })
+                    .await
+                    {
+                        Ok(Some(updated_page)) => {
+                            page = updated_page;
+                            rendered = render_page_document(&page, config);
+                            offset = 0;
+                            message = "forward".to_string();
+                        }
+                        Ok(None) => message = "forward canceled".to_string(),
+                        Err(error) => message = error.to_string(),
                     }
-                    Err(error) => message = error.to_string(),
-                },
+                }
                 KeyEvent {
                     code: KeyCode::Char('r'),
                     ..
                 } => {
-                    page = reload_and_snapshot(&client).await?;
-                    rendered = render_page_document(&page, config);
-                    offset = 0;
-                    message = "reloaded".to_string();
+                    let client_clone = client.clone();
+                    if let Some(updated_page) =
+                        load_with_ui(&client, "reloading", None, async move {
+                            reload_and_snapshot(&client_clone).await
+                        })
+                        .await?
+                    {
+                        page = updated_page;
+                        rendered = render_page_document(&page, config);
+                        offset = 0;
+                        message = "reloaded".to_string();
+                    } else {
+                        message = "reload canceled".to_string();
+                    }
                 }
                 _ => {}
             },
@@ -557,21 +629,54 @@ async fn run_interactive(
                     if let Some(target) = target_at(&rendered, offset, mouse.row, mouse.column) {
                         match target {
                             ClickTarget::Link { link_id, action_id } => {
-                                page = activate_or_follow_link(&client, link_id, action_id).await?;
-                                rendered = render_page_document(&page, config);
-                                offset = 0;
-                                message = format!("followed link {link_id}");
+                                let client_clone = client.clone();
+                                if let Some(updated_page) = load_with_ui(
+                                    &client,
+                                    &format!("following link {link_id}"),
+                                    None,
+                                    async move {
+                                        activate_or_follow_link(&client_clone, link_id, action_id)
+                                            .await
+                                    },
+                                )
+                                .await?
+                                {
+                                    page = updated_page;
+                                    rendered = render_page_document(&page, config);
+                                    offset = 0;
+                                    message = format!("followed link {link_id}");
+                                } else {
+                                    message = "follow canceled".to_string();
+                                }
                             }
                             ClickTarget::Control {
                                 control_id,
                                 action_id,
                                 action: ControlHitboxAction::Click,
                             } => {
-                                page = activate_or_click_control(&client, control_id, action_id)
-                                    .await?;
-                                rendered = render_page_document(&page, config);
-                                offset = 0;
-                                message = format!("clicked control {control_id}");
+                                let client_clone = client.clone();
+                                if let Some(updated_page) = load_with_ui(
+                                    &client,
+                                    &format!("clicking control {control_id}"),
+                                    None,
+                                    async move {
+                                        activate_or_click_control(
+                                            &client_clone,
+                                            control_id,
+                                            action_id,
+                                        )
+                                        .await
+                                    },
+                                )
+                                .await?
+                                {
+                                    page = updated_page;
+                                    rendered = render_page_document(&page, config);
+                                    offset = 0;
+                                    message = format!("clicked control {control_id}");
+                                } else {
+                                    message = "click canceled".to_string();
+                                }
                             }
                             ClickTarget::Control {
                                 control_id,
@@ -579,13 +684,30 @@ async fn run_interactive(
                                 action: ControlHitboxAction::InputText,
                             } => {
                                 if let Some(text) = prompt_input("Text: ")? {
-                                    page = input_control_or_action(
-                                        &client, control_id, action_id, text,
+                                    let client_clone = client.clone();
+                                    if let Some(updated_page) = load_with_ui(
+                                        &client,
+                                        &format!("input into control {control_id}"),
+                                        None,
+                                        async move {
+                                            input_control_or_action(
+                                                &client_clone,
+                                                control_id,
+                                                action_id,
+                                                text,
+                                            )
+                                            .await
+                                        },
                                     )
-                                    .await?;
-                                    rendered = render_page_document(&page, config);
-                                    offset = 0;
-                                    message = format!("input text into control {control_id}");
+                                    .await?
+                                    {
+                                        page = updated_page;
+                                        rendered = render_page_document(&page, config);
+                                        offset = 0;
+                                        message = format!("input text into control {control_id}");
+                                    } else {
+                                        message = "input canceled".to_string();
+                                    }
                                 }
                             }
                         }
@@ -641,10 +763,15 @@ where
     F: Future<Output = Result<trowser_render::SemanticPage>> + Send + 'static,
 {
     let handle = tokio::spawn(future);
+    let started = Instant::now();
     let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let mut frame = 0usize;
     while !handle.is_finished() {
-        draw_loading_status(label, frames[frame % frames.len()])?;
+        draw_loading_status(
+            label,
+            frames[frame % frames.len()],
+            load_phase(started.elapsed()),
+        )?;
         frame += 1;
         if poll(Duration::from_millis(80))?
             && let Event::Key(key) = read()?
@@ -660,7 +787,16 @@ where
     Ok(Some(handle.await??))
 }
 
-fn draw_loading_status(label: &str, frame: &str) -> Result<()> {
+const fn load_phase(elapsed: Duration) -> &'static str {
+    match elapsed.as_secs() {
+        0..=1 => "resolving",
+        2..=8 => "loading",
+        9..=20 => "extracting",
+        _ => "still working",
+    }
+}
+
+fn draw_loading_status(label: &str, frame: &str, phase: &str) -> Result<()> {
     let (width, height) = size()?;
     let mut out = stdout();
     queue!(
@@ -668,7 +804,7 @@ fn draw_loading_status(label: &str, frame: &str) -> Result<()> {
         MoveTo(0, height.saturating_sub(1)),
         Clear(ClearType::CurrentLine),
         Print(truncate_for_terminal(
-            &format!("{frame} {label} · Esc cancel"),
+            &format!("{frame} {phase}: {label} · Esc cancel"),
             width,
         ))
     )?;

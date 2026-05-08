@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -224,11 +225,25 @@ impl TrowserServer {
                 message: format!("request {request_id} canceled"),
             };
         }
+        if self.open_tab_count().await >= self.config.resources.max_tabs {
+            return Response::Error {
+                message: format!(
+                    "maximum tab count ({}) reached",
+                    self.config.resources.max_tabs
+                ),
+            };
+        }
         let tab_id = self.allocate_tab_id().await;
-        let page = self
-            .open_browser_tab(tab_id.clone(), &url)
-            .await
-            .unwrap_or_else(|error| error_page(&url, &error.to_string()));
+        let page = match tokio::time::timeout(
+            Duration::from_secs(45),
+            self.open_browser_tab(tab_id.clone(), &url),
+        )
+        .await
+        {
+            Ok(Ok(page)) => page,
+            Ok(Err(error)) => error_page(&url, &error.to_string()),
+            Err(_) => error_page(&url, "timed out while loading/extracting page"),
+        };
         if let Some(request_id) = request_id.as_ref()
             && self.take_canceled_request(request_id).await
         {
@@ -237,6 +252,13 @@ impl TrowserServer {
             };
         }
         self.store_page(tab_id, page).await
+    }
+
+    async fn open_tab_count(&self) -> usize {
+        let state = self.state.lock().await;
+        let count = state.tabs.len();
+        drop(state);
+        count
     }
 
     async fn handle_cancel(&self, request_id: String) -> Response {
@@ -736,12 +758,22 @@ fn error_page(url: &str, error: &str) -> SemanticPage {
         blocks: vec![
             SemanticBlock::Heading {
                 level: 1,
-                text: "CDP extraction failed".to_string(),
+                text: "Could not load page".to_string(),
                 layout: None,
                 region: SemanticRegion::Main,
             },
             SemanticBlock::Paragraph {
-                text: error.to_string(),
+                text: format!("URL: {url}"),
+                layout: None,
+                region: SemanticRegion::Main,
+            },
+            SemanticBlock::Paragraph {
+                text: format!("Reason: {error}"),
+                layout: None,
+                region: SemanticRegion::Main,
+            },
+            SemanticBlock::Paragraph {
+                text: "Try: r reload · b back · o open a different URL".to_string(),
                 layout: None,
                 region: SemanticRegion::Main,
             },
