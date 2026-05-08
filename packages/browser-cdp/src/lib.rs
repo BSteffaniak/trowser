@@ -7,7 +7,7 @@
 //! This crate is intentionally the only place where Chromium/CDP-specific
 //! implementation details should live.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -315,6 +315,7 @@ impl CdpPage {
         let mut cdp = CdpConnection::connect(&target.web_socket_debugger_url).await?;
         cdp.call("Page.enable", json!({})).await?;
         cdp.call("Runtime.enable", json!({})).await?;
+        cdp.call("Accessibility.enable", json!({})).await?;
         Ok(Self {
             target_id: target.id,
             cdp,
@@ -575,6 +576,24 @@ impl CdpConnection {
     }
 
     async fn extract_semantic_page(&mut self) -> CdpResult<SemanticPage> {
+        let dom_page = self.extract_dom_page().await?;
+        let ax_page = self
+            .extract_accessibility_page(&dom_page)
+            .await
+            .ok()
+            .flatten();
+        let mut page = ax_page.unwrap_or(dom_page);
+        if page.blocks.is_empty() {
+            page.blocks.push(SemanticBlock::Paragraph {
+                text: "No semantic text content was found on this page.".to_string(),
+                layout: None,
+                region: SemanticRegion::Main,
+            });
+        }
+        Ok(page)
+    }
+
+    async fn extract_dom_page(&mut self) -> CdpResult<SemanticPage> {
         let result = self
             .call(
                 "Runtime.evaluate",
@@ -591,15 +610,66 @@ impl CdpConnection {
             .and_then(Value::as_str)
             .ok_or(CdpError::MissingField("Runtime.evaluate.result.value"))?;
         let page: CdpSemanticPage = serde_json::from_str(page_json)?;
-        let mut page = page.into_semantic_page();
-        if page.blocks.is_empty() {
-            page.blocks.push(SemanticBlock::Paragraph {
-                text: "No semantic text content was found on this page.".to_string(),
-                layout: None,
-                region: SemanticRegion::Main,
-            });
+        Ok(page.into_semantic_page())
+    }
+
+    async fn extract_accessibility_page(
+        &mut self,
+        dom_page: &SemanticPage,
+    ) -> CdpResult<Option<SemanticPage>> {
+        let result = self.call("Accessibility.getFullAXTree", json!({})).await?;
+        let nodes = result
+            .get("nodes")
+            .cloned()
+            .ok_or(CdpError::MissingField("Accessibility.getFullAXTree.nodes"))?;
+        let nodes = serde_json::from_value::<Vec<AxNode>>(nodes)?;
+        let mut blocks = ax_blocks(&nodes);
+        if blocks.len() < 3 {
+            return Ok(None);
         }
-        Ok(page)
+        merge_dom_action_ids(&mut blocks, &dom_page.blocks);
+        Ok(Some(SemanticPage {
+            url: dom_page.url.clone(),
+            title: dom_page.title.clone(),
+            blocks,
+        }))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AxNode {
+    #[serde(rename = "nodeId")]
+    node_id: String,
+    #[serde(default)]
+    ignored: bool,
+    role: Option<AxValue>,
+    name: Option<AxValue>,
+    value: Option<AxValue>,
+    #[serde(default)]
+    properties: Vec<AxProperty>,
+    #[serde(default, rename = "childIds")]
+    child_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AxProperty {
+    name: String,
+    value: Option<AxValue>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AxValue {
+    value: Option<Value>,
+}
+
+impl AxValue {
+    fn string(&self) -> Option<String> {
+        self.value.as_ref().and_then(|value| match value {
+            Value::String(value) => Some(value.clone()),
+            Value::Number(value) => Some(value.to_string()),
+            Value::Bool(value) => Some(value.to_string()),
+            _ => None,
+        })
     }
 }
 
@@ -609,6 +679,269 @@ struct CdpMessage {
     method: Option<String>,
     result: Option<Value>,
     error: Option<Value>,
+}
+
+fn ax_blocks(nodes: &[AxNode]) -> Vec<SemanticBlock> {
+    let node_by_id = nodes
+        .iter()
+        .map(|node| (node.node_id.as_str(), node))
+        .collect::<BTreeMap<_, _>>();
+    let child_ids = nodes
+        .iter()
+        .flat_map(|node| node.child_ids.iter().map(String::as_str))
+        .collect::<BTreeSet<_>>();
+    let roots = nodes
+        .iter()
+        .filter(|node| !child_ids.contains(node.node_id.as_str()))
+        .collect::<Vec<_>>();
+    let mut blocks = Vec::new();
+    let mut seen = BTreeSet::new();
+    for root in roots {
+        push_ax_node_blocks(
+            root,
+            SemanticRegion::Main,
+            &node_by_id,
+            &mut seen,
+            &mut blocks,
+        );
+    }
+    blocks
+}
+
+fn push_ax_node_blocks(
+    node: &AxNode,
+    inherited_region: SemanticRegion,
+    node_by_id: &BTreeMap<&str, &AxNode>,
+    seen: &mut BTreeSet<String>,
+    blocks: &mut Vec<SemanticBlock>,
+) {
+    if !seen.insert(node.node_id.clone()) || node.ignored {
+        return;
+    }
+    let role = node_role(node);
+    let region = ax_region(&role).unwrap_or(inherited_region);
+    if let Some(block) = ax_node_block(node, &role, region) {
+        blocks.push(block);
+    }
+    for child_id in &node.child_ids {
+        if let Some(child) = node_by_id.get(child_id.as_str()) {
+            push_ax_node_blocks(child, region, node_by_id, seen, blocks);
+        }
+    }
+}
+
+fn node_role(node: &AxNode) -> String {
+    node.role
+        .as_ref()
+        .and_then(AxValue::string)
+        .unwrap_or_default()
+        .to_lowercase()
+}
+
+fn ax_region(role: &str) -> Option<SemanticRegion> {
+    match role {
+        "navigation" => Some(SemanticRegion::Navigation),
+        "banner" => Some(SemanticRegion::Header),
+        "contentinfo" => Some(SemanticRegion::Footer),
+        "complementary" => Some(SemanticRegion::Aside),
+        "main" | "article" => Some(SemanticRegion::Main),
+        _ => None,
+    }
+}
+
+fn ax_node_block(node: &AxNode, role: &str, region: SemanticRegion) -> Option<SemanticBlock> {
+    let name = ax_name(node);
+    if name.is_empty() {
+        return None;
+    }
+    match role {
+        "heading" => Some(SemanticBlock::Heading {
+            level: ax_property_u8(node, "level").unwrap_or(2),
+            text: name,
+            layout: None,
+            region,
+        }),
+        "link" => Some(SemanticBlock::Link {
+            action_id: None,
+            url: ax_property_string(node, "url").unwrap_or_default(),
+            text: name,
+            layout: None,
+            region,
+        }),
+        "image" | "img" => Some(SemanticBlock::Image {
+            alt: name,
+            url: ax_property_string(node, "url").unwrap_or_default(),
+            width: None,
+            height: None,
+            layout: None,
+            region,
+        }),
+        "button" | "menuitem" | "checkbox" | "radio" | "switch" | "tab" | "textbox"
+        | "searchbox" | "combobox" | "listbox" | "slider" | "spinbutton" => {
+            Some(SemanticBlock::FormControl {
+                action_id: None,
+                label: append_ax_state(name, node),
+                control_type: role.to_string(),
+                value: node
+                    .value
+                    .as_ref()
+                    .and_then(AxValue::string)
+                    .unwrap_or_default(),
+                layout: None,
+                region,
+            })
+        }
+        "paragraph" | "listitem" | "text" | "statictext" => Some(SemanticBlock::Paragraph {
+            text: name,
+            layout: None,
+            region,
+        }),
+        _ => None,
+    }
+}
+
+fn ax_name(node: &AxNode) -> String {
+    node.name
+        .as_ref()
+        .and_then(AxValue::string)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn append_ax_state(mut label: String, node: &AxNode) -> String {
+    let states = [
+        ("disabled", "disabled"),
+        ("expanded", "expanded"),
+        ("checked", "checked"),
+        ("selected", "selected"),
+        ("focused", "focused"),
+        ("required", "required"),
+    ]
+    .into_iter()
+    .filter_map(|(property, label)| {
+        ax_property_bool(node, property).and_then(|value| value.then_some(label))
+    })
+    .collect::<Vec<_>>();
+    if !states.is_empty() {
+        label.push_str(" (");
+        label.push_str(&states.join(", "));
+        label.push(')');
+    }
+    label
+}
+
+fn ax_property_string(node: &AxNode, name: &str) -> Option<String> {
+    node.properties
+        .iter()
+        .find(|property| property.name == name)
+        .and_then(|property| property.value.as_ref())
+        .and_then(AxValue::string)
+}
+
+fn ax_property_bool(node: &AxNode, name: &str) -> Option<bool> {
+    node.properties
+        .iter()
+        .find(|property| property.name == name)
+        .and_then(|property| property.value.as_ref())
+        .and_then(|value| value.value.as_ref())
+        .and_then(Value::as_bool)
+}
+
+fn ax_property_u8(node: &AxNode, name: &str) -> Option<u8> {
+    ax_property_string(node, name).and_then(|value| value.parse().ok())
+}
+
+fn merge_dom_action_ids(blocks: &mut [SemanticBlock], dom_blocks: &[SemanticBlock]) {
+    let mut used_links = BTreeSet::new();
+    let mut used_controls = BTreeSet::new();
+    for block in blocks {
+        match block {
+            SemanticBlock::Link {
+                action_id,
+                text,
+                url,
+                ..
+            } if action_id.is_none() => {
+                *action_id = matching_dom_link_action(text, url, dom_blocks, &mut used_links);
+            }
+            SemanticBlock::FormControl {
+                action_id,
+                label,
+                control_type,
+                ..
+            } if action_id.is_none() => {
+                *action_id = matching_dom_control_action(
+                    label,
+                    control_type,
+                    dom_blocks,
+                    &mut used_controls,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn matching_dom_link_action(
+    text: &str,
+    url: &str,
+    dom_blocks: &[SemanticBlock],
+    used: &mut BTreeSet<usize>,
+) -> Option<ActionId> {
+    dom_blocks.iter().enumerate().find_map(|(index, block)| {
+        if used.contains(&index) {
+            return None;
+        }
+        let SemanticBlock::Link {
+            action_id,
+            text: dom_text,
+            url: dom_url,
+            ..
+        } = block
+        else {
+            return None;
+        };
+        let matches = (!url.is_empty() && url == dom_url) || normalized_match(text, dom_text);
+        matches.then(|| {
+            used.insert(index);
+            action_id.clone()
+        })?
+    })
+}
+
+fn matching_dom_control_action(
+    label: &str,
+    control_type: &str,
+    dom_blocks: &[SemanticBlock],
+    used: &mut BTreeSet<usize>,
+) -> Option<ActionId> {
+    dom_blocks.iter().enumerate().find_map(|(index, block)| {
+        if used.contains(&index) {
+            return None;
+        }
+        let SemanticBlock::FormControl {
+            action_id,
+            label: dom_label,
+            control_type: dom_control_type,
+            ..
+        } = block
+        else {
+            return None;
+        };
+        let matches = normalized_match(label, dom_label)
+            || (!control_type.is_empty() && control_type == dom_control_type);
+        matches.then(|| {
+            used.insert(index);
+            action_id.clone()
+        })?
+    })
+}
+
+fn normalized_match(left: &str, right: &str) -> bool {
+    let left = left.trim().to_lowercase();
+    let right = right.trim().to_lowercase();
+    !left.is_empty() && (left == right || left.contains(&right) || right.contains(&left))
 }
 
 #[derive(Debug, Deserialize)]
