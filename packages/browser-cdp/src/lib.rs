@@ -23,7 +23,8 @@ use trowser_browser::{
     NavigateRequest,
 };
 use trowser_render::{
-    BlockLayout, SemanticBlock, SemanticLayoutNode, SemanticPage, SemanticRegion, TextRun,
+    BlockLayout, SemanticBlock, SemanticLayoutNode, SemanticPage, SemanticRegion, SemanticViewport,
+    TextRun,
 };
 use trowser_session_models::{ActionId, TabId};
 
@@ -239,11 +240,17 @@ impl CdpBrowser {
     /// # Errors
     ///
     /// Returns an error if target creation, navigation, or extraction fails.
-    pub async fn open_tab(&mut self, tab_id: TabId, url: &str) -> CdpResult<SemanticPage> {
+    pub async fn open_tab(
+        &mut self,
+        tab_id: TabId,
+        url: &str,
+        viewport: Option<SemanticViewport>,
+    ) -> CdpResult<SemanticPage> {
         if self.pages.contains_key(&tab_id) {
             self.close_tab(&tab_id).await?;
         }
         let mut page = CdpPage::create(self.port, &self.resource_policy).await?;
+        page.set_viewport(viewport).await?;
         let semantic_page = page.navigate(url).await?;
         self.pages.insert(tab_id, page);
         Ok(semantic_page)
@@ -254,11 +261,18 @@ impl CdpBrowser {
     /// # Errors
     ///
     /// Returns an error if target creation, navigation, or extraction fails.
-    pub async fn navigate_tab(&mut self, tab_id: &TabId, url: &str) -> CdpResult<SemanticPage> {
+    pub async fn navigate_tab(
+        &mut self,
+        tab_id: &TabId,
+        url: &str,
+        viewport: Option<SemanticViewport>,
+    ) -> CdpResult<SemanticPage> {
         if !self.pages.contains_key(tab_id) {
-            return self.open_tab(tab_id.clone(), url).await;
+            return self.open_tab(tab_id.clone(), url, viewport).await;
         }
-        self.page_mut(tab_id)?.navigate(url).await
+        let page = self.page_mut(tab_id)?;
+        page.set_viewport(viewport).await?;
+        page.navigate(url).await
     }
 
     /// Reloads a tab and extracts semantic content.
@@ -266,8 +280,14 @@ impl CdpBrowser {
     /// # Errors
     ///
     /// Returns an error if the page target is missing or reload/extraction fails.
-    pub async fn reload_tab(&mut self, tab_id: &TabId) -> CdpResult<SemanticPage> {
-        self.page_mut(tab_id)?.reload().await
+    pub async fn reload_tab(
+        &mut self,
+        tab_id: &TabId,
+        viewport: Option<SemanticViewport>,
+    ) -> CdpResult<SemanticPage> {
+        let page = self.page_mut(tab_id)?;
+        page.set_viewport(viewport).await?;
+        page.reload().await
     }
 
     /// Navigates a tab backward in history.
@@ -275,8 +295,14 @@ impl CdpBrowser {
     /// # Errors
     ///
     /// Returns an error if no back entry exists or `CDP` navigation/extraction fails.
-    pub async fn back_tab(&mut self, tab_id: &TabId) -> CdpResult<SemanticPage> {
-        self.page_mut(tab_id)?.back().await
+    pub async fn back_tab(
+        &mut self,
+        tab_id: &TabId,
+        viewport: Option<SemanticViewport>,
+    ) -> CdpResult<SemanticPage> {
+        let page = self.page_mut(tab_id)?;
+        page.set_viewport(viewport).await?;
+        page.back().await
     }
 
     /// Navigates a tab forward in history.
@@ -284,8 +310,14 @@ impl CdpBrowser {
     /// # Errors
     ///
     /// Returns an error if no forward entry exists or `CDP` navigation/extraction fails.
-    pub async fn forward_tab(&mut self, tab_id: &TabId) -> CdpResult<SemanticPage> {
-        self.page_mut(tab_id)?.forward().await
+    pub async fn forward_tab(
+        &mut self,
+        tab_id: &TabId,
+        viewport: Option<SemanticViewport>,
+    ) -> CdpResult<SemanticPage> {
+        let page = self.page_mut(tab_id)?;
+        page.set_viewport(viewport).await?;
+        page.forward().await
     }
 
     /// Activates/clicks a stable DOM action in a tab and extracts semantic content.
@@ -297,8 +329,11 @@ impl CdpBrowser {
         &mut self,
         tab_id: &TabId,
         action_id: &ActionId,
+        viewport: Option<SemanticViewport>,
     ) -> CdpResult<SemanticPage> {
-        self.page_mut(tab_id)?.activate_action(action_id).await
+        let page = self.page_mut(tab_id)?;
+        page.set_viewport(viewport).await?;
+        page.activate_action(action_id).await
     }
 
     /// Inputs text into a stable DOM action in a tab and extracts semantic content.
@@ -311,10 +346,11 @@ impl CdpBrowser {
         tab_id: &TabId,
         action_id: &ActionId,
         text: &str,
+        viewport: Option<SemanticViewport>,
     ) -> CdpResult<SemanticPage> {
-        self.page_mut(tab_id)?
-            .input_text_action(action_id, text)
-            .await
+        let page = self.page_mut(tab_id)?;
+        page.set_viewport(viewport).await?;
+        page.input_text_action(action_id, text).await
     }
 
     /// Closes the browser page target for a tab.
@@ -354,6 +390,7 @@ impl Drop for CdpBrowser {
 struct CdpPage {
     target_id: String,
     cdp: CdpConnection,
+    viewport: Option<SemanticViewport>,
 }
 
 impl CdpPage {
@@ -367,7 +404,32 @@ impl CdpPage {
         Ok(Self {
             target_id: target.id,
             cdp,
+            viewport: None,
         })
+    }
+
+    async fn set_viewport(&mut self, viewport: Option<SemanticViewport>) -> CdpResult<()> {
+        let Some(viewport) = viewport else {
+            return Ok(());
+        };
+        if self.viewport == Some(viewport) {
+            return Ok(());
+        }
+        self.cdp
+            .call(
+                "Emulation.setDeviceMetricsOverride",
+                json!({
+                    "width": viewport.width_px,
+                    "height": viewport.height_px,
+                    "deviceScaleFactor": 1,
+                    "mobile": false,
+                    "screenWidth": viewport.width_px,
+                    "screenHeight": viewport.height_px,
+                }),
+            )
+            .await?;
+        self.viewport = Some(viewport);
+        Ok(())
     }
 
     async fn navigate(&mut self, url: &str) -> CdpResult<SemanticPage> {
@@ -375,13 +437,13 @@ impl CdpPage {
             .call("Page.navigate", json!({ "url": url }))
             .await?;
         self.wait_for_page_load(Duration::from_secs(15)).await;
-        self.cdp.extract_semantic_page().await
+        self.cdp.extract_semantic_page(self.viewport).await
     }
 
     async fn reload(&mut self) -> CdpResult<SemanticPage> {
         self.cdp.call("Page.reload", json!({})).await?;
         self.wait_for_page_load(Duration::from_secs(15)).await;
-        self.cdp.extract_semantic_page().await
+        self.cdp.extract_semantic_page(self.viewport).await
     }
 
     async fn back(&mut self) -> CdpResult<SemanticPage> {
@@ -397,7 +459,7 @@ impl CdpPage {
     async fn activate_action(&mut self, action_id: &ActionId) -> CdpResult<SemanticPage> {
         self.run_action(&activate_action_js(action_id)?).await?;
         self.wait_for_page_load(Duration::from_secs(2)).await;
-        self.cdp.extract_semantic_page().await
+        self.cdp.extract_semantic_page(self.viewport).await
     }
 
     async fn input_text_action(
@@ -407,7 +469,7 @@ impl CdpPage {
     ) -> CdpResult<SemanticPage> {
         self.run_action(&input_text_action_js(action_id, text)?)
             .await?;
-        self.cdp.extract_semantic_page().await
+        self.cdp.extract_semantic_page(self.viewport).await
     }
 
     async fn run_action(&mut self, expression: &str) -> CdpResult<()> {
@@ -445,7 +507,7 @@ impl CdpPage {
             )
             .await?;
         self.wait_for_page_load(Duration::from_secs(2)).await;
-        self.cdp.extract_semantic_page().await
+        self.cdp.extract_semantic_page(self.viewport).await
     }
 
     async fn history_entry(&mut self, offset: i64) -> CdpResult<i64> {
@@ -486,7 +548,7 @@ impl CdpPage {
 /// navigation fails, or semantic extraction fails.
 pub async fn fetch_semantic_page(config: &CdpBackendConfig, url: &str) -> CdpResult<SemanticPage> {
     let mut browser = CdpBrowser::launch(config).await?;
-    let result = browser.open_tab(TabId::new("tab-0"), url).await;
+    let result = browser.open_tab(TabId::new("tab-0"), url, None).await;
     let _ = browser.shutdown().await;
     result
 }
@@ -672,7 +734,10 @@ impl CdpConnection {
         Err(CdpError::MissingField("event"))
     }
 
-    async fn extract_semantic_page(&mut self) -> CdpResult<SemanticPage> {
+    async fn extract_semantic_page(
+        &mut self,
+        viewport: Option<SemanticViewport>,
+    ) -> CdpResult<SemanticPage> {
         let dom_page = self.extract_dom_page().await?;
         let ax_page = self
             .extract_accessibility_page(&dom_page)
@@ -680,6 +745,7 @@ impl CdpConnection {
             .ok()
             .flatten();
         let mut page = merge_accessibility_page(dom_page, ax_page);
+        page.viewport = viewport;
         if page.blocks.is_empty() {
             page.blocks.push(SemanticBlock::Paragraph {
                 text: "No semantic text content was found on this page.".to_string(),
@@ -730,6 +796,7 @@ impl CdpConnection {
             title: dom_page.title.clone(),
             blocks,
             layout_tree: None,
+            viewport: None,
         }))
     }
 }
@@ -1265,6 +1332,7 @@ impl CdpSemanticPage {
                 .map(CdpSemanticBlock::into_semantic_block)
                 .collect(),
             layout_tree: self.layout_tree,
+            viewport: None,
         }
     }
 }
@@ -1802,6 +1870,7 @@ impl BrowserBackend for CdpBackend {
                 title: "CDP backend requires async daemon extraction".to_string(),
                 blocks: Vec::new(),
                 layout_tree: None,
+                viewport: None,
             },
         })
     }

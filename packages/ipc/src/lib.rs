@@ -5,7 +5,7 @@
 //! IPC protocol models for trowser.
 
 use serde::{Deserialize, Serialize};
-use trowser_render::SemanticPage;
+use trowser_render::{SemanticPage, SemanticViewport};
 use trowser_session_models::{ActionId, SessionSnapshot, TabId};
 
 /// Current trowser IPC protocol version.
@@ -38,6 +38,24 @@ pub struct ServerHello {
     pub capabilities: ProtocolCapabilities,
 }
 
+/// Terminal viewport hint sent by clients for responsive browser layout extraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ViewportHint {
+    /// Terminal width in cells.
+    pub width_cells: u16,
+    /// Terminal height in cells.
+    pub height_cells: u16,
+}
+
+impl ViewportHint {
+    /// Converts this terminal viewport hint into CSS pixels.
+    #[must_use]
+    pub fn semantic_viewport(self) -> SemanticViewport {
+        SemanticViewport::from_terminal_cells(self.width_cells, self.height_cells)
+    }
+}
+
 /// IPC protocol capabilities.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -58,9 +76,16 @@ pub enum Request {
     /// Returns daemon status.
     Status,
     /// Opens a new tab to a URL.
-    Open { url: String },
+    Open {
+        url: String,
+        viewport: Option<ViewportHint>,
+    },
     /// Opens a new tab to a URL with a cancellable request id.
-    Navigate { request_id: String, url: String },
+    Navigate {
+        request_id: String,
+        url: String,
+        viewport: Option<ViewportHint>,
+    },
     /// Cancels or marks stale a cancellable request.
     Cancel { request_id: String },
     /// Switches to a tab.
@@ -72,17 +97,24 @@ pub enum Request {
     /// Switches to the previous tab.
     PreviousTab,
     /// Returns a semantic snapshot for the active tab.
-    ActiveSnapshot,
+    ActiveSnapshot { viewport: Option<ViewportHint> },
     /// Reloads the active tab.
-    Reload,
+    Reload { viewport: Option<ViewportHint> },
     /// Navigates the active tab backward in browser history.
-    Back,
+    Back { viewport: Option<ViewportHint> },
     /// Navigates the active tab forward in browser history.
-    Forward,
+    Forward { viewport: Option<ViewportHint> },
     /// Activates/clicks a stable DOM action in the active tab.
-    ActivateAction { action_id: ActionId },
+    ActivateAction {
+        action_id: ActionId,
+        viewport: Option<ViewportHint>,
+    },
     /// Inputs text into a stable DOM action in the active tab.
-    InputTextAction { action_id: ActionId, text: String },
+    InputTextAction {
+        action_id: ActionId,
+        text: String,
+        viewport: Option<ViewportHint>,
+    },
     /// Activates/clicks a form control in the active tab.
     ClickControl { control_id: u32 },
     /// Inputs text into a form control in the active tab.
@@ -96,9 +128,15 @@ pub enum Request {
     /// Clears the persisted session snapshot.
     ClearSession,
     /// Follows a reader-mode link in the active tab.
-    FollowLink { link_id: u32 },
+    FollowLink {
+        link_id: u32,
+        viewport: Option<ViewportHint>,
+    },
     /// Returns a semantic snapshot for a tab.
-    Snapshot { tab_id: TabId },
+    Snapshot {
+        tab_id: TabId,
+        viewport: Option<ViewportHint>,
+    },
     /// Requests graceful daemon shutdown.
     Shutdown,
 }

@@ -28,7 +28,7 @@ use trowser_browser_cdp::discover_browser_binary;
 use trowser_cli_schema::{Cli, Command, ServerCommand, SessionCommand};
 use trowser_client::{ClientError, TrowserClient};
 use trowser_config::{ConfigPaths, TROWSER_DAEMON_READY_FILE_ENV, TrowserConfig};
-use trowser_ipc::{Request, Response, ServerStatus};
+use trowser_ipc::{Request, Response, ServerStatus, ViewportHint};
 use trowser_server::TrowserServer;
 use trowser_session_models::ActionId;
 use trowser_terminal::{
@@ -68,8 +68,28 @@ pub async fn run() -> Result<u8> {
         Command::Session { command } => run_session(&command, &paths, cli.json).await,
         Command::Status => run_status(&paths, cli.json).await,
         Command::Follow { link_id } => run_follow(&paths, &config, link_id, cli.json).await,
-        Command::Back => run_navigation(&paths, &config, Request::Back, cli.json).await,
-        Command::Forward => run_navigation(&paths, &config, Request::Forward, cli.json).await,
+        Command::Back => {
+            run_navigation(
+                &paths,
+                &config,
+                Request::Back {
+                    viewport: Some(config_viewport_hint(&config)),
+                },
+                cli.json,
+            )
+            .await
+        }
+        Command::Forward => {
+            run_navigation(
+                &paths,
+                &config,
+                Request::Forward {
+                    viewport: Some(config_viewport_hint(&config)),
+                },
+                cli.json,
+            )
+            .await
+        }
         Command::Click { control_id } => {
             run_navigation(
                 &paths,
@@ -143,9 +163,11 @@ async fn run_open(
     json: bool,
 ) -> Result<u8> {
     let client = ensure_server(paths).await?;
+    let viewport = config_viewport_hint(config);
     let opened = client
         .send(&Request::Open {
             url: url.to_string(),
+            viewport: Some(viewport),
         })
         .await?;
 
@@ -153,7 +175,12 @@ async fn run_open(
         anyhow::bail!("unexpected open response: {opened:?}");
     };
 
-    let snapshot = client.send(&Request::Snapshot { tab_id }).await?;
+    let snapshot = client
+        .send(&Request::Snapshot {
+            tab_id,
+            viewport: Some(viewport),
+        })
+        .await?;
     let Response::Snapshot { page } = snapshot else {
         anyhow::bail!("unexpected snapshot response: {snapshot:?}");
     };
@@ -181,12 +208,23 @@ async fn run_follow(
     json: bool,
 ) -> Result<u8> {
     let client = ensure_server(paths).await?;
-    let followed = client.send(&Request::FollowLink { link_id }).await?;
+    let viewport = config_viewport_hint(config);
+    let followed = client
+        .send(&Request::FollowLink {
+            link_id,
+            viewport: Some(viewport),
+        })
+        .await?;
     let Response::Opened { tab_id } = followed else {
         anyhow::bail!("unexpected follow response: {followed:?}");
     };
 
-    let snapshot = client.send(&Request::Snapshot { tab_id }).await?;
+    let snapshot = client
+        .send(&Request::Snapshot {
+            tab_id,
+            viewport: Some(viewport),
+        })
+        .await?;
     let Response::Snapshot { page } = snapshot else {
         anyhow::bail!("unexpected snapshot response: {snapshot:?}");
     };
@@ -744,6 +782,7 @@ async fn open_and_snapshot(
     let opened = client
         .send(&Request::Open {
             url: url.to_string(),
+            viewport: current_viewport_hint(),
         })
         .await?;
     let Response::Opened { tab_id } = opened else {
@@ -757,7 +796,13 @@ async fn navigate_and_snapshot_with_request(
     request_id: String,
     url: String,
 ) -> Result<trowser_render::SemanticPage> {
-    let opened = client.send(&Request::Navigate { request_id, url }).await?;
+    let opened = client
+        .send(&Request::Navigate {
+            request_id,
+            url,
+            viewport: current_viewport_hint(),
+        })
+        .await?;
     let Response::Opened { tab_id } = opened else {
         anyhow::bail!("unexpected navigate response: {opened:?}");
     };
@@ -827,7 +872,12 @@ async fn follow_and_snapshot(
     client: &TrowserClient,
     link_id: u32,
 ) -> Result<trowser_render::SemanticPage> {
-    let followed = client.send(&Request::FollowLink { link_id }).await?;
+    let followed = client
+        .send(&Request::FollowLink {
+            link_id,
+            viewport: current_viewport_hint(),
+        })
+        .await?;
     let Response::Opened { tab_id } = followed else {
         anyhow::bail!("unexpected follow response: {followed:?}");
     };
@@ -835,15 +885,33 @@ async fn follow_and_snapshot(
 }
 
 async fn reload_and_snapshot(client: &TrowserClient) -> Result<trowser_render::SemanticPage> {
-    navigation_and_snapshot(client, Request::Reload).await
+    navigation_and_snapshot(
+        client,
+        Request::Reload {
+            viewport: current_viewport_hint(),
+        },
+    )
+    .await
 }
 
 async fn back_and_snapshot(client: &TrowserClient) -> Result<trowser_render::SemanticPage> {
-    navigation_and_snapshot(client, Request::Back).await
+    navigation_and_snapshot(
+        client,
+        Request::Back {
+            viewport: current_viewport_hint(),
+        },
+    )
+    .await
 }
 
 async fn forward_and_snapshot(client: &TrowserClient) -> Result<trowser_render::SemanticPage> {
-    navigation_and_snapshot(client, Request::Forward).await
+    navigation_and_snapshot(
+        client,
+        Request::Forward {
+            viewport: current_viewport_hint(),
+        },
+    )
+    .await
 }
 
 async fn next_tab_and_snapshot(client: &TrowserClient) -> Result<trowser_render::SemanticPage> {
@@ -875,7 +943,11 @@ async fn previous_tab_and_snapshot(client: &TrowserClient) -> Result<trowser_ren
 async fn close_active_tab_and_snapshot(
     client: &TrowserClient,
 ) -> Result<trowser_render::SemanticPage> {
-    let active = client.send(&Request::ActiveSnapshot).await?;
+    let active = client
+        .send(&Request::ActiveSnapshot {
+            viewport: current_viewport_hint(),
+        })
+        .await?;
     let Response::ActiveSnapshot { tab_id, .. } = active else {
         return Ok(empty_page("Press o to open a URL."));
     };
@@ -900,7 +972,14 @@ async fn activate_or_follow_link(
     action_id: Option<ActionId>,
 ) -> Result<trowser_render::SemanticPage> {
     if let Some(action_id) = action_id {
-        navigation_and_snapshot(client, Request::ActivateAction { action_id }).await
+        navigation_and_snapshot(
+            client,
+            Request::ActivateAction {
+                action_id,
+                viewport: current_viewport_hint(),
+            },
+        )
+        .await
     } else {
         follow_and_snapshot(client, link_id).await
     }
@@ -912,7 +991,14 @@ async fn activate_or_click_control(
     action_id: Option<ActionId>,
 ) -> Result<trowser_render::SemanticPage> {
     if let Some(action_id) = action_id {
-        navigation_and_snapshot(client, Request::ActivateAction { action_id }).await
+        navigation_and_snapshot(
+            client,
+            Request::ActivateAction {
+                action_id,
+                viewport: current_viewport_hint(),
+            },
+        )
+        .await
     } else {
         click_and_snapshot(client, control_id).await
     }
@@ -933,7 +1019,15 @@ async fn input_control_or_action(
     text: String,
 ) -> Result<trowser_render::SemanticPage> {
     if let Some(action_id) = action_id {
-        navigation_and_snapshot(client, Request::InputTextAction { action_id, text }).await
+        navigation_and_snapshot(
+            client,
+            Request::InputTextAction {
+                action_id,
+                text,
+                viewport: current_viewport_hint(),
+            },
+        )
+        .await
     } else {
         input_and_snapshot(client, control_id, text).await
     }
@@ -955,7 +1049,12 @@ async fn snapshot_tab(
     client: &TrowserClient,
     tab_id: trowser_session_models::TabId,
 ) -> Result<trowser_render::SemanticPage> {
-    let snapshot = client.send(&Request::Snapshot { tab_id }).await?;
+    let snapshot = client
+        .send(&Request::Snapshot {
+            tab_id,
+            viewport: current_viewport_hint(),
+        })
+        .await?;
     let Response::Snapshot { page } = snapshot else {
         anyhow::bail!("unexpected snapshot response: {snapshot:?}");
     };
@@ -979,7 +1078,12 @@ async fn tabs_status(client: &TrowserClient) -> Result<String> {
 }
 
 async fn active_snapshot_or_empty(client: &TrowserClient) -> trowser_render::SemanticPage {
-    match client.send(&Request::ActiveSnapshot).await {
+    match client
+        .send(&Request::ActiveSnapshot {
+            viewport: current_viewport_hint(),
+        })
+        .await
+    {
         Ok(Response::ActiveSnapshot { page, .. }) => page,
         _ => empty_page("Press o to open a URL."),
     }
@@ -995,6 +1099,21 @@ fn empty_page(message: &str) -> trowser_render::SemanticPage {
             region: trowser_render::SemanticRegion::Main,
         }],
         layout_tree: None,
+        viewport: None,
+    }
+}
+
+fn current_viewport_hint() -> Option<ViewportHint> {
+    size().ok().map(|(width_cells, height_cells)| ViewportHint {
+        width_cells,
+        height_cells,
+    })
+}
+
+const fn config_viewport_hint(config: &TrowserConfig) -> ViewportHint {
+    ViewportHint {
+        width_cells: config.render.max_width,
+        height_cells: 40,
     }
 }
 

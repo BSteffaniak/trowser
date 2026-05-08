@@ -19,6 +19,29 @@ pub struct SemanticPage {
     pub blocks: Vec<SemanticBlock>,
     /// Optional browser-derived DOM/layout tree for layout-preserving rendering.
     pub layout_tree: Option<SemanticLayoutNode>,
+    /// Viewport used by the browser when extracting this page.
+    pub viewport: Option<SemanticViewport>,
+}
+
+/// Browser viewport used for responsive layout extraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SemanticViewport {
+    /// Viewport width in CSS pixels.
+    pub width_px: u32,
+    /// Viewport height in CSS pixels.
+    pub height_px: u32,
+}
+
+impl SemanticViewport {
+    /// Creates a viewport from terminal cells and approximate cell size.
+    #[must_use]
+    pub fn from_terminal_cells(width_cells: u16, height_cells: u16) -> Self {
+        Self {
+            width_px: u32::from(width_cells).saturating_mul(9).max(360),
+            height_px: u32::from(height_cells).saturating_mul(18).max(720),
+        }
+    }
 }
 
 /// Browser-derived layout hint for a semantic block.
@@ -390,6 +413,7 @@ pub fn sanitize_page(page: &SemanticPage) -> SemanticPage {
         title: sanitize_terminal_text(&page.title),
         blocks: page.blocks.iter().map(sanitize_block).collect(),
         layout_tree: page.layout_tree.as_ref().map(sanitize_layout_node),
+        viewport: page.viewport,
     }
 }
 
@@ -671,6 +695,7 @@ mod tests {
                 region: SemanticRegion::Main,
             }],
             layout_tree: None,
+            viewport: None,
         };
 
         let links = reader_links(&page);

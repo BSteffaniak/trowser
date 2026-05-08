@@ -1774,6 +1774,7 @@ mod tests {
                 region: SemanticRegion::Main,
             }],
             layout_tree: None,
+            viewport: None,
         };
 
         let rendered = render_plain_text(&page, &TerminalRenderOptions::default());
@@ -1797,6 +1798,7 @@ mod tests {
                 region: SemanticRegion::Main,
             }],
             layout_tree: None,
+            viewport: None,
         };
 
         let rendered = render_plain_text(&page, &TerminalRenderOptions::default());

@@ -16,9 +16,11 @@ use trowser_browser_cdp::{CdpBackendConfig, CdpBrowser, CdpResourcePolicy};
 use trowser_config::{ConfigPaths, TROWSER_DAEMON_READY_FILE_ENV, TrowserConfig};
 use trowser_ipc::{
     ClientHello, PROTOCOL_VERSION, ProtocolCapabilities, Request, Response, ServerHello,
-    ServerStatus,
+    ServerStatus, ViewportHint,
 };
-use trowser_render::{SemanticBlock, SemanticPage, SemanticRegion, reader_blocks, reader_links};
+use trowser_render::{
+    SemanticBlock, SemanticPage, SemanticRegion, SemanticViewport, reader_blocks, reader_links,
+};
 use trowser_session_models::{ActionId, SessionSnapshot, TabId, TabSummary};
 
 /// Daemon errors.
@@ -165,20 +167,32 @@ impl TrowserServer {
         match request {
             Request::Hello(hello) => Self::handle_hello(&hello),
             Request::Status => Response::Status(self.status()),
-            Request::Open { url } => self.handle_open(url).await,
-            Request::Navigate { request_id, url } => self.handle_navigate(request_id, url).await,
+            Request::Open { url, viewport } => self.handle_open(url, viewport).await,
+            Request::Navigate {
+                request_id,
+                url,
+                viewport,
+            } => self.handle_navigate(request_id, url, viewport).await,
             Request::Cancel { request_id } => self.handle_cancel(request_id).await,
             Request::SwitchTab { tab_id } => self.handle_switch_tab(tab_id).await,
             Request::CloseTab { tab_id } => self.handle_close_tab(tab_id).await,
             Request::NextTab => self.handle_next_tab().await,
             Request::PreviousTab => self.handle_previous_tab().await,
-            Request::ActiveSnapshot => self.handle_active_snapshot().await,
-            Request::Reload => self.handle_reload().await,
-            Request::Back => self.handle_back().await,
-            Request::Forward => self.handle_forward().await,
-            Request::ActivateAction { action_id } => self.handle_activate_action(action_id).await,
-            Request::InputTextAction { action_id, text } => {
-                self.handle_input_text_action(action_id, text).await
+            Request::ActiveSnapshot { viewport } => self.handle_active_snapshot(viewport).await,
+            Request::Reload { viewport } => self.handle_reload(viewport).await,
+            Request::Back { viewport } => self.handle_back(viewport).await,
+            Request::Forward { viewport } => self.handle_forward(viewport).await,
+            Request::ActivateAction {
+                action_id,
+                viewport,
+            } => self.handle_activate_action(action_id, viewport).await,
+            Request::InputTextAction {
+                action_id,
+                text,
+                viewport,
+            } => {
+                self.handle_input_text_action(action_id, text, viewport)
+                    .await
             }
             Request::ClickControl { control_id } => self.handle_click_control(control_id).await,
             Request::InputText { control_id, text } => {
@@ -188,8 +202,10 @@ impl TrowserServer {
             Request::SaveSession => self.handle_save_session().await,
             Request::RestoreSession => self.handle_restore_session().await,
             Request::ClearSession => self.handle_clear_session().await,
-            Request::FollowLink { link_id } => self.handle_follow_link(link_id).await,
-            Request::Snapshot { tab_id } => self.handle_snapshot(&tab_id).await,
+            Request::FollowLink { link_id, viewport } => {
+                self.handle_follow_link(link_id, viewport).await
+            }
+            Request::Snapshot { tab_id, viewport } => self.handle_snapshot(&tab_id, viewport).await,
             Request::Shutdown => {
                 self.shutdown.notify_waiters();
                 Response::Ok
@@ -213,15 +229,25 @@ impl TrowserServer {
         })
     }
 
-    async fn handle_open(&self, url: String) -> Response {
-        self.open_url(url, None).await
+    async fn handle_open(&self, url: String, viewport: Option<ViewportHint>) -> Response {
+        self.open_url(url, None, viewport).await
     }
 
-    async fn handle_navigate(&self, request_id: String, url: String) -> Response {
-        self.open_url(url, Some(request_id)).await
+    async fn handle_navigate(
+        &self,
+        request_id: String,
+        url: String,
+        viewport: Option<ViewportHint>,
+    ) -> Response {
+        self.open_url(url, Some(request_id), viewport).await
     }
 
-    async fn open_url(&self, url: String, request_id: Option<String>) -> Response {
+    async fn open_url(
+        &self,
+        url: String,
+        request_id: Option<String>,
+        viewport: Option<ViewportHint>,
+    ) -> Response {
         if let Some(request_id) = request_id.as_ref()
             && self.is_request_canceled(request_id).await
         {
@@ -240,7 +266,11 @@ impl TrowserServer {
         let tab_id = self.allocate_tab_id().await;
         let page = match tokio::time::timeout(
             Duration::from_secs(45),
-            self.open_browser_tab(tab_id.clone(), &url),
+            self.open_browser_tab(
+                tab_id.clone(),
+                &url,
+                viewport.map(ViewportHint::semantic_viewport),
+            ),
         )
         .await
         {
@@ -294,7 +324,7 @@ impl TrowserServer {
         tab_id
     }
 
-    async fn handle_follow_link(&self, link_id: u32) -> Response {
+    async fn handle_follow_link(&self, link_id: u32, viewport: Option<ViewportHint>) -> Response {
         let Some((tab_id, action_id, url)) = self.follow_link_target(link_id).await else {
             return Response::Error {
                 message: format!("unknown link id {link_id}"),
@@ -302,11 +332,11 @@ impl TrowserServer {
         };
 
         if let Some(action_id) = action_id {
-            return self.handle_activate_action(action_id).await;
+            return self.handle_activate_action(action_id, viewport).await;
         }
 
         let page = self
-            .navigate_browser_tab(&tab_id, &url)
+            .navigate_browser_tab(&tab_id, &url, viewport.map(ViewportHint::semantic_viewport))
             .await
             .unwrap_or_else(|error| error_page(&url, &error.to_string()));
         self.store_page(tab_id, page).await
@@ -440,7 +470,7 @@ impl TrowserServer {
         Response::Opened { tab_id }
     }
 
-    async fn handle_active_snapshot(&self) -> Response {
+    async fn handle_active_snapshot(&self, viewport: Option<ViewportHint>) -> Response {
         let state = self.state.lock().await;
         let Some(tab_id) = state.active_tab.clone() else {
             return Response::Error {
@@ -453,29 +483,39 @@ impl TrowserServer {
             };
         };
         drop(state);
+        if let Some(viewport) = viewport
+            && page.viewport != Some(viewport.semantic_viewport())
+        {
+            return self
+                .refresh_tab_snapshot(tab_id, page.url.clone(), viewport.semantic_viewport())
+                .await;
+        }
         Response::ActiveSnapshot { tab_id, page }
     }
 
-    async fn handle_reload(&self) -> Response {
+    async fn handle_reload(&self, viewport: Option<ViewportHint>) -> Response {
         let Some((tab_id, url)) = self.active_tab_url().await else {
             return Response::Error {
                 message: "no active tab".to_string(),
             };
         };
         let page = self
-            .reload_page(&tab_id, &url)
+            .reload_page(&tab_id, &url, viewport.map(ViewportHint::semantic_viewport))
             .await
             .unwrap_or_else(|error| error_page(&url, &error.to_string()));
         self.store_page(tab_id, page).await
     }
 
-    async fn handle_back(&self) -> Response {
+    async fn handle_back(&self, viewport: Option<ViewportHint>) -> Response {
         let Some(tab_id) = self.active_tab_id().await else {
             return Response::Error {
                 message: "no active tab".to_string(),
             };
         };
-        match self.back_page(&tab_id).await {
+        match self
+            .back_page(&tab_id, viewport.map(ViewportHint::semantic_viewport))
+            .await
+        {
             Ok(page) => self.store_page(tab_id, page).await,
             Err(error) => Response::Error {
                 message: error.to_string(),
@@ -483,13 +523,16 @@ impl TrowserServer {
         }
     }
 
-    async fn handle_forward(&self) -> Response {
+    async fn handle_forward(&self, viewport: Option<ViewportHint>) -> Response {
         let Some(tab_id) = self.active_tab_id().await else {
             return Response::Error {
                 message: "no active tab".to_string(),
             };
         };
-        match self.forward_page(&tab_id).await {
+        match self
+            .forward_page(&tab_id, viewport.map(ViewportHint::semantic_viewport))
+            .await
+        {
             Ok(page) => self.store_page(tab_id, page).await,
             Err(error) => Response::Error {
                 message: error.to_string(),
@@ -497,13 +540,24 @@ impl TrowserServer {
         }
     }
 
-    async fn handle_activate_action(&self, action_id: ActionId) -> Response {
+    async fn handle_activate_action(
+        &self,
+        action_id: ActionId,
+        viewport: Option<ViewportHint>,
+    ) -> Response {
         let Some(tab_id) = self.active_tab_id().await else {
             return Response::Error {
                 message: "no active tab".to_string(),
             };
         };
-        match self.activate_action(&tab_id, &action_id).await {
+        match self
+            .activate_action(
+                &tab_id,
+                &action_id,
+                viewport.map(ViewportHint::semantic_viewport),
+            )
+            .await
+        {
             Ok(page) => self.store_page(tab_id, page).await,
             Err(error) => Response::Error {
                 message: error.to_string(),
@@ -511,13 +565,26 @@ impl TrowserServer {
         }
     }
 
-    async fn handle_input_text_action(&self, action_id: ActionId, text: String) -> Response {
+    async fn handle_input_text_action(
+        &self,
+        action_id: ActionId,
+        text: String,
+        viewport: Option<ViewportHint>,
+    ) -> Response {
         let Some(tab_id) = self.active_tab_id().await else {
             return Response::Error {
                 message: "no active tab".to_string(),
             };
         };
-        match self.input_text_action(&tab_id, &action_id, &text).await {
+        match self
+            .input_text_action(
+                &tab_id,
+                &action_id,
+                &text,
+                viewport.map(ViewportHint::semantic_viewport),
+            )
+            .await
+        {
             Ok(page) => self.store_page(tab_id, page).await,
             Err(error) => Response::Error {
                 message: error.to_string(),
@@ -531,7 +598,7 @@ impl TrowserServer {
                 message: format!("unknown control id {control_id}"),
             };
         };
-        self.handle_activate_action(action_id).await
+        self.handle_activate_action(action_id, None).await
     }
 
     async fn handle_input_text(&self, control_id: u32, text: String) -> Response {
@@ -540,7 +607,7 @@ impl TrowserServer {
                 message: format!("unknown control id {control_id}"),
             };
         };
-        self.handle_input_text_action(action_id, text).await
+        self.handle_input_text_action(action_id, text, None).await
     }
 
     async fn active_tab_id(&self) -> Option<TabId> {
@@ -558,6 +625,19 @@ impl TrowserServer {
         Some((tab_id, url))
     }
 
+    async fn refresh_tab_snapshot(
+        &self,
+        tab_id: TabId,
+        url: String,
+        viewport: SemanticViewport,
+    ) -> Response {
+        let page = self
+            .reload_page(&tab_id, &url, Some(viewport))
+            .await
+            .unwrap_or_else(|error| error_page(&url, &error.to_string()));
+        self.store_page(tab_id, page).await
+    }
+
     async fn store_page(&self, tab_id: TabId, page: SemanticPage) -> Response {
         let mut state = self.state.lock().await;
         state.tabs.insert(tab_id.clone(), page);
@@ -567,14 +647,32 @@ impl TrowserServer {
         Response::Opened { tab_id }
     }
 
-    async fn handle_snapshot(&self, tab_id: &TabId) -> Response {
+    async fn handle_snapshot(&self, tab_id: &TabId, viewport: Option<ViewportHint>) -> Response {
         let state = self.state.lock().await;
-        state.tabs.get(tab_id).cloned().map_or_else(
-            || Response::Error {
+        let Some(page) = state.tabs.get(tab_id).cloned() else {
+            return Response::Error {
                 message: format!("unknown tab {}", tab_id.as_str()),
-            },
-            |page| Response::Snapshot { page },
-        )
+            };
+        };
+        drop(state);
+        if let Some(viewport) = viewport
+            && page.viewport != Some(viewport.semantic_viewport())
+        {
+            let response = self
+                .refresh_tab_snapshot(tab_id.clone(), page.url, viewport.semantic_viewport())
+                .await;
+            let Response::Opened { tab_id } = response else {
+                return response;
+            };
+            let state = self.state.lock().await;
+            return state.tabs.get(&tab_id).cloned().map_or_else(
+                || Response::Error {
+                    message: format!("unknown tab {}", tab_id.as_str()),
+                },
+                |page| Response::Snapshot { page },
+            );
+        }
+        Response::Snapshot { page }
     }
 
     #[allow(
@@ -585,6 +683,7 @@ impl TrowserServer {
         &self,
         tab_id: TabId,
         url: &str,
+        viewport: Option<SemanticViewport>,
     ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
         let mut browser = self.browser.lock().await;
         if browser.is_none() {
@@ -594,7 +693,7 @@ impl TrowserServer {
         let Some(browser) = browser.as_mut() else {
             unreachable!("browser initialized above")
         };
-        browser.open_tab(tab_id, url).await
+        browser.open_tab(tab_id, url, viewport).await
     }
 
     #[allow(
@@ -605,6 +704,7 @@ impl TrowserServer {
         &self,
         tab_id: &TabId,
         url: &str,
+        viewport: Option<SemanticViewport>,
     ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
         let mut browser = self.browser.lock().await;
         if browser.is_none() {
@@ -614,7 +714,7 @@ impl TrowserServer {
         let Some(browser) = browser.as_mut() else {
             unreachable!("browser initialized above")
         };
-        browser.navigate_tab(tab_id, url).await
+        browser.navigate_tab(tab_id, url, viewport).await
     }
 
     #[allow(
@@ -625,6 +725,7 @@ impl TrowserServer {
         &self,
         tab_id: &TabId,
         fallback_url: &str,
+        viewport: Option<SemanticViewport>,
     ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
         let mut browser = self.browser.lock().await;
         if browser.is_none() {
@@ -633,14 +734,20 @@ impl TrowserServer {
             let Some(browser) = browser.as_mut() else {
                 unreachable!("browser initialized above")
             };
-            return browser.open_tab(tab_id.clone(), fallback_url).await;
+            return browser
+                .open_tab(tab_id.clone(), fallback_url, viewport)
+                .await;
         }
         let Some(browser) = browser.as_mut() else {
             unreachable!("browser checked above")
         };
-        match browser.reload_tab(tab_id).await {
+        match browser.reload_tab(tab_id, viewport).await {
             Ok(page) => Ok(page),
-            Err(_) => browser.open_tab(tab_id.clone(), fallback_url).await,
+            Err(_) => {
+                browser
+                    .open_tab(tab_id.clone(), fallback_url, viewport)
+                    .await
+            }
         }
     }
 
@@ -651,12 +758,13 @@ impl TrowserServer {
     async fn back_page(
         &self,
         tab_id: &TabId,
+        viewport: Option<SemanticViewport>,
     ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
         let mut browser = self.browser.lock().await;
         let Some(browser) = browser.as_mut() else {
             return Err(trowser_browser_cdp::CdpError::NavigationHistory);
         };
-        browser.back_tab(tab_id).await
+        browser.back_tab(tab_id, viewport).await
     }
 
     #[allow(
@@ -666,12 +774,13 @@ impl TrowserServer {
     async fn forward_page(
         &self,
         tab_id: &TabId,
+        viewport: Option<SemanticViewport>,
     ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
         let mut browser = self.browser.lock().await;
         let Some(browser) = browser.as_mut() else {
             return Err(trowser_browser_cdp::CdpError::NavigationHistory);
         };
-        browser.forward_tab(tab_id).await
+        browser.forward_tab(tab_id, viewport).await
     }
 
     #[allow(
@@ -682,6 +791,7 @@ impl TrowserServer {
         &self,
         tab_id: &TabId,
         action_id: &ActionId,
+        viewport: Option<SemanticViewport>,
     ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
         let mut browser = self.browser.lock().await;
         let Some(browser) = browser.as_mut() else {
@@ -689,7 +799,7 @@ impl TrowserServer {
                 "browser is not connected".to_string(),
             ));
         };
-        browser.activate_action(tab_id, action_id).await
+        browser.activate_action(tab_id, action_id, viewport).await
     }
 
     #[allow(
@@ -701,6 +811,7 @@ impl TrowserServer {
         tab_id: &TabId,
         action_id: &ActionId,
         text: &str,
+        viewport: Option<SemanticViewport>,
     ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
         let mut browser = self.browser.lock().await;
         let Some(browser) = browser.as_mut() else {
@@ -708,7 +819,9 @@ impl TrowserServer {
                 "browser is not connected".to_string(),
             ));
         };
-        browser.input_text_action(tab_id, action_id, text).await
+        browser
+            .input_text_action(tab_id, action_id, text, viewport)
+            .await
     }
 
     fn cdp_config(&self) -> CdpBackendConfig {
@@ -774,7 +887,7 @@ impl TrowserServer {
 
         for tab in &snapshot.tabs {
             let page = self
-                .open_browser_tab(tab.id.clone(), &tab.url)
+                .open_browser_tab(tab.id.clone(), &tab.url, None)
                 .await
                 .unwrap_or_else(|error| error_page(&tab.url, &error.to_string()));
             let mut state = self.state.lock().await;
@@ -881,6 +994,7 @@ fn error_page(url: &str, error: &str) -> SemanticPage {
             },
         ],
         layout_tree: None,
+        viewport: None,
     }
 }
 
