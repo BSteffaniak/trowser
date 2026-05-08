@@ -835,6 +835,7 @@ impl CdpConnection {
             blocks,
             layout_tree: None,
             viewport: None,
+            scroll_y_px: dom_page.scroll_y_px,
         }))
     }
 }
@@ -1391,6 +1392,8 @@ struct CdpSemanticPage {
     title: String,
     blocks: Vec<CdpSemanticBlock>,
     layout_tree: Option<SemanticLayoutNode>,
+    #[serde(default)]
+    scroll_y_px: u32,
 }
 
 impl CdpSemanticPage {
@@ -1405,6 +1408,7 @@ impl CdpSemanticPage {
                 .collect(),
             layout_tree: self.layout_tree,
             viewport: None,
+            scroll_y_px: self.scroll_y_px,
         }
     }
 }
@@ -1627,7 +1631,18 @@ fn activate_action_js(action_id: &ActionId) -> CdpResult<String> {
   const el = window.__trowserActions && window.__trowserActions[{action_id}];
   if (!el) return {{ ok: false, error: 'unknown action id' }};
   const anchor = el.closest && el.closest('a[href]');
-  if (anchor && anchor.href) return {{ ok: true, navigate: anchor.href }};
+  if (anchor && anchor.href) {{
+    const targetUrl = new URL(anchor.href, location.href);
+    const currentUrl = new URL(location.href);
+    if (targetUrl.origin === currentUrl.origin && targetUrl.pathname === currentUrl.pathname && targetUrl.search === currentUrl.search && targetUrl.hash) {{
+      const rawId = decodeURIComponent(targetUrl.hash.slice(1));
+      const target = document.getElementById(rawId) || document.querySelector(`[name='${{CSS.escape(rawId)}}']`);
+      if (target) target.scrollIntoView();
+      history.pushState(null, '', targetUrl.href);
+      return {{ ok: true }};
+    }}
+    return {{ ok: true, navigate: targetUrl.href }};
+  }}
   el.focus();
   el.click();
   return {{ ok: true }};
@@ -1874,6 +1889,7 @@ const DOM_EXTRACTION_JS: &str = r#"
     title: document.title,
     blocks,
     layout_tree: document.body ? layoutNode(document.body) : null,
+    scroll_y_px: Math.max(0, Math.round(window.scrollY || 0)),
   });
 })()
 "#;
@@ -1947,6 +1963,7 @@ impl BrowserBackend for CdpBackend {
                 blocks: Vec::new(),
                 layout_tree: None,
                 viewport: None,
+                scroll_y_px: 0,
             },
         })
     }

@@ -103,6 +103,8 @@ pub struct RenderedLine {
     pub links: Vec<LinkHitbox>,
     /// Form-control hitboxes on this line.
     pub controls: Vec<ControlHitbox>,
+    /// Browser source y-coordinate for scroll/anchor synchronization.
+    pub source_y_px: Option<u32>,
 }
 
 /// A styled text span.
@@ -301,6 +303,7 @@ fn push_blocks_with_layout(
             continue;
         }
 
+        let start_line = document.lines.len();
         push_reader_block_lines(
             block,
             next_link_id,
@@ -309,7 +312,39 @@ fn push_blocks_with_layout(
             options,
             document,
         );
+        set_source_y_for_new_lines(document, start_line, block_source_y_px(block));
         index += 1;
+    }
+}
+
+fn block_source_y_px(block: &SemanticBlock) -> Option<u32> {
+    block.layout().and_then(|layout| source_y_px(layout.y))
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "browser CSS geometry is finite pixel data projected into integer metadata"
+)]
+fn source_y_px(value: f64) -> Option<u32> {
+    if !value.is_finite() || value < 0.0 || value > f64::from(u32::MAX) {
+        return None;
+    }
+    Some(value.round() as u32)
+}
+
+fn set_source_y_for_new_lines(
+    document: &mut RenderedDocument,
+    start_line: usize,
+    source_y_px: Option<u32>,
+) {
+    let Some(source_y_px) = source_y_px else {
+        return;
+    };
+    for line in document.lines.iter_mut().skip(start_line) {
+        if !line.text.trim().is_empty() {
+            line.source_y_px = Some(source_y_px);
+        }
     }
 }
 
@@ -953,6 +988,7 @@ fn box_content_line(line: &RenderedLine, width: usize) -> RenderedLine {
         spans: boxed_spans(line, &clipped, pad),
         links: offset_links(&line.links, 2),
         controls: offset_controls(&line.controls, 2),
+        source_y_px: line.source_y_px,
         text,
     }
 }
@@ -1033,7 +1069,15 @@ fn combine_document_columns_row(
         spans,
         links,
         controls,
+        source_y_px: row_source_y_px(columns, row),
     }
+}
+
+fn row_source_y_px(columns: &[RenderedDocument], row: usize) -> Option<u32> {
+    columns
+        .iter()
+        .filter_map(|column| column.lines.get(row).and_then(|line| line.source_y_px))
+        .min()
 }
 
 fn append_column_line(
@@ -1116,6 +1160,7 @@ fn line_with_style(text: String, style: SpanStyle) -> RenderedLine {
         text,
         links: Vec::new(),
         controls: Vec::new(),
+        source_y_px: None,
     }
 }
 
@@ -1598,6 +1643,7 @@ fn push_inline_cells_line(document: &mut RenderedDocument, cells: &[InlineCell])
         spans,
         links,
         controls: Vec::new(),
+        source_y_px: None,
     });
 }
 
@@ -1793,6 +1839,7 @@ fn push_wrapped_lines(
             text,
             links,
             controls: Vec::new(),
+            source_y_px: None,
         });
     }
 }
@@ -1826,6 +1873,7 @@ fn push_wrapped_control_lines(
             }],
             text,
             links: Vec::new(),
+            source_y_px: None,
         });
     }
 }
@@ -1870,6 +1918,7 @@ fn push_text_lines(
             text,
             links,
             controls: Vec::new(),
+            source_y_px: None,
         });
     }
 }
@@ -2110,6 +2159,7 @@ mod tests {
             }],
             layout_tree: None,
             viewport: None,
+            scroll_y_px: 0,
         };
 
         let rendered = render_plain_text(&page, &TerminalRenderOptions::default());
@@ -2134,6 +2184,7 @@ mod tests {
             }],
             layout_tree: None,
             viewport: None,
+            scroll_y_px: 0,
         };
 
         let rendered = render_plain_text(&page, &TerminalRenderOptions::default());
@@ -2317,6 +2368,7 @@ mod tests {
                 ..SemanticLayoutNode::default()
             }),
             viewport: None,
+            scroll_y_px: 0,
         }
     }
 }

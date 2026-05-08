@@ -1192,6 +1192,7 @@ fn error_page(url: &str, error: &str) -> SemanticPage {
         ],
         layout_tree: None,
         viewport: None,
+        scroll_y_px: 0,
     }
 }
 

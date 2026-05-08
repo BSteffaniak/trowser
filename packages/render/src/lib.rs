@@ -21,6 +21,8 @@ pub struct SemanticPage {
     pub layout_tree: Option<SemanticLayoutNode>,
     /// Viewport used by the browser when extracting this page.
     pub viewport: Option<SemanticViewport>,
+    /// Browser vertical scroll offset in CSS pixels at extraction time.
+    pub scroll_y_px: u32,
 }
 
 /// Browser viewport used for responsive layout extraction.
@@ -414,6 +416,7 @@ pub fn sanitize_page(page: &SemanticPage) -> SemanticPage {
         blocks: page.blocks.iter().map(sanitize_block).collect(),
         layout_tree: page.layout_tree.as_ref().map(sanitize_layout_node),
         viewport: page.viewport,
+        scroll_y_px: page.scroll_y_px,
     }
 }
 
@@ -696,6 +699,7 @@ mod tests {
             }],
             layout_tree: None,
             viewport: None,
+            scroll_y_px: 0,
         };
 
         let links = reader_links(&page);

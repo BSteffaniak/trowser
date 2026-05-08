@@ -316,7 +316,7 @@ async fn run_interactive(
     let mut render_mode = RenderMode::Reader;
     let mut rendered = render_page_document(&page, config, render_mode);
     let mut tab_status = tabs_status(&client).await.unwrap_or_default();
-    let mut offset = 0usize;
+    let mut offset = page_scroll_offset(&page, &rendered);
     let mut search_query = String::new();
     let mut message = String::from(
         "q quit · j/k scroll · m mode · o/t open tab · Tab switch · x close · f follow · i input · c click · b back · F forward · r reload",
@@ -359,7 +359,7 @@ async fn run_interactive(
                 } => {
                     render_mode = render_mode.next();
                     rendered = render_page_document(&page, config, render_mode);
-                    offset = 0;
+                    offset = page_scroll_offset(&page, &rendered);
                     message = format!("render mode: {}", render_mode.label());
                 }
                 KeyEvent {
@@ -381,7 +381,7 @@ async fn run_interactive(
                             page = updated_page;
                             rendered = render_page_document(&page, config, render_mode);
                             tab_status = tabs_status(&client).await.unwrap_or_default();
-                            offset = 0;
+                            offset = page_scroll_offset(&page, &rendered);
                             message = "activated focused action".to_string();
                         } else {
                             message = "action canceled".to_string();
@@ -469,7 +469,7 @@ async fn run_interactive(
                             page = updated_page;
                             rendered = render_page_document(&page, config, render_mode);
                             tab_status = tabs_status(&client).await.unwrap_or_default();
-                            offset = 0;
+                            offset = page_scroll_offset(&page, &rendered);
                             message = format!("opened {url}");
                         } else {
                             message = "load canceled".to_string();
@@ -483,7 +483,7 @@ async fn run_interactive(
                         page = updated_page;
                         rendered = render_page_document(&page, config, render_mode);
                         tab_status = tabs_status(&client).await.unwrap_or_default();
-                        offset = 0;
+                        offset = page_scroll_offset(&page, &rendered);
                         message = "next tab".to_string();
                     }
                     Err(error) => message = error.to_string(),
@@ -496,7 +496,7 @@ async fn run_interactive(
                         page = updated_page;
                         rendered = render_page_document(&page, config, render_mode);
                         tab_status = tabs_status(&client).await.unwrap_or_default();
-                        offset = 0;
+                        offset = page_scroll_offset(&page, &rendered);
                         message = "previous tab".to_string();
                     }
                     Err(error) => message = error.to_string(),
@@ -509,7 +509,7 @@ async fn run_interactive(
                         page = updated_page;
                         rendered = render_page_document(&page, config, render_mode);
                         tab_status = tabs_status(&client).await.unwrap_or_default();
-                        offset = 0;
+                        offset = page_scroll_offset(&page, &rendered);
                         message = "closed tab".to_string();
                     }
                     Err(error) => message = error.to_string(),
@@ -524,7 +524,7 @@ async fn run_interactive(
                             page = updated_page;
                             rendered = render_page_document(&page, config, render_mode);
                             tab_status = tabs_status(&client).await.unwrap_or_default();
-                            offset = 0;
+                            offset = page_scroll_offset(&page, &rendered);
                             message = format!("switched to tab {index}");
                         }
                         Err(error) => message = error.to_string(),
@@ -548,7 +548,7 @@ async fn run_interactive(
                         {
                             page = updated_page;
                             rendered = render_page_document(&page, config, render_mode);
-                            offset = 0;
+                            offset = page_scroll_offset(&page, &rendered);
                             message = format!("followed link {link_id}");
                         } else {
                             message = "follow canceled".to_string();
@@ -574,7 +574,7 @@ async fn run_interactive(
                         {
                             page = updated_page;
                             rendered = render_page_document(&page, config, render_mode);
-                            offset = 0;
+                            offset = page_scroll_offset(&page, &rendered);
                             message = format!("input text into control {control_id}");
                         } else {
                             message = "input canceled".to_string();
@@ -600,7 +600,7 @@ async fn run_interactive(
                         {
                             page = updated_page;
                             rendered = render_page_document(&page, config, render_mode);
-                            offset = 0;
+                            offset = page_scroll_offset(&page, &rendered);
                             message = format!("clicked control {control_id}");
                         } else {
                             message = "click canceled".to_string();
@@ -620,7 +620,7 @@ async fn run_interactive(
                         Ok(Some(updated_page)) => {
                             page = updated_page;
                             rendered = render_page_document(&page, config, render_mode);
-                            offset = 0;
+                            offset = page_scroll_offset(&page, &rendered);
                             message = "back".to_string();
                         }
                         Ok(None) => message = "back canceled".to_string(),
@@ -640,7 +640,7 @@ async fn run_interactive(
                         Ok(Some(updated_page)) => {
                             page = updated_page;
                             rendered = render_page_document(&page, config, render_mode);
-                            offset = 0;
+                            offset = page_scroll_offset(&page, &rendered);
                             message = "forward".to_string();
                         }
                         Ok(None) => message = "forward canceled".to_string(),
@@ -660,7 +660,7 @@ async fn run_interactive(
                     {
                         page = updated_page;
                         rendered = render_page_document(&page, config, render_mode);
-                        offset = 0;
+                        offset = page_scroll_offset(&page, &rendered);
                         message = "reloaded".to_string();
                     } else {
                         message = "reload canceled".to_string();
@@ -680,7 +680,7 @@ async fn run_interactive(
                     Ok(Some(updated_page)) => {
                         page = updated_page;
                         rendered = render_page_document(&page, config, render_mode);
-                        offset = 0;
+                        offset = page_scroll_offset(&page, &rendered);
                         message = "resized viewport".to_string();
                     }
                     Ok(None) => message = "resize canceled".to_string(),
@@ -712,7 +712,7 @@ async fn run_interactive(
                                 {
                                     page = updated_page;
                                     rendered = render_page_document(&page, config, render_mode);
-                                    offset = 0;
+                                    offset = page_scroll_offset(&page, &rendered);
                                     message = format!("followed link {link_id}");
                                 } else {
                                     message = "follow canceled".to_string();
@@ -741,7 +741,7 @@ async fn run_interactive(
                                 {
                                     page = updated_page;
                                     rendered = render_page_document(&page, config, render_mode);
-                                    offset = 0;
+                                    offset = page_scroll_offset(&page, &rendered);
                                     message = format!("clicked control {control_id}");
                                 } else {
                                     message = "click canceled".to_string();
@@ -772,7 +772,7 @@ async fn run_interactive(
                                     {
                                         page = updated_page;
                                         rendered = render_page_document(&page, config, render_mode);
-                                        offset = 0;
+                                        offset = page_scroll_offset(&page, &rendered);
                                         message = format!("input text into control {control_id}");
                                     } else {
                                         message = "input canceled".to_string();
@@ -1127,6 +1127,7 @@ fn empty_page(message: &str) -> trowser_render::SemanticPage {
         }],
         layout_tree: None,
         viewport: None,
+        scroll_y_px: 0,
     }
 }
 
@@ -1165,6 +1166,20 @@ fn current_terminal_width() -> u16 {
 const fn viewport_body_height(height_cells: u16) -> u16 {
     let body_height = height_cells.saturating_sub(2);
     if body_height == 0 { 1 } else { body_height }
+}
+
+fn page_scroll_offset(page: &trowser_render::SemanticPage, document: &RenderedDocument) -> usize {
+    if page.scroll_y_px == 0 {
+        return 0;
+    }
+    document
+        .lines
+        .iter()
+        .position(|line| {
+            line.source_y_px
+                .is_some_and(|source_y_px| source_y_px >= page.scroll_y_px)
+        })
+        .unwrap_or_else(|| document.lines.len().saturating_sub(1))
 }
 
 fn draw_viewport(
