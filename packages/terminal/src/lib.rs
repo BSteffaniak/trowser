@@ -441,7 +441,7 @@ fn push_browser_layout_lines(
         return;
     }
 
-    let regions = BrowserRegions::from_blocks(&page.blocks);
+    let regions = BrowserRegions::from_page(page);
     push_browser_full_width_panel(
         "Top bar",
         &regions.top,
@@ -454,6 +454,7 @@ fn push_browser_layout_lines(
     push_browser_content_panels(
         &regions.main,
         &regions.aside,
+        regions.content_order(),
         width,
         options,
         next_link_id,
@@ -481,21 +482,77 @@ struct BrowserRegions<'a> {
     main: Vec<&'a SemanticBlock>,
     aside: Vec<&'a SemanticBlock>,
     footer: Vec<&'a SemanticBlock>,
+    main_x: Option<f64>,
+    aside_x: Option<f64>,
+    main_y: Option<f64>,
+    aside_y: Option<f64>,
 }
 
 impl<'a> BrowserRegions<'a> {
-    fn from_blocks(blocks: &'a [SemanticBlock]) -> Self {
+    fn from_page(page: &'a SemanticPage) -> Self {
         let mut regions = Self::default();
-        for block in blocks {
-            match block.region() {
-                SemanticRegion::Header | SemanticRegion::Navigation => regions.top.push(block),
-                SemanticRegion::Aside => regions.aside.push(block),
-                SemanticRegion::Footer => regions.footer.push(block),
-                SemanticRegion::Main | SemanticRegion::Unknown => regions.main.push(block),
-            }
+        for block in &page.blocks {
+            regions.push_block(block);
+        }
+        if let Some(root) = &page.layout_tree {
+            regions.apply_layout_tree(root);
         }
         regions
     }
+
+    fn push_block(&mut self, block: &'a SemanticBlock) {
+        match block.region() {
+            SemanticRegion::Header | SemanticRegion::Navigation => self.top.push(block),
+            SemanticRegion::Aside => {
+                self.aside_x = min_layout_axis(self.aside_x, block.layout().map(|layout| layout.x));
+                self.aside_y = min_layout_axis(self.aside_y, block.layout().map(|layout| layout.y));
+                self.aside.push(block);
+            }
+            SemanticRegion::Footer => self.footer.push(block),
+            SemanticRegion::Main | SemanticRegion::Unknown => {
+                self.main_x = min_layout_axis(self.main_x, block.layout().map(|layout| layout.x));
+                self.main_y = min_layout_axis(self.main_y, block.layout().map(|layout| layout.y));
+                self.main.push(block);
+            }
+        }
+    }
+
+    fn apply_layout_tree(&mut self, node: &SemanticLayoutNode) {
+        if let Some(layout) = node.layout.filter(|layout| layout.is_non_empty()) {
+            match node.region {
+                SemanticRegion::Aside => {
+                    self.aside_x = min_layout_axis(self.aside_x, Some(layout.x));
+                    self.aside_y = min_layout_axis(self.aside_y, Some(layout.y));
+                }
+                SemanticRegion::Main | SemanticRegion::Unknown => {
+                    self.main_x = min_layout_axis(self.main_x, Some(layout.x));
+                    self.main_y = min_layout_axis(self.main_y, Some(layout.y));
+                }
+                SemanticRegion::Header | SemanticRegion::Navigation | SemanticRegion::Footer => {}
+            }
+        }
+        for child in &node.children {
+            self.apply_layout_tree(child);
+        }
+    }
+
+    fn content_order(&self) -> BrowserContentOrder {
+        match (self.aside_x, self.main_x) {
+            (Some(aside_x), Some(main_x)) if aside_x < main_x => BrowserContentOrder::AsideThenMain,
+            _ => BrowserContentOrder::MainThenAside,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserContentOrder {
+    MainThenAside,
+    AsideThenMain,
+}
+
+fn min_layout_axis(current: Option<f64>, candidate: Option<f64>) -> Option<f64> {
+    let candidate = candidate.filter(|value| value.is_finite() && *value >= 0.0)?;
+    Some(current.map_or(candidate, |current| current.min(candidate)))
 }
 
 fn push_browser_full_width_panel(
@@ -515,9 +572,14 @@ fn push_browser_full_width_panel(
     document.lines.push(RenderedLine::default());
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "panel composition keeps render state explicit"
+)]
 fn push_browser_content_panels(
     main_blocks: &[&SemanticBlock],
     aside_blocks: &[&SemanticBlock],
+    order: BrowserContentOrder,
     width: usize,
     options: &TerminalRenderOptions,
     next_link_id: &mut usize,
@@ -528,18 +590,10 @@ fn push_browser_content_panels(
         return;
     }
     if aside_blocks.is_empty() || width < 96 {
-        push_browser_full_width_panel(
-            "Main",
+        push_stacked_browser_content_panels(
             main_blocks,
-            width,
-            options,
-            next_link_id,
-            next_control_id,
-            document,
-        );
-        push_browser_full_width_panel(
-            "Aside",
             aside_blocks,
+            order,
             width,
             options,
             next_link_id,
@@ -549,28 +603,145 @@ fn push_browser_content_panels(
         return;
     }
 
-    let aside_width = (width / 3).clamp(28, 44);
-    let main_width = width.saturating_sub(aside_width + 2).max(40);
-    let main = render_browser_panel(
-        "Main",
-        main_blocks,
-        main_width,
+    match order {
+        BrowserContentOrder::MainThenAside => push_side_by_side_browser_content_panels(
+            main_blocks,
+            aside_blocks,
+            width,
+            options,
+            next_link_id,
+            next_control_id,
+            document,
+        ),
+        BrowserContentOrder::AsideThenMain => push_side_by_side_browser_content_panels(
+            aside_blocks,
+            main_blocks,
+            width,
+            options,
+            next_link_id,
+            next_control_id,
+            document,
+        ),
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "panel composition keeps render state explicit"
+)]
+fn push_stacked_browser_content_panels(
+    main_blocks: &[&SemanticBlock],
+    aside_blocks: &[&SemanticBlock],
+    order: BrowserContentOrder,
+    width: usize,
+    options: &TerminalRenderOptions,
+    next_link_id: &mut usize,
+    next_control_id: &mut usize,
+    document: &mut RenderedDocument,
+) {
+    match order {
+        BrowserContentOrder::MainThenAside => {
+            push_browser_full_width_panel(
+                "Main",
+                main_blocks,
+                width,
+                options,
+                next_link_id,
+                next_control_id,
+                document,
+            );
+            push_browser_full_width_panel(
+                "Aside",
+                aside_blocks,
+                width,
+                options,
+                next_link_id,
+                next_control_id,
+                document,
+            );
+        }
+        BrowserContentOrder::AsideThenMain => {
+            push_browser_full_width_panel(
+                "Aside",
+                aside_blocks,
+                width,
+                options,
+                next_link_id,
+                next_control_id,
+                document,
+            );
+            push_browser_full_width_panel(
+                "Main",
+                main_blocks,
+                width,
+                options,
+                next_link_id,
+                next_control_id,
+                document,
+            );
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "panel composition keeps render state explicit"
+)]
+fn push_side_by_side_browser_content_panels(
+    left_blocks: &[&SemanticBlock],
+    right_blocks: &[&SemanticBlock],
+    width: usize,
+    options: &TerminalRenderOptions,
+    next_link_id: &mut usize,
+    next_control_id: &mut usize,
+    document: &mut RenderedDocument,
+) {
+    let secondary_width = (width / 3).clamp(28, 44);
+    let primary_width = width.saturating_sub(secondary_width + 2).max(40);
+    let left_is_aside = panel_region(left_blocks) == Some(SemanticRegion::Aside);
+    let left_width = if left_is_aside {
+        secondary_width
+    } else {
+        primary_width
+    };
+    let right_width = if left_is_aside {
+        primary_width
+    } else {
+        secondary_width
+    };
+    let left = render_browser_panel(
+        panel_title(left_blocks),
+        left_blocks,
+        left_width,
         options,
         next_link_id,
         next_control_id,
     );
-    let aside = render_browser_panel(
-        "Aside",
-        aside_blocks,
-        aside_width,
+    let right = render_browser_panel(
+        panel_title(right_blocks),
+        right_blocks,
+        right_width,
         options,
         next_link_id,
         next_control_id,
     );
     document
         .lines
-        .extend(combine_documents_side_by_side(&main, &aside, 2));
+        .extend(combine_documents_side_by_side(&left, &right, 2));
     document.lines.push(RenderedLine::default());
+}
+
+fn panel_title(blocks: &[&SemanticBlock]) -> &'static str {
+    panel_region(blocks).map_or("Panel", |region| match region {
+        SemanticRegion::Aside => "Aside",
+        SemanticRegion::Main | SemanticRegion::Unknown => "Main",
+        SemanticRegion::Header | SemanticRegion::Navigation => "Top bar",
+        SemanticRegion::Footer => "Footer",
+    })
+}
+
+fn panel_region(blocks: &[&SemanticBlock]) -> Option<SemanticRegion> {
+    blocks.first().map(|block| block.region())
 }
 
 fn render_browser_panel(
