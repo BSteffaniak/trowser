@@ -26,7 +26,7 @@ use crossterm::terminal::{
 };
 use crossterm::{execute, queue};
 use trowser_browser_cdp::discover_browser_binary;
-use trowser_cli_schema::{Cli, Command, ServerCommand, SessionCommand};
+use trowser_cli_schema::{Cli, Command, ServerCommand, SessionCommand, TabCloseArgs, TabCommand};
 use trowser_client::{ClientError, TrowserClient};
 use trowser_config::{ConfigPaths, TROWSER_DAEMON_READY_FILE_ENV, TrowserConfig};
 use trowser_ipc::{Request, Response, ServerStatus, ViewportHint};
@@ -70,6 +70,7 @@ pub async fn run() -> Result<u8> {
         Command::Interactive => run_interactive(&paths, &config, None).await,
         Command::Server { command } => run_server(&command, &paths, cli.json).await,
         Command::Session { command } => run_session(&command, &paths, cli.json).await,
+        Command::Tab { command } => run_tab(&command, &paths, &config, cli.json).await,
         Command::Status => run_status(&paths, cli.json).await,
         Command::Follow { link_id } => run_follow(&paths, &config, link_id, cli.json).await,
         Command::Back => {
@@ -322,7 +323,7 @@ async fn run_interactive(
     let mut offset = page_scroll_offset(&page, &rendered);
     let mut search_query = String::new();
     let mut message = String::from(
-        "q quit · j/k scroll · m mode · o/t open tab · Tab switch · x close · f follow · i input · c click · b back · F forward · r reload",
+        "q quit · j/k scroll · m mode · o/t open tab · Tab switch · x close · X close all · f follow · i input · c click · b back · F forward · r reload",
     );
     let _guard = TerminalGuard::enter()?;
     let mut image_state = TerminalImageState::default();
@@ -526,6 +527,32 @@ async fn run_interactive(
                     }
                     Err(error) => message = error.to_string(),
                 },
+                KeyEvent {
+                    code: KeyCode::Char('X'),
+                    ..
+                } => {
+                    if prompt_input("Close all tabs? type yes: ")?
+                        .is_some_and(|answer| answer.trim().eq_ignore_ascii_case("yes"))
+                    {
+                        match close_all_tabs(&client).await {
+                            Ok(outcome) => {
+                                page = empty_page("Press o to open a URL.");
+                                rendered = render_page_document(&page, config, render_mode);
+                                tab_status = tabs_status(&client).await.unwrap_or_default();
+                                offset = page_scroll_offset(&page, &rendered);
+                                let noun = if outcome.closed_tabs.len() == 1 {
+                                    "tab"
+                                } else {
+                                    "tabs"
+                                };
+                                message = format!("closed {} {noun}", outcome.closed_tabs.len());
+                            }
+                            Err(error) => message = error.to_string(),
+                        }
+                    } else {
+                        message = "close all canceled".to_string();
+                    }
+                }
                 KeyEvent {
                     code: KeyCode::Char(ch),
                     ..
@@ -1651,6 +1678,117 @@ async fn run_session(command: &SessionCommand, paths: &ConfigPaths, json: bool) 
         unexpected => anyhow::bail!("unexpected session response: {unexpected:?}"),
     }
     Ok(0)
+}
+
+async fn run_tab(
+    command: &TabCommand,
+    paths: &ConfigPaths,
+    config: &TrowserConfig,
+    json: bool,
+) -> Result<u8> {
+    match command {
+        TabCommand::List => run_tabs(paths, json).await,
+        TabCommand::Switch { tab_id } => {
+            run_navigation(
+                paths,
+                config,
+                Request::SwitchTab {
+                    tab_id: trowser_session_models::TabId::new(tab_id.as_str()),
+                },
+                json,
+            )
+            .await
+        }
+        TabCommand::Close(args) => run_tab_close(args, paths, config, json).await,
+        TabCommand::CloseAll => run_close_all_tabs(paths, json).await,
+        TabCommand::Next => run_navigation(paths, config, Request::NextTab, json).await,
+        TabCommand::Previous => run_navigation(paths, config, Request::PreviousTab, json).await,
+    }
+}
+
+async fn run_tab_close(
+    args: &TabCloseArgs,
+    paths: &ConfigPaths,
+    config: &TrowserConfig,
+    json: bool,
+) -> Result<u8> {
+    match (args.all, args.tab_id.as_ref()) {
+        (true, None) => run_close_all_tabs(paths, json).await,
+        (true, Some(_)) => anyhow::bail!("use either a tab id or --all, not both"),
+        (false, Some(tab_id)) => {
+            run_maybe_navigation(
+                paths,
+                config,
+                Request::CloseTab {
+                    tab_id: trowser_session_models::TabId::new(tab_id.as_str()),
+                },
+                json,
+            )
+            .await
+        }
+        (false, None) => anyhow::bail!("missing tab id; pass a tab id or --all"),
+    }
+}
+
+async fn run_close_all_tabs(paths: &ConfigPaths, json: bool) -> Result<u8> {
+    let client = ensure_server(paths).await?;
+    let outcome = close_all_tabs(&client).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "closed_tabs": outcome.closed_tabs,
+                "active_tab": outcome.active_tab.as_deref(),
+            })
+        );
+    } else {
+        let noun = if outcome.closed_tabs.len() == 1 {
+            "tab"
+        } else {
+            "tabs"
+        };
+        println!("closed {} {noun}", outcome.closed_tabs.len());
+    }
+
+    Ok(0)
+}
+
+struct CloseAllTabsOutcome {
+    closed_tabs: Vec<String>,
+    active_tab: Option<String>,
+}
+
+async fn close_all_tabs(client: &TrowserClient) -> Result<CloseAllTabsOutcome> {
+    let response = client.send(&Request::ListTabs).await?;
+    let Response::Tabs(snapshot) = response else {
+        anyhow::bail!("unexpected tabs response: {response:?}");
+    };
+    let mut closed_tabs = Vec::with_capacity(snapshot.tabs.len());
+
+    for tab in snapshot.tabs {
+        let tab_id = tab.id;
+        let tab_id_text = tab_id.as_str().to_string();
+        match client.send(&Request::CloseTab { tab_id }).await? {
+            Response::Ok | Response::Opened { .. } => closed_tabs.push(tab_id_text),
+            unexpected => anyhow::bail!("unexpected close response: {unexpected:?}"),
+        }
+    }
+
+    let active_tab = current_active_tab(client).await?;
+    Ok(CloseAllTabsOutcome {
+        closed_tabs,
+        active_tab,
+    })
+}
+
+async fn current_active_tab(client: &TrowserClient) -> Result<Option<String>> {
+    let response = client.send(&Request::ListTabs).await?;
+    let Response::Tabs(snapshot) = response else {
+        anyhow::bail!("unexpected tabs response: {response:?}");
+    };
+    Ok(snapshot
+        .active_tab
+        .map(|tab_id| tab_id.as_str().to_string()))
 }
 
 async fn run_server(command: &ServerCommand, paths: &ConfigPaths, json: bool) -> Result<u8> {
