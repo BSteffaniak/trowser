@@ -1611,7 +1611,7 @@ const DOM_EXTRACTION_JS: &str = r#"
   };
   const region = (el) => {
     const container = el.closest('main, article, nav, aside, header, footer, [role="main"], [role="article"], [role="navigation"], [role="complementary"], [role="banner"], [role="contentinfo"]');
-    if (!container) return 'Main';
+    if (!container) return 'Unknown';
     const tag = container.tagName.toLowerCase();
     const role = (container.getAttribute('role') || '').toLowerCase();
     if (tag === 'main' || tag === 'article' || role === 'main' || role === 'article') return 'Main';
@@ -1697,14 +1697,16 @@ const DOM_EXTRACTION_JS: &str = r#"
     if (!el || !visible(el) || depth > 8) return null;
     const tag = el.tagName.toLowerCase();
     const style = window.getComputedStyle(el);
+    const isLayoutContainer = ['flex','inline-flex','grid','inline-grid','table','table-row','table-cell'].includes(style.display);
     const children = Array.from(el.children)
       .filter((child) => visible(child))
       .filter((child) => {
         const childTag = child.tagName.toLowerCase();
         const childStyle = window.getComputedStyle(child);
         return depth < 2
-          || ['header','nav','main','article','section','aside','footer','form','ul','ol','li','p','blockquote','pre','table','a','button','input','textarea','select'].includes(childTag)
-          || ['flex','grid','table'].includes(childStyle.display)
+          || isLayoutContainer
+          || ['div','header','nav','main','article','section','aside','footer','form','ul','ol','li','p','blockquote','pre','table','a','button','input','textarea','select'].includes(childTag)
+          || ['flex','inline-flex','grid','inline-grid','table','table-row','table-cell'].includes(childStyle.display)
           || child.getAttribute('role');
       })
       .slice(0, 80)

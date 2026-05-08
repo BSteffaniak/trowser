@@ -4,11 +4,11 @@
 
 //! Terminal rendering primitives for trowser.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use trowser_render::{
-    NAV_SUMMARY_LINK_LIMIT, SemanticBlock, SemanticLayoutNode, SemanticPage, SemanticRegion,
-    TextRun, TextRunStyle, reader_blocks, sanitize_page,
+    BlockLayout, NAV_SUMMARY_LINK_LIMIT, SemanticBlock, SemanticLayoutNode, SemanticPage,
+    SemanticRegion, TextRun, TextRunStyle, reader_blocks, sanitize_page,
 };
 use trowser_session_models::ActionId;
 use trowser_terminal_image::TerminalImageCapabilities;
@@ -423,15 +423,13 @@ fn push_browser_layout_lines(
     next_control_id: &mut usize,
     document: &mut RenderedDocument,
 ) {
-    if !page
+    let Some(root) = page
         .layout_tree
         .as_ref()
-        .is_some_and(layout_tree_has_geometry)
-    {
-        let blocks = page.blocks.iter().collect::<Vec<_>>();
-        push_blocks_with_layout(
-            &blocks,
-            RenderMode::Page,
+        .filter(|node| layout_tree_has_geometry(node))
+    else {
+        push_browser_fallback_lines(
+            page,
             width,
             options,
             next_link_id,
@@ -439,31 +437,64 @@ fn push_browser_layout_lines(
             document,
         );
         return;
+    };
+
+    let mut rendered_blocks = BTreeSet::new();
+    push_layout_node_lines(
+        root,
+        page,
+        width,
+        options,
+        next_link_id,
+        next_control_id,
+        document,
+        &mut rendered_blocks,
+    );
+
+    if rendered_blocks.len() < page.blocks.len() {
+        let remaining = page
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, block)| (!rendered_blocks.contains(&index)).then_some(block))
+            .collect::<Vec<_>>();
+        if !remaining.is_empty() {
+            let panel = render_browser_panel(
+                "unplaced",
+                &remaining,
+                width,
+                options,
+                next_link_id,
+                next_control_id,
+            );
+            document.lines.extend(panel.lines);
+        }
     }
 
-    let regions = BrowserRegions::from_page(page);
-    push_browser_full_width_panel(
-        "Top bar",
-        &regions.top,
-        width,
-        options,
-        next_link_id,
-        next_control_id,
-        document,
-    );
-    push_browser_content_panels(
-        &regions.main,
-        &regions.aside,
-        regions.content_order(),
-        width,
-        options,
-        next_link_id,
-        next_control_id,
-        document,
-    );
-    push_browser_full_width_panel(
-        "Footer",
-        &regions.footer,
+    if document.lines.is_empty() {
+        push_browser_fallback_lines(
+            page,
+            width,
+            options,
+            next_link_id,
+            next_control_id,
+            document,
+        );
+    }
+}
+
+fn push_browser_fallback_lines(
+    page: &SemanticPage,
+    width: usize,
+    options: &TerminalRenderOptions,
+    next_link_id: &mut usize,
+    next_control_id: &mut usize,
+    document: &mut RenderedDocument,
+) {
+    let blocks = page.blocks.iter().collect::<Vec<_>>();
+    push_blocks_with_layout(
+        &blocks,
+        RenderMode::Page,
         width,
         options,
         next_link_id,
@@ -476,272 +507,396 @@ fn layout_tree_has_geometry(node: &SemanticLayoutNode) -> bool {
     node.has_layout() || node.children.iter().any(layout_tree_has_geometry)
 }
 
-#[derive(Debug, Default)]
-struct BrowserRegions<'a> {
-    top: Vec<&'a SemanticBlock>,
-    main: Vec<&'a SemanticBlock>,
-    aside: Vec<&'a SemanticBlock>,
-    footer: Vec<&'a SemanticBlock>,
-    main_x: Option<f64>,
-    aside_x: Option<f64>,
-    main_y: Option<f64>,
-    aside_y: Option<f64>,
-}
-
-impl<'a> BrowserRegions<'a> {
-    fn from_page(page: &'a SemanticPage) -> Self {
-        let mut regions = Self::default();
-        for block in &page.blocks {
-            regions.push_block(block);
-        }
-        if let Some(root) = &page.layout_tree {
-            regions.apply_layout_tree(root);
-        }
-        regions
-    }
-
-    fn push_block(&mut self, block: &'a SemanticBlock) {
-        match block.region() {
-            SemanticRegion::Header | SemanticRegion::Navigation => self.top.push(block),
-            SemanticRegion::Aside => {
-                self.aside_x = min_layout_axis(self.aside_x, block.layout().map(|layout| layout.x));
-                self.aside_y = min_layout_axis(self.aside_y, block.layout().map(|layout| layout.y));
-                self.aside.push(block);
-            }
-            SemanticRegion::Footer => self.footer.push(block),
-            SemanticRegion::Main | SemanticRegion::Unknown => {
-                self.main_x = min_layout_axis(self.main_x, block.layout().map(|layout| layout.x));
-                self.main_y = min_layout_axis(self.main_y, block.layout().map(|layout| layout.y));
-                self.main.push(block);
-            }
-        }
-    }
-
-    fn apply_layout_tree(&mut self, node: &SemanticLayoutNode) {
-        if let Some(layout) = node.layout.filter(|layout| layout.is_non_empty()) {
-            match node.region {
-                SemanticRegion::Aside => {
-                    self.aside_x = min_layout_axis(self.aside_x, Some(layout.x));
-                    self.aside_y = min_layout_axis(self.aside_y, Some(layout.y));
-                }
-                SemanticRegion::Main | SemanticRegion::Unknown => {
-                    self.main_x = min_layout_axis(self.main_x, Some(layout.x));
-                    self.main_y = min_layout_axis(self.main_y, Some(layout.y));
-                }
-                SemanticRegion::Header | SemanticRegion::Navigation | SemanticRegion::Footer => {}
-            }
-        }
-        for child in &node.children {
-            self.apply_layout_tree(child);
-        }
-    }
-
-    fn content_order(&self) -> BrowserContentOrder {
-        match (self.aside_x, self.main_x) {
-            (Some(aside_x), Some(main_x)) if aside_x < main_x => BrowserContentOrder::AsideThenMain,
-            _ => BrowserContentOrder::MainThenAside,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BrowserContentOrder {
-    MainThenAside,
-    AsideThenMain,
-}
-
-fn min_layout_axis(current: Option<f64>, candidate: Option<f64>) -> Option<f64> {
-    let candidate = candidate.filter(|value| value.is_finite() && *value >= 0.0)?;
-    Some(current.map_or(candidate, |current| current.min(candidate)))
-}
-
-fn push_browser_full_width_panel(
-    title: &str,
-    blocks: &[&SemanticBlock],
-    width: usize,
-    options: &TerminalRenderOptions,
-    next_link_id: &mut usize,
-    next_control_id: &mut usize,
-    document: &mut RenderedDocument,
-) {
-    if blocks.is_empty() {
-        return;
-    }
-    let panel = render_browser_panel(title, blocks, width, options, next_link_id, next_control_id);
-    document.lines.extend(panel.lines);
-    document.lines.push(RenderedLine::default());
-}
-
 #[allow(
     clippy::too_many_arguments,
-    reason = "panel composition keeps render state explicit"
+    reason = "layout rendering needs shared hit-test counters and rendered-block tracking"
 )]
-fn push_browser_content_panels(
-    main_blocks: &[&SemanticBlock],
-    aside_blocks: &[&SemanticBlock],
-    order: BrowserContentOrder,
+fn push_layout_node_lines(
+    node: &SemanticLayoutNode,
+    page: &SemanticPage,
     width: usize,
     options: &TerminalRenderOptions,
     next_link_id: &mut usize,
     next_control_id: &mut usize,
     document: &mut RenderedDocument,
-) {
-    if main_blocks.is_empty() && aside_blocks.is_empty() {
-        return;
-    }
-    if aside_blocks.is_empty() || width < 96 {
-        push_stacked_browser_content_panels(
-            main_blocks,
-            aside_blocks,
-            order,
+    rendered_blocks: &mut BTreeSet<usize>,
+) -> bool {
+    let children = visual_layout_children(node, page, rendered_blocks);
+    if width >= 96 && is_horizontal_layout(&children) {
+        push_layout_columns(
+            &children,
+            page,
             width,
             options,
             next_link_id,
             next_control_id,
             document,
+            rendered_blocks,
         );
-        return;
+        return true;
     }
 
-    match order {
-        BrowserContentOrder::MainThenAside => push_side_by_side_browser_content_panels(
-            main_blocks,
-            aside_blocks,
-            width,
-            options,
-            next_link_id,
-            next_control_id,
-            document,
-        ),
-        BrowserContentOrder::AsideThenMain => push_side_by_side_browser_content_panels(
-            aside_blocks,
-            main_blocks,
-            width,
-            options,
-            next_link_id,
-            next_control_id,
-            document,
-        ),
-    }
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "panel composition keeps render state explicit"
-)]
-fn push_stacked_browser_content_panels(
-    main_blocks: &[&SemanticBlock],
-    aside_blocks: &[&SemanticBlock],
-    order: BrowserContentOrder,
-    width: usize,
-    options: &TerminalRenderOptions,
-    next_link_id: &mut usize,
-    next_control_id: &mut usize,
-    document: &mut RenderedDocument,
-) {
-    match order {
-        BrowserContentOrder::MainThenAside => {
-            push_browser_full_width_panel(
-                "Main",
-                main_blocks,
+    if should_descend_layout_node(node, &children, page, rendered_blocks) {
+        let mut rendered = false;
+        for child in sort_nodes_by_position(children) {
+            rendered |= push_layout_node_lines(
+                child,
+                page,
                 width,
                 options,
                 next_link_id,
                 next_control_id,
                 document,
-            );
-            push_browser_full_width_panel(
-                "Aside",
-                aside_blocks,
-                width,
-                options,
-                next_link_id,
-                next_control_id,
-                document,
+                rendered_blocks,
             );
         }
-        BrowserContentOrder::AsideThenMain => {
-            push_browser_full_width_panel(
-                "Aside",
-                aside_blocks,
-                width,
-                options,
-                next_link_id,
-                next_control_id,
-                document,
-            );
-            push_browser_full_width_panel(
-                "Main",
-                main_blocks,
-                width,
-                options,
-                next_link_id,
-                next_control_id,
-                document,
-            );
-        }
+        return rendered;
     }
-}
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "panel composition keeps render state explicit"
-)]
-fn push_side_by_side_browser_content_panels(
-    left_blocks: &[&SemanticBlock],
-    right_blocks: &[&SemanticBlock],
-    width: usize,
-    options: &TerminalRenderOptions,
-    next_link_id: &mut usize,
-    next_control_id: &mut usize,
-    document: &mut RenderedDocument,
-) {
-    let secondary_width = (width / 3).clamp(28, 44);
-    let primary_width = width.saturating_sub(secondary_width + 2).max(40);
-    let left_is_aside = panel_region(left_blocks) == Some(SemanticRegion::Aside);
-    let left_width = if left_is_aside {
-        secondary_width
-    } else {
-        primary_width
-    };
-    let right_width = if left_is_aside {
-        primary_width
-    } else {
-        secondary_width
-    };
-    let left = render_browser_panel(
-        panel_title(left_blocks),
-        left_blocks,
-        left_width,
+    push_layout_panel(
+        node,
+        page,
+        width,
         options,
         next_link_id,
         next_control_id,
-    );
-    let right = render_browser_panel(
-        panel_title(right_blocks),
-        right_blocks,
-        right_width,
-        options,
-        next_link_id,
-        next_control_id,
-    );
-    document
-        .lines
-        .extend(combine_documents_side_by_side(&left, &right, 2));
-    document.lines.push(RenderedLine::default());
+        document,
+        rendered_blocks,
+    )
 }
 
-fn panel_title(blocks: &[&SemanticBlock]) -> &'static str {
-    panel_region(blocks).map_or("Panel", |region| match region {
-        SemanticRegion::Aside => "Aside",
-        SemanticRegion::Main | SemanticRegion::Unknown => "Main",
-        SemanticRegion::Header | SemanticRegion::Navigation => "Top bar",
-        SemanticRegion::Footer => "Footer",
+fn visual_layout_children<'a>(
+    node: &'a SemanticLayoutNode,
+    page: &SemanticPage,
+    rendered_blocks: &BTreeSet<usize>,
+) -> Vec<&'a SemanticLayoutNode> {
+    node.children
+        .iter()
+        .filter(|child| child.has_layout())
+        .filter(|child| layout_node_has_unrendered_content(child, page, rendered_blocks))
+        .collect()
+}
+
+fn layout_node_has_unrendered_content(
+    node: &SemanticLayoutNode,
+    page: &SemanticPage,
+    rendered_blocks: &BTreeSet<usize>,
+) -> bool {
+    node_has_own_content(node)
+        || page.blocks.iter().enumerate().any(|(index, block)| {
+            !rendered_blocks.contains(&index) && layout_node_contains_block(node, block)
+        })
+        || node
+            .children
+            .iter()
+            .any(|child| layout_node_has_unrendered_content(child, page, rendered_blocks))
+}
+
+fn node_has_own_content(node: &SemanticLayoutNode) -> bool {
+    !node.text.trim().is_empty()
+        || !node.runs.is_empty()
+        || node.action_id.is_some()
+        || !node.url.trim().is_empty()
+        || !node.control_type.trim().is_empty()
+}
+
+fn is_horizontal_layout(children: &[&SemanticLayoutNode]) -> bool {
+    if children.len() < 2 {
+        return false;
+    }
+
+    let sorted = sort_nodes_left_to_right(children.to_vec());
+    sorted.windows(2).any(|pair| {
+        let Some(left) = pair[0].layout else {
+            return false;
+        };
+        let Some(right) = pair[1].layout else {
+            return false;
+        };
+        vertically_aligned(left, right) && horizontally_distinct(left, right)
     })
 }
 
-fn panel_region(blocks: &[&SemanticBlock]) -> Option<SemanticRegion> {
-    blocks.first().map(|block| block.region())
+fn vertically_aligned(left: BlockLayout, right: BlockLayout) -> bool {
+    let overlap = axis_overlap(
+        left.y,
+        left.y + left.height,
+        right.y,
+        right.y + right.height,
+    );
+    let shorter = left.height.min(right.height).max(1.0);
+    overlap / shorter >= 0.25
+}
+
+fn horizontally_distinct(left: BlockLayout, right: BlockLayout) -> bool {
+    let center_distance = (layout_center_x(left) - layout_center_x(right)).abs();
+    let narrower = left.width.min(right.width).max(1.0);
+    let overlap = axis_overlap(left.x, left.x + left.width, right.x, right.x + right.width);
+    center_distance >= narrower * 0.5 && overlap / narrower <= 0.65
+}
+
+fn axis_overlap(left_start: f64, left_end: f64, right_start: f64, right_end: f64) -> f64 {
+    (left_end.min(right_end) - left_start.max(right_start)).max(0.0)
+}
+
+fn layout_center_x(layout: BlockLayout) -> f64 {
+    layout.x + layout.width / 2.0
+}
+
+fn sort_nodes_by_position(mut nodes: Vec<&SemanticLayoutNode>) -> Vec<&SemanticLayoutNode> {
+    nodes.sort_by(|left, right| compare_layout_nodes(left, right));
+    nodes
+}
+
+fn sort_nodes_left_to_right(mut nodes: Vec<&SemanticLayoutNode>) -> Vec<&SemanticLayoutNode> {
+    nodes.sort_by(|left, right| {
+        let left_layout = left.layout.unwrap_or_default();
+        let right_layout = right.layout.unwrap_or_default();
+        left_layout
+            .x
+            .total_cmp(&right_layout.x)
+            .then_with(|| left_layout.y.total_cmp(&right_layout.y))
+    });
+    nodes
+}
+
+fn compare_layout_nodes(
+    left: &SemanticLayoutNode,
+    right: &SemanticLayoutNode,
+) -> std::cmp::Ordering {
+    let left_layout = left.layout.unwrap_or_default();
+    let right_layout = right.layout.unwrap_or_default();
+    left_layout
+        .y
+        .total_cmp(&right_layout.y)
+        .then_with(|| left_layout.x.total_cmp(&right_layout.x))
+}
+
+fn should_descend_layout_node(
+    node: &SemanticLayoutNode,
+    children: &[&SemanticLayoutNode],
+    page: &SemanticPage,
+    rendered_blocks: &BTreeSet<usize>,
+) -> bool {
+    if children.is_empty() {
+        return false;
+    }
+
+    if matches!(node.tag.as_str(), "body" | "html") || children.len() == 1 {
+        return true;
+    }
+
+    if is_layout_container(node) || is_horizontal_layout(children) {
+        return true;
+    }
+
+    unrendered_blocks_in_node(node, page, rendered_blocks).is_empty()
+}
+
+fn is_layout_container(node: &SemanticLayoutNode) -> bool {
+    matches!(
+        node.display.as_str(),
+        "flex" | "inline-flex" | "grid" | "inline-grid"
+    ) || node.tag == "main"
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "column rendering needs shared hit-test counters and rendered-block tracking"
+)]
+fn push_layout_columns(
+    children: &[&SemanticLayoutNode],
+    page: &SemanticPage,
+    width: usize,
+    options: &TerminalRenderOptions,
+    next_link_id: &mut usize,
+    next_control_id: &mut usize,
+    document: &mut RenderedDocument,
+    rendered_blocks: &mut BTreeSet<usize>,
+) {
+    let sorted = sort_nodes_left_to_right(children.to_vec());
+    let column_widths = projected_column_widths(&sorted, width, 2);
+    let columns = sorted
+        .iter()
+        .zip(column_widths)
+        .filter_map(|(child, column_width)| {
+            let mut column = RenderedDocument::default();
+            let rendered = push_layout_node_lines(
+                child,
+                page,
+                column_width,
+                options,
+                next_link_id,
+                next_control_id,
+                &mut column,
+                rendered_blocks,
+            );
+            rendered.then_some(column)
+        })
+        .collect::<Vec<_>>();
+
+    if columns.is_empty() {
+        return;
+    }
+
+    document
+        .lines
+        .extend(combine_documents_columns(&columns, 2));
+    document.lines.push(RenderedLine::default());
+}
+
+fn projected_column_widths(
+    children: &[&SemanticLayoutNode],
+    width: usize,
+    gap: usize,
+) -> Vec<usize> {
+    let available = width.saturating_sub(gap.saturating_mul(children.len().saturating_sub(1)));
+    if children.is_empty() {
+        return Vec::new();
+    }
+    if available < children.len().saturating_mul(MIN_BLOCK_WIDTH) {
+        return vec![available / children.len(); children.len()];
+    }
+
+    let total_css_width = children
+        .iter()
+        .filter_map(|child| child.layout.map(|layout| layout.width.max(0.0)))
+        .sum::<f64>()
+        .max(1.0);
+    let available_f64 = f64::from(u32::try_from(available).unwrap_or(u32::MAX));
+    let mut widths = children
+        .iter()
+        .map(|child| {
+            child.layout.map_or(MIN_BLOCK_WIDTH, |layout| {
+                rounded_terminal_cells((layout.width.max(0.0) / total_css_width) * available_f64)
+            })
+        })
+        .map(|column_width| column_width.max(MIN_BLOCK_WIDTH))
+        .collect::<Vec<_>>();
+
+    normalize_column_widths(&mut widths, available);
+    widths
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "browser CSS geometry must be projected onto integer terminal cells"
+)]
+fn rounded_terminal_cells(value: f64) -> usize {
+    if !value.is_finite() || value <= 0.0 {
+        return 0;
+    }
+    value.round() as usize
+}
+
+fn normalize_column_widths(widths: &mut [usize], available: usize) {
+    let mut total = widths.iter().sum::<usize>();
+    while total > available {
+        let Some((index, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, width)| **width > MIN_BLOCK_WIDTH)
+            .max_by_key(|(_, width)| **width)
+        else {
+            break;
+        };
+        widths[index] -= 1;
+        total -= 1;
+    }
+
+    while total < available {
+        let Some((index, _)) = widths.iter().enumerate().max_by_key(|(_, width)| **width) else {
+            break;
+        };
+        widths[index] += 1;
+        total += 1;
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "panel rendering needs shared hit-test counters and rendered-block tracking"
+)]
+fn push_layout_panel(
+    node: &SemanticLayoutNode,
+    page: &SemanticPage,
+    width: usize,
+    options: &TerminalRenderOptions,
+    next_link_id: &mut usize,
+    next_control_id: &mut usize,
+    document: &mut RenderedDocument,
+    rendered_blocks: &mut BTreeSet<usize>,
+) -> bool {
+    let block_indices = unrendered_blocks_in_node(node, page, rendered_blocks);
+    if block_indices.is_empty() {
+        return false;
+    }
+
+    let blocks = block_indices
+        .iter()
+        .filter_map(|index| page.blocks.get(*index))
+        .collect::<Vec<_>>();
+    for index in block_indices {
+        rendered_blocks.insert(index);
+    }
+
+    let panel = render_browser_panel(
+        &layout_panel_title(node),
+        &blocks,
+        width,
+        options,
+        next_link_id,
+        next_control_id,
+    );
+    document.lines.extend(panel.lines);
+    document.lines.push(RenderedLine::default());
+    true
+}
+
+fn unrendered_blocks_in_node(
+    node: &SemanticLayoutNode,
+    page: &SemanticPage,
+    rendered_blocks: &BTreeSet<usize>,
+) -> Vec<usize> {
+    page.blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| {
+            (!rendered_blocks.contains(&index) && layout_node_contains_block(node, block))
+                .then_some(index)
+        })
+        .collect()
+}
+
+fn layout_node_contains_block(node: &SemanticLayoutNode, block: &SemanticBlock) -> bool {
+    let Some(node_layout) = node.layout.filter(|layout| layout.is_non_empty()) else {
+        return false;
+    };
+    let Some(block_layout) = block.layout().filter(|layout| layout.is_non_empty()) else {
+        return false;
+    };
+    let center_x = block_layout.x + block_layout.width / 2.0;
+    let center_y = block_layout.y + block_layout.height / 2.0;
+    rect_contains_point(node_layout, center_x, center_y)
+}
+
+fn rect_contains_point(rect: BlockLayout, x: f64, y: f64) -> bool {
+    const TOLERANCE_PX: f64 = 2.0;
+    x >= rect.x - TOLERANCE_PX
+        && x <= rect.x + rect.width + TOLERANCE_PX
+        && y >= rect.y - TOLERANCE_PX
+        && y <= rect.y + rect.height + TOLERANCE_PX
+}
+
+fn layout_panel_title(node: &SemanticLayoutNode) -> String {
+    if !node.tag.trim().is_empty() {
+        return node.tag.clone();
+    }
+    if !node.role.trim().is_empty() {
+        return node.role.clone();
+    }
+    "box".to_string()
 }
 
 fn render_browser_panel(
@@ -823,84 +978,91 @@ fn boxed_spans(line: &RenderedLine, clipped: &str, pad: usize) -> Vec<StyledSpan
     ]
 }
 
-fn combine_documents_side_by_side(
-    left: &RenderedDocument,
-    right: &RenderedDocument,
-    gap: usize,
-) -> Vec<RenderedLine> {
-    let left_width = document_width(left);
-    let rows = left.lines.len().max(right.lines.len());
+fn combine_documents_columns(columns: &[RenderedDocument], gap: usize) -> Vec<RenderedLine> {
+    let widths = columns.iter().map(document_width).collect::<Vec<_>>();
+    let rows = columns
+        .iter()
+        .map(|column| column.lines.len())
+        .max()
+        .unwrap_or_default();
+
     (0..rows)
-        .map(|row| combine_document_row(left, right, row, left_width, gap))
+        .map(|row| combine_document_columns_row(columns, &widths, row, gap))
         .collect()
 }
 
-fn combine_document_row(
-    left: &RenderedDocument,
-    right: &RenderedDocument,
+fn combine_document_columns_row(
+    columns: &[RenderedDocument],
+    widths: &[usize],
     row: usize,
-    left_width: usize,
     gap: usize,
 ) -> RenderedLine {
-    let left_line = left.lines.get(row).cloned().unwrap_or_default();
-    let right_line = right.lines.get(row).cloned().unwrap_or_default();
-    let filler = left_width.saturating_sub(left_line.text.chars().count()) + gap;
-    let text = format!(
-        "{}{}{}",
-        left_line.text,
-        " ".repeat(filler),
-        right_line.text
-    );
+    let mut text = String::new();
+    let mut spans = Vec::new();
+    let mut links = Vec::new();
+    let mut controls = Vec::new();
+    let mut offset = 0usize;
+
+    for (index, column) in columns.iter().enumerate() {
+        let line = column.lines.get(row).cloned().unwrap_or_default();
+        let width = widths.get(index).copied().unwrap_or_default();
+        let filler = width.saturating_sub(line.text.chars().count());
+        append_column_line(
+            &line,
+            filler,
+            offset,
+            &mut text,
+            &mut spans,
+            &mut links,
+            &mut controls,
+        );
+        offset = offset.saturating_add(width);
+
+        if index + 1 < columns.len() {
+            text.push_str(&" ".repeat(gap));
+            spans.push(StyledSpan {
+                text: " ".repeat(gap),
+                style: SpanStyle::Normal,
+            });
+            offset = offset.saturating_add(gap);
+        }
+    }
+
     RenderedLine {
-        spans: combined_spans(&left_line, &right_line, filler),
-        links: combine_links(&left_line, &right_line, left_width + gap),
-        controls: combine_controls(&left_line, &right_line, left_width + gap),
         text,
+        spans,
+        links,
+        controls,
     }
 }
 
-fn combined_spans(left: &RenderedLine, right: &RenderedLine, filler: usize) -> Vec<StyledSpan> {
-    let mut spans = if left.spans.is_empty() {
-        vec![StyledSpan {
-            text: left.text.clone(),
-            style: SpanStyle::Normal,
-        }]
-    } else {
-        left.spans.clone()
-    };
-    spans.push(StyledSpan {
-        text: " ".repeat(filler),
-        style: SpanStyle::Normal,
-    });
-    spans.extend(if right.spans.is_empty() {
-        vec![StyledSpan {
-            text: right.text.clone(),
-            style: SpanStyle::Normal,
-        }]
-    } else {
-        right.spans.clone()
-    });
-    spans
-}
-
-fn combine_links(left: &RenderedLine, right: &RenderedLine, offset: usize) -> Vec<LinkHitbox> {
-    left.links
-        .iter()
-        .cloned()
-        .chain(offset_links(&right.links, offset))
-        .collect()
-}
-
-fn combine_controls(
-    left: &RenderedLine,
-    right: &RenderedLine,
+fn append_column_line(
+    line: &RenderedLine,
+    filler: usize,
     offset: usize,
-) -> Vec<ControlHitbox> {
-    left.controls
-        .iter()
-        .cloned()
-        .chain(offset_controls(&right.controls, offset))
-        .collect()
+    text: &mut String,
+    spans: &mut Vec<StyledSpan>,
+    links: &mut Vec<LinkHitbox>,
+    controls: &mut Vec<ControlHitbox>,
+) {
+    text.push_str(&line.text);
+    if line.spans.is_empty() {
+        spans.push(StyledSpan {
+            text: line.text.clone(),
+            style: SpanStyle::Normal,
+        });
+    } else {
+        spans.extend(line.spans.clone());
+    }
+    if filler > 0 {
+        text.push_str(&" ".repeat(filler));
+        spans.push(StyledSpan {
+            text: " ".repeat(filler),
+            style: SpanStyle::Normal,
+        });
+    }
+    links.extend(offset_links(&line.links, offset));
+    controls.extend(offset_controls(&line.controls, offset));
 }
 
 fn offset_links(links: &[LinkHitbox], offset: usize) -> Vec<LinkHitbox> {
@@ -1930,8 +2092,10 @@ fn pad_to_width(output: &mut String, width: usize, used: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{TerminalRenderOptions, render_plain_text};
-    use trowser_render::{BlockLayout, SemanticBlock, SemanticPage, SemanticRegion};
+    use super::{RenderMode, TerminalRenderOptions, render_document_mode, render_plain_text};
+    use trowser_render::{
+        BlockLayout, SemanticBlock, SemanticLayoutNode, SemanticPage, SemanticRegion,
+    };
 
     #[test]
     fn renders_semantic_text() {
@@ -1974,5 +2138,185 @@ mod tests {
 
         let rendered = render_plain_text(&page, &TerminalRenderOptions::default());
         assert!(rendered.contains("      Indented"));
+    }
+
+    #[test]
+    fn browser_mode_orders_generic_div_columns_by_geometry() {
+        let page = generic_two_column_page(0.0, 288.0);
+
+        let rendered = render_document_mode(
+            &page,
+            &TerminalRenderOptions {
+                width: 120,
+                ..TerminalRenderOptions::default()
+            },
+            RenderMode::Browser,
+        )
+        .to_plain_text();
+
+        let content_line = rendered
+            .lines()
+            .find(|line| line.contains("Sidebar links") && line.contains("Article content"))
+            .expect("side-by-side content line");
+        assert!(
+            content_line.find("Sidebar links") < content_line.find("Article content"),
+            "sidebar should render left of content: {content_line}"
+        );
+    }
+
+    #[test]
+    fn browser_mode_orders_right_rail_after_content_by_geometry() {
+        let page = generic_two_column_page(900.0, 0.0);
+
+        let rendered = render_document_mode(
+            &page,
+            &TerminalRenderOptions {
+                width: 120,
+                ..TerminalRenderOptions::default()
+            },
+            RenderMode::Browser,
+        )
+        .to_plain_text();
+
+        let content_line = rendered
+            .lines()
+            .find(|line| line.contains("Sidebar links") && line.contains("Article content"))
+            .expect("side-by-side content line");
+        assert!(
+            content_line.find("Article content") < content_line.find("Sidebar links"),
+            "content should render left of right rail: {content_line}"
+        );
+    }
+
+    #[test]
+    fn browser_mode_stacks_narrow_columns_in_visual_order() {
+        let page = generic_two_column_page(0.0, 288.0);
+
+        let rendered = render_document_mode(
+            &page,
+            &TerminalRenderOptions {
+                width: 80,
+                ..TerminalRenderOptions::default()
+            },
+            RenderMode::Browser,
+        )
+        .to_plain_text();
+
+        assert!(
+            rendered.find("Sidebar links") < rendered.find("Article content"),
+            "narrow browser mode should stack left column before right column: {rendered}"
+        );
+    }
+
+    #[test]
+    fn browser_mode_ignores_full_width_wrappers_for_column_order() {
+        let mut page = generic_two_column_page(0.0, 288.0);
+        if let Some(root) = page.layout_tree.as_mut() {
+            root.region = SemanticRegion::Main;
+            if let Some(wrapper) = root.children.first_mut() {
+                wrapper.region = SemanticRegion::Main;
+            }
+        }
+
+        let rendered = render_document_mode(
+            &page,
+            &TerminalRenderOptions {
+                width: 120,
+                ..TerminalRenderOptions::default()
+            },
+            RenderMode::Browser,
+        )
+        .to_plain_text();
+
+        let content_line = rendered
+            .lines()
+            .find(|line| line.contains("Sidebar links") && line.contains("Article content"))
+            .expect("side-by-side content line");
+        assert!(
+            content_line.find("Sidebar links") < content_line.find("Article content"),
+            "full-width wrappers must not force content before sidebar: {content_line}"
+        );
+    }
+
+    fn generic_two_column_page(sidebar_x: f64, content_x: f64) -> SemanticPage {
+        let sidebar_layout = BlockLayout {
+            x: sidebar_x,
+            y: 80.0,
+            width: 240.0,
+            height: 600.0,
+        };
+        let content_layout = BlockLayout {
+            x: content_x,
+            y: 80.0,
+            width: 840.0,
+            height: 600.0,
+        };
+        SemanticPage {
+            url: String::new(),
+            title: String::new(),
+            blocks: vec![
+                SemanticBlock::Paragraph {
+                    text: "Sidebar links".to_string(),
+                    layout: Some(BlockLayout {
+                        x: sidebar_x + 16.0,
+                        y: 120.0,
+                        width: 180.0,
+                        height: 24.0,
+                    }),
+                    region: SemanticRegion::Unknown,
+                },
+                SemanticBlock::Paragraph {
+                    text: "Article content".to_string(),
+                    layout: Some(BlockLayout {
+                        x: content_x + 32.0,
+                        y: 120.0,
+                        width: 600.0,
+                        height: 24.0,
+                    }),
+                    region: SemanticRegion::Unknown,
+                },
+            ],
+            layout_tree: Some(SemanticLayoutNode {
+                tag: "body".to_string(),
+                region: SemanticRegion::Unknown,
+                layout: Some(BlockLayout {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1200.0,
+                    height: 800.0,
+                }),
+                display: "block".to_string(),
+                children: vec![SemanticLayoutNode {
+                    tag: "div".to_string(),
+                    region: SemanticRegion::Unknown,
+                    layout: Some(BlockLayout {
+                        x: 0.0,
+                        y: 80.0,
+                        width: 1200.0,
+                        height: 600.0,
+                    }),
+                    display: "flex".to_string(),
+                    children: vec![
+                        SemanticLayoutNode {
+                            tag: "div".to_string(),
+                            region: SemanticRegion::Unknown,
+                            layout: Some(sidebar_layout),
+                            display: "block".to_string(),
+                            ..SemanticLayoutNode::default()
+                        },
+                        SemanticLayoutNode {
+                            tag: "div".to_string(),
+                            region: SemanticRegion::Unknown,
+                            layout: Some(content_layout),
+                            display: "block".to_string(),
+                            ..SemanticLayoutNode::default()
+                        },
+                    ],
+                    ..SemanticLayoutNode::default()
+                }],
+                ..SemanticLayoutNode::default()
+            }),
+            viewport: None,
+        }
     }
 }
