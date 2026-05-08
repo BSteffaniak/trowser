@@ -35,7 +35,7 @@ use trowser_terminal::{
     ControlHitboxAction, RenderMode, RenderedDocument, SpanStyle, TerminalRenderOptions,
     render_document_mode, render_plain_text,
 };
-use trowser_terminal_image::detect_from_env;
+use trowser_terminal_image::{PngImagePlacement, detect_from_env, encode_png_image};
 
 mod trace;
 
@@ -1193,6 +1193,7 @@ fn draw_viewport(
     let (width, height) = size()?;
     let body_height = height.saturating_sub(2);
     let mut out = stdout();
+    let image_capabilities = detect_from_env();
     let scroll = scroll_percent(document, offset);
     let title = if page.title.is_empty() {
         page.url.as_str()
@@ -1222,6 +1223,7 @@ fn draw_viewport(
         if let Some(line) = line {
             let is_focused = row == 0 && line_target(line).is_some();
             queue_styled_line(&mut out, line, width, is_focused)?;
+            queue_line_images(&mut out, line, row.saturating_add(1), &image_capabilities)?;
         }
     }
 
@@ -1274,6 +1276,39 @@ fn queue_styled_line<W: Write>(
         queue!(out, Print(text))?;
     }
     queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
+    Ok(())
+}
+
+fn queue_line_images<W: Write>(
+    out: &mut W,
+    line: &trowser_terminal::RenderedLine,
+    row: u16,
+    capabilities: &trowser_terminal_image::TerminalImageCapabilities,
+) -> Result<()> {
+    if line.images.is_empty() || capabilities.preferred_png_protocol().is_none() {
+        return Ok(());
+    }
+    for (index, image) in line.images.iter().enumerate() {
+        if image.mime_type != "image/png" {
+            continue;
+        }
+        let image_id = u32::from(row)
+            .saturating_mul(1024)
+            .saturating_add(u32::try_from(index + 1).unwrap_or(u32::MAX));
+        let placement = PngImagePlacement {
+            data: &image.data,
+            row,
+            col: image.start_col,
+            pixel_width: image.pixel_width,
+            pixel_height: image.pixel_height,
+            cell_width: image.cell_width,
+            cell_height: image.cell_height,
+            image_id,
+        };
+        if let Some(encoded) = encode_png_image(capabilities, &placement) {
+            out.write_all(&encoded)?;
+        }
+    }
     Ok(())
 }
 

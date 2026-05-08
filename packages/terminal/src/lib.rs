@@ -7,8 +7,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use trowser_render::{
-    BlockLayout, NAV_SUMMARY_LINK_LIMIT, SemanticBlock, SemanticLayoutNode, SemanticPage,
-    SemanticRegion, TextRun, TextRunStyle, reader_blocks, sanitize_page,
+    BlockLayout, ImagePreview, MediaKind, NAV_SUMMARY_LINK_LIMIT, SemanticBlock,
+    SemanticLayoutNode, SemanticPage, SemanticRegion, TextRun, TextRunStyle, reader_blocks,
+    sanitize_page,
 };
 use trowser_session_models::ActionId;
 use trowser_terminal_image::TerminalImageCapabilities;
@@ -103,8 +104,29 @@ pub struct RenderedLine {
     pub links: Vec<LinkHitbox>,
     /// Form-control hitboxes on this line.
     pub controls: Vec<ControlHitbox>,
+    /// Inline images anchored on this line.
+    pub images: Vec<RenderedImage>,
     /// Browser source y-coordinate for scroll/anchor synchronization.
     pub source_y_px: Option<u32>,
+}
+
+/// Terminal image payload anchored to a rendered line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedImage {
+    /// MIME type of the image payload.
+    pub mime_type: String,
+    /// Encoded image bytes.
+    pub data: Vec<u8>,
+    /// Pixel width of the image.
+    pub pixel_width: u32,
+    /// Pixel height of the image.
+    pub pixel_height: u32,
+    /// Desired terminal cell width.
+    pub cell_width: u16,
+    /// Desired terminal cell height.
+    pub cell_height: u16,
+    /// Start column on the rendered line.
+    pub start_col: u16,
 }
 
 /// A styled text span.
@@ -633,6 +655,8 @@ fn node_has_own_content(node: &SemanticLayoutNode) -> bool {
         || node.action_id.is_some()
         || !node.url.trim().is_empty()
         || !node.control_type.trim().is_empty()
+        || node.media_kind != MediaKind::Unknown
+        || !node.source_url.trim().is_empty()
 }
 
 fn is_horizontal_layout(children: &[&SemanticLayoutNode]) -> bool {
@@ -988,6 +1012,7 @@ fn box_content_line(line: &RenderedLine, width: usize) -> RenderedLine {
         spans: boxed_spans(line, &clipped, pad),
         links: offset_links(&line.links, 2),
         controls: offset_controls(&line.controls, 2),
+        images: offset_images(&line.images, 2),
         source_y_px: line.source_y_px,
         text,
     }
@@ -1037,6 +1062,7 @@ fn combine_document_columns_row(
     let mut spans = Vec::new();
     let mut links = Vec::new();
     let mut controls = Vec::new();
+    let mut images = Vec::new();
     let mut offset = 0usize;
 
     for (index, column) in columns.iter().enumerate() {
@@ -1051,6 +1077,7 @@ fn combine_document_columns_row(
             &mut spans,
             &mut links,
             &mut controls,
+            &mut images,
         );
         offset = offset.saturating_add(width);
 
@@ -1069,6 +1096,7 @@ fn combine_document_columns_row(
         spans,
         links,
         controls,
+        images,
         source_y_px: row_source_y_px(columns, row),
     }
 }
@@ -1080,6 +1108,10 @@ fn row_source_y_px(columns: &[RenderedDocument], row: usize) -> Option<u32> {
         .min()
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "column composition appends multiple independent rendered metadata streams"
+)]
 fn append_column_line(
     line: &RenderedLine,
     filler: usize,
@@ -1088,6 +1120,7 @@ fn append_column_line(
     spans: &mut Vec<StyledSpan>,
     links: &mut Vec<LinkHitbox>,
     controls: &mut Vec<ControlHitbox>,
+    images: &mut Vec<RenderedImage>,
 ) {
     text.push_str(&line.text);
     if line.spans.is_empty() {
@@ -1107,6 +1140,7 @@ fn append_column_line(
     }
     links.extend(offset_links(&line.links, offset));
     controls.extend(offset_controls(&line.controls, offset));
+    images.extend(offset_images(&line.images, offset));
 }
 
 fn offset_links(links: &[LinkHitbox], offset: usize) -> Vec<LinkHitbox> {
@@ -1130,6 +1164,21 @@ fn offset_controls(controls: &[ControlHitbox], offset: usize) -> Vec<ControlHitb
             action: control.action,
             start_col: offset_col(control.start_col, offset),
             end_col: offset_col(control.end_col, offset),
+        })
+        .collect()
+}
+
+fn offset_images(images: &[RenderedImage], offset: usize) -> Vec<RenderedImage> {
+    images
+        .iter()
+        .map(|image| RenderedImage {
+            mime_type: image.mime_type.clone(),
+            data: image.data.clone(),
+            pixel_width: image.pixel_width,
+            pixel_height: image.pixel_height,
+            cell_width: image.cell_width,
+            cell_height: image.cell_height,
+            start_col: offset_col(image.start_col, offset),
         })
         .collect()
 }
@@ -1160,6 +1209,7 @@ fn line_with_style(text: String, style: SpanStyle) -> RenderedLine {
         text,
         links: Vec::new(),
         controls: Vec::new(),
+        images: Vec::new(),
         source_y_px: None,
     }
 }
@@ -1276,12 +1326,42 @@ fn push_outline_lines(
                     control_action(control_type),
                 );
             }
+            SemanticBlock::Media {
+                action_id,
+                media_kind,
+                label,
+                source_url,
+                ..
+            } => {
+                let control_id = u32::try_from(*next_control_id).unwrap_or(u32::MAX);
+                if action_id.is_some() {
+                    *next_control_id += 1;
+                }
+                let label = media_outline_label(*media_kind, label, source_url);
+                if action_id.is_some() {
+                    push_wrapped_control_lines(
+                        document,
+                        &format!("[media {control_id}] {label}"),
+                        0,
+                        width,
+                        control_id,
+                        action_id.clone(),
+                        ControlHitboxAction::Click,
+                    );
+                } else {
+                    push_wrapped_lines(document, &label, 0, width, None);
+                }
+            }
             _ => {}
         }
     }
     document.lines.push(RenderedLine::default());
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "reader block rendering is an exhaustive semantic variant dispatcher"
+)]
 fn push_reader_block_lines(
     block: &SemanticBlock,
     next_link_id: &mut usize,
@@ -1370,8 +1450,56 @@ fn push_reader_block_lines(
             url,
             width,
             height,
+            preview,
             ..
-        } => push_image_block_lines(document, alt, url, *width, *height, placement, options),
+        } => push_image_block_lines(
+            document,
+            alt,
+            url,
+            *width,
+            *height,
+            preview.as_ref(),
+            placement,
+            options,
+        ),
+        SemanticBlock::Media {
+            action_id,
+            media_kind,
+            label,
+            source_url,
+            poster_url,
+            sources,
+            width,
+            height,
+            duration_seconds,
+            current_time_seconds,
+            paused,
+            muted,
+            controls,
+            autoplay,
+            preview,
+            ..
+        } => push_media_block_lines(
+            document,
+            action_id.as_ref(),
+            *media_kind,
+            label,
+            source_url,
+            poster_url,
+            sources,
+            *width,
+            *height,
+            *duration_seconds,
+            *current_time_seconds,
+            *paused,
+            *muted,
+            *controls,
+            *autoplay,
+            preview.as_ref(),
+            placement,
+            options,
+            next_control_id,
+        ),
         SemanticBlock::FormControl {
             action_id,
             label,
@@ -1442,18 +1570,151 @@ fn push_link_block_lines(
     document.lines.push(RenderedLine::default());
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "image render blocks expose explicit browser-derived fields"
+)]
 fn push_image_block_lines(
     document: &mut RenderedDocument,
     alt: &str,
     url: &str,
     width: Option<u32>,
     height: Option<u32>,
+    preview: Option<&ImagePreview>,
     placement: ReaderPlacement,
     options: &TerminalRenderOptions,
 ) {
+    let start_line = document.lines.len();
     let mut output = String::new();
-    render_image_box(alt, url, width, height, placement, options, &mut output);
+    render_image_box(
+        alt,
+        url,
+        width,
+        height,
+        preview,
+        placement,
+        options,
+        &mut output,
+    );
     push_text_lines(document, &output, None);
+    attach_preview_image(document, start_line, preview, placement, options);
+}
+
+#[allow(
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_arguments,
+    reason = "media render blocks expose explicit browser-derived state"
+)]
+fn push_media_block_lines(
+    document: &mut RenderedDocument,
+    action_id: Option<&ActionId>,
+    media_kind: MediaKind,
+    label: &str,
+    source_url: &str,
+    poster_url: &str,
+    sources: &[trowser_render::MediaSource],
+    width: Option<u32>,
+    height: Option<u32>,
+    duration_seconds: Option<u32>,
+    current_time_seconds: Option<u32>,
+    paused: bool,
+    muted: bool,
+    controls: bool,
+    autoplay: bool,
+    preview: Option<&ImagePreview>,
+    placement: ReaderPlacement,
+    options: &TerminalRenderOptions,
+    next_control_id: &mut usize,
+) {
+    let control_id = u32::try_from(*next_control_id).unwrap_or(u32::MAX);
+    if action_id.is_some() {
+        *next_control_id += 1;
+    }
+    let mut output = String::new();
+    render_media_box(
+        media_kind,
+        label,
+        source_url,
+        poster_url,
+        sources,
+        width,
+        height,
+        duration_seconds,
+        current_time_seconds,
+        paused,
+        muted,
+        controls,
+        autoplay,
+        preview,
+        action_id.map(|_| control_id),
+        placement,
+        options,
+        &mut output,
+    );
+    let start_line = document.lines.len();
+    push_text_lines(document, &output, None);
+    attach_preview_image(document, start_line, preview, placement, options);
+    if action_id.is_some()
+        && let Some(line) = document
+            .lines
+            .iter_mut()
+            .rev()
+            .find(|line| line.text.contains("[media "))
+    {
+        line.controls.push(ControlHitbox {
+            control_id,
+            action_id: action_id.cloned(),
+            action: ControlHitboxAction::Click,
+            start_col: u16::try_from(placement.indent).unwrap_or(u16::MAX),
+            end_col: u16::try_from(line.text.chars().count()).unwrap_or(u16::MAX),
+        });
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "preview pixel aspect ratio is clamped to a small terminal cell height"
+)]
+fn attach_preview_image(
+    document: &mut RenderedDocument,
+    start_line: usize,
+    preview: Option<&ImagePreview>,
+    placement: ReaderPlacement,
+    options: &TerminalRenderOptions,
+) {
+    let Some(preview) = preview.filter(|preview| {
+        !preview.is_empty()
+            && preview.mime_type == "image/png"
+            && options
+                .image_capabilities
+                .preferred_png_protocol()
+                .is_some()
+    }) else {
+        return;
+    };
+    let Some(line) = document.lines.iter_mut().skip(start_line).find(|line| {
+        let trimmed = line.text.trim_start();
+        trimmed.starts_with('│') || trimmed.contains("preview:")
+    }) else {
+        return;
+    };
+    let pixel_width = preview.width.unwrap_or(1).max(1);
+    let pixel_height = preview.height.unwrap_or(1).max(1);
+    let cell_width = u16::try_from(placement.width.saturating_sub(4).clamp(10, 80))
+        .unwrap_or(u16::MAX)
+        .max(1);
+    let ratio = f64::from(pixel_height) / f64::from(pixel_width);
+    let cell_height = ((f64::from(cell_width) * ratio / 2.0).round() as u16).clamp(1, 24);
+    line.images.push(RenderedImage {
+        mime_type: preview.mime_type.clone(),
+        data: preview.data.clone(),
+        pixel_width,
+        pixel_height,
+        cell_width,
+        cell_height,
+        start_col: u16::try_from(placement.indent.saturating_add(2)).unwrap_or(u16::MAX),
+    });
 }
 
 fn push_form_control_block_lines(
@@ -1643,6 +1904,7 @@ fn push_inline_cells_line(document: &mut RenderedDocument, cells: &[InlineCell])
         spans,
         links,
         controls: Vec::new(),
+        images: Vec::new(),
         source_y_px: None,
     });
 }
@@ -1839,6 +2101,7 @@ fn push_wrapped_lines(
             text,
             links,
             controls: Vec::new(),
+            images: Vec::new(),
             source_y_px: None,
         });
     }
@@ -1873,6 +2136,7 @@ fn push_wrapped_control_lines(
             }],
             text,
             links: Vec::new(),
+            images: Vec::new(),
             source_y_px: None,
         });
     }
@@ -1918,6 +2182,7 @@ fn push_text_lines(
             text,
             links,
             controls: Vec::new(),
+            images: Vec::new(),
             source_y_px: None,
         });
     }
@@ -2034,21 +2299,22 @@ fn css_pixels_to_cells(value: f64, cell_size: f64, minimum: f64) -> usize {
     (value / cell_size).round().max(minimum) as usize
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "image boxes render explicit browser-derived fields"
+)]
 fn render_image_box(
     alt: &str,
     url: &str,
     image_width: Option<u32>,
     image_height: Option<u32>,
+    preview: Option<&ImagePreview>,
     placement: ReaderPlacement,
     options: &TerminalRenderOptions,
     output: &mut String,
 ) {
     let box_width = placement.width.clamp(40, 72);
-    let title = if options.image_capabilities.supports_images() {
-        "image available"
-    } else {
-        "image"
-    };
+    let title = image_title(preview, options);
     let dimensions = image_width
         .zip(image_height)
         .map(|(width, height)| format!(" {width}x{height}"))
@@ -2064,6 +2330,18 @@ fn render_image_box(
     if !alt.is_empty() {
         render_box_line(alt, placement.indent, box_width, output);
     }
+    if let Some(preview) = preview.filter(|preview| !preview.is_empty()) {
+        let detail = format!(
+            "preview: {} bytes{}",
+            preview.data.len(),
+            preview
+                .width
+                .zip(preview.height)
+                .map(|(width, height)| format!(" {width}x{height}"))
+                .unwrap_or_default()
+        );
+        render_box_line(&detail, placement.indent, box_width, output);
+    }
     if !url.is_empty() {
         render_box_line(url, placement.indent, box_width, output);
     }
@@ -2073,6 +2351,169 @@ fn render_image_box(
     output.push_str(&"─".repeat(box_width.saturating_sub(2)));
     output.push('┘');
     output.push_str("\n\n");
+}
+
+fn image_title(preview: Option<&ImagePreview>, options: &TerminalRenderOptions) -> &'static str {
+    if preview.is_some_and(|preview| !preview.is_empty())
+        && options
+            .image_capabilities
+            .preferred_png_protocol()
+            .is_some()
+    {
+        "image preview"
+    } else if options.image_capabilities.supports_images() {
+        "image available"
+    } else {
+        "image"
+    }
+}
+
+#[allow(
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_arguments,
+    reason = "media boxes render explicit browser-derived state"
+)]
+fn render_media_box(
+    media_kind: MediaKind,
+    label: &str,
+    source_url: &str,
+    poster_url: &str,
+    sources: &[trowser_render::MediaSource],
+    media_width: Option<u32>,
+    media_height: Option<u32>,
+    duration_seconds: Option<u32>,
+    current_time_seconds: Option<u32>,
+    paused: bool,
+    muted: bool,
+    controls: bool,
+    autoplay: bool,
+    preview: Option<&ImagePreview>,
+    control_id: Option<u32>,
+    placement: ReaderPlacement,
+    options: &TerminalRenderOptions,
+    output: &mut String,
+) {
+    let box_width = placement.width.clamp(40, 72);
+    let dimensions = media_width
+        .zip(media_height)
+        .map(|(width, height)| format!(" {width}x{height}"))
+        .unwrap_or_default();
+    let title = if preview.is_some_and(|preview| !preview.is_empty())
+        && options
+            .image_capabilities
+            .preferred_png_protocol()
+            .is_some()
+    {
+        format!("{} preview{dimensions}", media_kind.label())
+    } else {
+        format!("{}{dimensions}", media_kind.label())
+    };
+
+    output.push_str(&" ".repeat(placement.indent));
+    output.push('┌');
+    output.push_str(&fit_line(&title, box_width.saturating_sub(2), '─'));
+    output.push('┐');
+    output.push('\n');
+
+    if let Some(control_id) = control_id {
+        render_box_line(
+            &format!("[media {control_id}] click to play/pause"),
+            placement.indent,
+            box_width,
+            output,
+        );
+    }
+    if !label.is_empty() {
+        render_box_line(label, placement.indent, box_width, output);
+    }
+    render_box_line(
+        &format_media_state(
+            duration_seconds,
+            current_time_seconds,
+            paused,
+            muted,
+            controls,
+            autoplay,
+        ),
+        placement.indent,
+        box_width,
+        output,
+    );
+    if let Some(preview) = preview.filter(|preview| !preview.is_empty()) {
+        render_box_line(
+            &format!("preview: {} bytes", preview.data.len()),
+            placement.indent,
+            box_width,
+            output,
+        );
+    }
+    if !poster_url.is_empty() {
+        render_box_line(
+            &format!("poster: {poster_url}"),
+            placement.indent,
+            box_width,
+            output,
+        );
+    }
+    if !source_url.is_empty() {
+        render_box_line(source_url, placement.indent, box_width, output);
+    }
+    for source in sources
+        .iter()
+        .filter(|source| source.url != source_url)
+        .take(3)
+    {
+        render_box_line(&source.url, placement.indent, box_width, output);
+    }
+
+    output.push_str(&" ".repeat(placement.indent));
+    output.push('└');
+    output.push_str(&"─".repeat(box_width.saturating_sub(2)));
+    output.push('┘');
+    output.push_str("\n\n");
+}
+
+fn media_outline_label(media_kind: MediaKind, label: &str, source_url: &str) -> String {
+    let value = if !label.trim().is_empty() {
+        label
+    } else if !source_url.trim().is_empty() {
+        source_url
+    } else {
+        "embedded content"
+    };
+    format!("{} {value}", media_kind.label())
+}
+
+#[allow(
+    clippy::fn_params_excessive_bools,
+    reason = "media state is derived from boolean HTML media attributes"
+)]
+fn format_media_state(
+    duration_seconds: Option<u32>,
+    current_time_seconds: Option<u32>,
+    paused: bool,
+    muted: bool,
+    controls: bool,
+    autoplay: bool,
+) -> String {
+    let mut state = Vec::new();
+    state.push(if paused { "paused" } else { "playing" });
+    if muted {
+        state.push("muted");
+    }
+    if controls {
+        state.push("controls");
+    }
+    if autoplay {
+        state.push("autoplay");
+    }
+    let timeline = match (current_time_seconds, duration_seconds) {
+        (Some(current), Some(duration)) => format!(" {current}/{duration}s"),
+        (Some(current), None) => format!(" {current}s"),
+        (None, Some(duration)) => format!(" {duration}s"),
+        (None, None) => String::new(),
+    };
+    format!("{}{}", state.join(", "), timeline)
 }
 
 fn fit_line(text: &str, width: usize, fill: char) -> String {
@@ -2143,7 +2584,7 @@ fn pad_to_width(output: &mut String, width: usize, used: usize) {
 mod tests {
     use super::{RenderMode, TerminalRenderOptions, render_document_mode, render_plain_text};
     use trowser_render::{
-        BlockLayout, SemanticBlock, SemanticLayoutNode, SemanticPage, SemanticRegion,
+        BlockLayout, MediaKind, SemanticBlock, SemanticLayoutNode, SemanticPage, SemanticRegion,
     };
 
     #[test]
@@ -2189,6 +2630,45 @@ mod tests {
 
         let rendered = render_plain_text(&page, &TerminalRenderOptions::default());
         assert!(rendered.contains("      Indented"));
+    }
+
+    #[test]
+    fn renders_video_media_as_clickable_placeholder() {
+        let page = SemanticPage {
+            url: "https://example.com/video".to_string(),
+            title: "Video".to_string(),
+            blocks: vec![SemanticBlock::Media {
+                action_id: Some(trowser_session_models::ActionId::new("v-1")),
+                media_kind: MediaKind::Video,
+                label: "Demo video".to_string(),
+                source_url: "https://example.com/demo.mp4".to_string(),
+                poster_url: String::new(),
+                sources: Vec::new(),
+                width: Some(640),
+                height: Some(360),
+                duration_seconds: Some(30),
+                current_time_seconds: Some(4),
+                paused: true,
+                muted: true,
+                controls: true,
+                autoplay: false,
+                preview: None,
+                layout: None,
+                region: SemanticRegion::Main,
+            }],
+            layout_tree: None,
+            viewport: None,
+            scroll_y_px: 0,
+        };
+
+        let rendered =
+            render_document_mode(&page, &TerminalRenderOptions::default(), RenderMode::Page);
+        let output = rendered.to_plain_text();
+
+        assert!(output.contains("video 640x360"));
+        assert!(output.contains("[media 1] click to play/pause"));
+        assert!(output.contains("paused, muted, controls 4/30s"));
+        assert!(rendered.lines.iter().any(|line| !line.controls.is_empty()));
     }
 
     #[test]

@@ -9,7 +9,7 @@ use trowser_render::{SemanticPage, SemanticViewport};
 use trowser_session_models::{ActionId, SessionSnapshot, TabId};
 
 /// Current trowser IPC protocol version.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Initial client hello.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +68,10 @@ impl ViewportHint {
 /// IPC protocol capabilities.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "capability flags intentionally describe independent protocol features"
+)]
 pub struct ProtocolCapabilities {
     /// Server supports semantic page snapshots.
     pub semantic_snapshots: bool,
@@ -75,6 +79,10 @@ pub struct ProtocolCapabilities {
     pub tabs: bool,
     /// Server supports navigation.
     pub navigation: bool,
+    /// Server can extract browser media/embed elements.
+    pub media_elements: bool,
+    /// Server can attach captured PNG previews to image/media blocks.
+    pub image_previews: bool,
 }
 
 /// Client request sent to the daemon.

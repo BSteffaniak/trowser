@@ -138,6 +138,76 @@ impl TextRun {
     }
 }
 
+/// Browser-derived media/embed kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum MediaKind {
+    /// Unknown embedded or replaced content.
+    #[default]
+    Unknown,
+    /// HTML video element.
+    Video,
+    /// HTML audio element.
+    Audio,
+    /// Canvas drawing surface.
+    Canvas,
+    /// Nested browsing context.
+    Iframe,
+    /// Generic embed element.
+    Embed,
+    /// Generic object element.
+    Object,
+}
+
+impl MediaKind {
+    /// Returns a compact lowercase label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "media",
+            Self::Video => "video",
+            Self::Audio => "audio",
+            Self::Canvas => "canvas",
+            Self::Iframe => "iframe",
+            Self::Embed => "embed",
+            Self::Object => "object",
+        }
+    }
+}
+
+/// Browser-derived media source candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MediaSource {
+    /// Source URL.
+    pub url: String,
+    /// Declared MIME type, when present.
+    pub mime_type: String,
+    /// Declared media query, when present.
+    pub media: String,
+}
+
+/// Inline image/thumbnail payload captured by the browser backend.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImagePreview {
+    /// MIME type for the payload, usually `image/png`.
+    pub mime_type: String,
+    /// Encoded image bytes.
+    pub data: Vec<u8>,
+    /// Pixel width of the payload, when known.
+    pub width: Option<u32>,
+    /// Pixel height of the payload, when known.
+    pub height: Option<u32>,
+}
+
+impl ImagePreview {
+    /// Returns true when this preview contains bytes.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+}
+
 /// Browser-derived layout tree node used by layout-preserving renderers.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -164,6 +234,12 @@ pub struct SemanticLayoutNode {
     pub control_type: String,
     /// Current control value when available.
     pub value: String,
+    /// Media/embed kind for replaced content nodes.
+    pub media_kind: MediaKind,
+    /// Primary media source URL for replaced content nodes.
+    pub source_url: String,
+    /// Poster image URL for video-like content, when present.
+    pub poster_url: String,
     /// Child layout nodes.
     pub children: Vec<Self>,
 }
@@ -249,6 +325,27 @@ pub enum SemanticBlock {
         url: String,
         width: Option<u32>,
         height: Option<u32>,
+        preview: Option<ImagePreview>,
+        layout: Option<BlockLayout>,
+        region: SemanticRegion,
+    },
+    /// Video, audio, canvas, iframe, embed, or object placeholder.
+    Media {
+        action_id: Option<ActionId>,
+        media_kind: MediaKind,
+        label: String,
+        source_url: String,
+        poster_url: String,
+        sources: Vec<MediaSource>,
+        width: Option<u32>,
+        height: Option<u32>,
+        duration_seconds: Option<u32>,
+        current_time_seconds: Option<u32>,
+        paused: bool,
+        muted: bool,
+        controls: bool,
+        autoplay: bool,
+        preview: Option<ImagePreview>,
         layout: Option<BlockLayout>,
         region: SemanticRegion,
     },
@@ -279,6 +376,7 @@ impl SemanticBlock {
             | Self::HorizontalRule { layout, .. }
             | Self::Link { layout, .. }
             | Self::Image { layout, .. }
+            | Self::Media { layout, .. }
             | Self::FormControl { layout, .. } => *layout,
         }
     }
@@ -298,6 +396,7 @@ impl SemanticBlock {
             | Self::HorizontalRule { region, .. }
             | Self::Link { region, .. }
             | Self::Image { region, .. }
+            | Self::Media { region, .. }
             | Self::FormControl { region, .. } => *region,
         }
     }
@@ -433,10 +532,17 @@ fn sanitize_layout_node(node: &SemanticLayoutNode) -> SemanticLayoutNode {
         url: sanitize_terminal_text(&node.url),
         control_type: sanitize_terminal_text(&node.control_type),
         value: sanitize_terminal_text(&node.value),
+        media_kind: node.media_kind,
+        source_url: sanitize_terminal_text(&node.source_url),
+        poster_url: sanitize_terminal_text(&node.poster_url),
         children: node.children.iter().map(sanitize_layout_node).collect(),
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "semantic block sanitization is exhaustive over wire model variants"
+)]
 fn sanitize_block(block: &SemanticBlock) -> SemanticBlock {
     match block {
         SemanticBlock::Heading {
@@ -517,9 +623,55 @@ fn sanitize_block(block: &SemanticBlock) -> SemanticBlock {
             url,
             width,
             height,
+            preview,
             layout,
             region,
-        } => sanitize_image(alt, url, *width, *height, *layout, *region),
+        } => sanitize_image(
+            alt,
+            url,
+            *width,
+            *height,
+            preview.as_ref(),
+            *layout,
+            *region,
+        ),
+        SemanticBlock::Media {
+            action_id,
+            media_kind,
+            label,
+            source_url,
+            poster_url,
+            sources,
+            width,
+            height,
+            duration_seconds,
+            current_time_seconds,
+            paused,
+            muted,
+            controls,
+            autoplay,
+            preview,
+            layout,
+            region,
+        } => sanitize_media(
+            action_id.as_ref(),
+            *media_kind,
+            label,
+            source_url,
+            poster_url,
+            sources,
+            *width,
+            *height,
+            *duration_seconds,
+            *current_time_seconds,
+            *paused,
+            *muted,
+            *controls,
+            *autoplay,
+            preview.as_ref(),
+            *layout,
+            *region,
+        ),
         SemanticBlock::FormControl {
             action_id,
             label,
@@ -543,6 +695,7 @@ fn sanitize_image(
     url: &str,
     width: Option<u32>,
     height: Option<u32>,
+    preview: Option<&ImagePreview>,
     layout: Option<BlockLayout>,
     region: SemanticRegion,
 ) -> SemanticBlock {
@@ -551,8 +704,62 @@ fn sanitize_image(
         url: sanitize_terminal_text(url),
         width,
         height,
+        preview: preview.cloned(),
         layout,
         region,
+    }
+}
+
+#[allow(
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_arguments,
+    reason = "media semantics are a wire model with explicit browser-derived fields"
+)]
+fn sanitize_media(
+    action_id: Option<&ActionId>,
+    media_kind: MediaKind,
+    label: &str,
+    source_url: &str,
+    poster_url: &str,
+    sources: &[MediaSource],
+    width: Option<u32>,
+    height: Option<u32>,
+    duration_seconds: Option<u32>,
+    current_time_seconds: Option<u32>,
+    paused: bool,
+    muted: bool,
+    controls: bool,
+    autoplay: bool,
+    preview: Option<&ImagePreview>,
+    layout: Option<BlockLayout>,
+    region: SemanticRegion,
+) -> SemanticBlock {
+    SemanticBlock::Media {
+        action_id: action_id.cloned(),
+        media_kind,
+        label: sanitize_terminal_text(label),
+        source_url: sanitize_terminal_text(source_url),
+        poster_url: sanitize_terminal_text(poster_url),
+        sources: sources.iter().map(sanitize_media_source).collect(),
+        width,
+        height,
+        duration_seconds,
+        current_time_seconds,
+        paused,
+        muted,
+        controls,
+        autoplay,
+        preview: preview.cloned(),
+        layout,
+        region,
+    }
+}
+
+fn sanitize_media_source(source: &MediaSource) -> MediaSource {
+    MediaSource {
+        url: sanitize_terminal_text(&source.url),
+        mime_type: sanitize_terminal_text(&source.mime_type),
+        media: sanitize_terminal_text(&source.media),
     }
 }
 

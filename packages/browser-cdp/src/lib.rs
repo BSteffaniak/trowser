@@ -23,8 +23,8 @@ use trowser_browser::{
     NavigateRequest,
 };
 use trowser_render::{
-    BlockLayout, SemanticBlock, SemanticLayoutNode, SemanticPage, SemanticRegion, SemanticViewport,
-    TextRun,
+    BlockLayout, ImagePreview, MediaKind, MediaSource, SemanticBlock, SemanticLayoutNode,
+    SemanticPage, SemanticRegion, SemanticViewport, TextRun,
 };
 use trowser_session_models::{ActionId, TabId};
 
@@ -811,7 +811,74 @@ impl CdpConnection {
             .and_then(Value::as_str)
             .ok_or(CdpError::MissingField("Runtime.evaluate.result.value"))?;
         let page: CdpSemanticPage = serde_json::from_str(page_json)?;
-        Ok(page.into_semantic_page())
+        let mut page = page.into_semantic_page();
+        self.enrich_media_previews(&mut page).await;
+        Ok(page)
+    }
+
+    async fn enrich_media_previews(&mut self, page: &mut SemanticPage) {
+        const MAX_PREVIEWS: usize = 8;
+        let mut preview_count = 0usize;
+        for block in &mut page.blocks {
+            if preview_count >= MAX_PREVIEWS {
+                break;
+            }
+            let layout = block.layout().filter(|layout| layout.is_non_empty());
+            let Some(layout) = layout else {
+                continue;
+            };
+            let needs_preview = match block {
+                SemanticBlock::Image { preview, .. } | SemanticBlock::Media { preview, .. } => {
+                    preview.as_ref().is_none_or(ImagePreview::is_empty)
+                }
+                _ => false,
+            };
+            if !needs_preview {
+                continue;
+            }
+            let Ok(preview) = self.capture_preview(layout).await else {
+                continue;
+            };
+            match block {
+                SemanticBlock::Image { preview: slot, .. }
+                | SemanticBlock::Media { preview: slot, .. } => *slot = Some(preview),
+                _ => {}
+            }
+            preview_count += 1;
+        }
+    }
+
+    async fn capture_preview(&mut self, layout: BlockLayout) -> CdpResult<ImagePreview> {
+        let width = layout.width.clamp(1.0, 900.0);
+        let height = layout.height.clamp(1.0, 700.0);
+        let result = self
+            .call(
+                "Page.captureScreenshot",
+                json!({
+                    "format": "png",
+                    "fromSurface": true,
+                    "clip": {
+                        "x": layout.x.max(0.0),
+                        "y": layout.y.max(0.0),
+                        "width": width,
+                        "height": height,
+                        "scale": 1,
+                    },
+                }),
+            )
+            .await?;
+        let encoded = result
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or(CdpError::MissingField("Page.captureScreenshot.data"))?;
+        let data = base64_decode(encoded.as_bytes())
+            .ok_or_else(|| CdpError::Extraction("invalid screenshot base64".to_string()))?;
+        Ok(ImagePreview {
+            mime_type: "image/png".to_string(),
+            data,
+            width: Some(f64_to_u32(width)),
+            height: Some(f64_to_u32(height)),
+        })
     }
 
     async fn extract_accessibility_page(
@@ -953,6 +1020,7 @@ const fn is_structured_dom_block(block: &SemanticBlock) -> bool {
             | SemanticBlock::Quote { .. }
             | SemanticBlock::CodeBlock { .. }
             | SemanticBlock::Table { .. }
+            | SemanticBlock::Media { .. }
     )
 }
 
@@ -1186,6 +1254,7 @@ fn ax_node_block(node: &AxNode, role: &str, region: SemanticRegion) -> Option<Se
             url: ax_property_string(node, "url").unwrap_or_default(),
             width: None,
             height: None,
+            preview: None,
             layout: None,
             region,
         }),
@@ -1386,6 +1455,45 @@ fn normalized_match(left: &str, right: &str) -> bool {
     !left.is_empty() && (left == right || left.contains(&right) || right.contains(&left))
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "CDP screenshot clip dimensions are clamped positive CSS pixel values"
+)]
+fn f64_to_u32(value: f64) -> u32 {
+    value.round().max(1.0).min(f64::from(u32::MAX)) as u32
+}
+
+fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {
+    let mut output = Vec::with_capacity(input.len().saturating_mul(3) / 4);
+    let mut buffer = 0u32;
+    let mut bits = 0u8;
+    for byte in input
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace())
+    {
+        if byte == b'=' {
+            break;
+        }
+        let value = match byte {
+            b'A'..=b'Z' => u32::from(byte - b'A'),
+            b'a'..=b'z' => u32::from(byte - b'a' + 26),
+            b'0'..=b'9' => u32::from(byte - b'0' + 52),
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push(((buffer >> bits) & 0xff) as u8);
+        }
+    }
+    Some(output)
+}
+
 #[derive(Debug, Deserialize)]
 struct CdpSemanticPage {
     url: String,
@@ -1475,6 +1583,33 @@ enum CdpSemanticBlock {
         url: String,
         width: Option<u32>,
         height: Option<u32>,
+        #[serde(default)]
+        preview: Option<ImagePreview>,
+        layout: Option<BlockLayout>,
+        region: SemanticRegion,
+    },
+    Media {
+        action_id: Option<ActionId>,
+        media_kind: MediaKind,
+        label: String,
+        source_url: String,
+        poster_url: String,
+        #[serde(default)]
+        sources: Vec<MediaSource>,
+        width: Option<u32>,
+        height: Option<u32>,
+        duration_seconds: Option<u32>,
+        current_time_seconds: Option<u32>,
+        #[serde(default)]
+        paused: bool,
+        #[serde(default)]
+        muted: bool,
+        #[serde(default)]
+        controls: bool,
+        #[serde(default)]
+        autoplay: bool,
+        #[serde(default)]
+        preview: Option<ImagePreview>,
         layout: Option<BlockLayout>,
         region: SemanticRegion,
     },
@@ -1594,6 +1729,7 @@ impl CdpSemanticBlock {
                 url,
                 width,
                 height,
+                preview,
                 layout,
                 region,
             } => SemanticBlock::Image {
@@ -1601,6 +1737,44 @@ impl CdpSemanticBlock {
                 url,
                 width,
                 height,
+                preview,
+                layout,
+                region,
+            },
+            Self::Media {
+                action_id,
+                media_kind,
+                label,
+                source_url,
+                poster_url,
+                sources,
+                width,
+                height,
+                duration_seconds,
+                current_time_seconds,
+                paused,
+                muted,
+                controls,
+                autoplay,
+                preview,
+                layout,
+                region,
+            } => SemanticBlock::Media {
+                action_id,
+                media_kind,
+                label,
+                source_url,
+                poster_url,
+                sources,
+                width,
+                height,
+                duration_seconds,
+                current_time_seconds,
+                paused,
+                muted,
+                controls,
+                autoplay,
+                preview,
                 layout,
                 region,
             },
@@ -1642,6 +1816,25 @@ fn activate_action_js(action_id: &ActionId) -> CdpResult<String> {
       return {{ ok: true }};
     }}
     return {{ ok: true, navigate: targetUrl.href }};
+  }}
+  if (el instanceof HTMLMediaElement) {{
+    el.focus();
+    if (el.paused) {{
+      const played = el.play();
+      if (played && typeof played.catch === 'function') played.catch(() => {{}});
+    }} else {{
+      el.pause();
+    }}
+    return {{ ok: true }};
+  }}
+  if (el.tagName && el.tagName.toLowerCase() === 'summary') {{
+    const details = el.closest('details');
+    if (details) details.open = !details.open;
+    return {{ ok: true }};
+  }}
+  if (el.tagName && el.tagName.toLowerCase() === 'details') {{
+    el.open = !el.open;
+    return {{ ok: true }};
   }}
   el.focus();
   el.click();
@@ -1721,7 +1914,7 @@ const DOM_EXTRACTION_JS: &str = r#"
     window.__trowserActions[id] = el;
     return id;
   };
-  const controlSelector = 'input,textarea,button,select,[role="button"],[role="menuitem"],[aria-haspopup],[aria-expanded],[onclick]';
+  const controlSelector = 'input,textarea,button,select,summary,details,[role="button"],[role="menuitem"],[aria-haspopup],[aria-expanded],[onclick]';
   const isControl = (el) => el.matches(controlSelector) && !el.matches('a[href]');
   const controlType = (el) => clean(el.getAttribute('role') || el.type || el.tagName.toLowerCase());
   const controlLabel = (el) => clean(el.labels && el.labels[0] ? el.labels[0].innerText : (el.getAttribute('aria-label') || el.getAttribute('title') || el.name || el.placeholder || el.innerText || el.textContent));
@@ -1765,7 +1958,7 @@ const DOM_EXTRACTION_JS: &str = r#"
         if (text || el.href) runs.push({ text: text || el.href, style: 'Normal', url: el.href || '', action_id: actionId(el) });
         return;
       }
-      if (isControl(el) || tag === 'img' || tag === 'svg') return;
+      if (isControl(el) || ['img','svg','video','audio','canvas','iframe','embed','object'].includes(tag)) return;
       const childStyle = tag === 'strong' || tag === 'b'
         ? 'Strong'
         : tag === 'em' || tag === 'i'
@@ -1794,14 +1987,15 @@ const DOM_EXTRACTION_JS: &str = r#"
         const childStyle = window.getComputedStyle(child);
         return depth < 2
           || isLayoutContainer
-          || ['div','header','nav','main','article','section','aside','footer','form','ul','ol','li','p','blockquote','pre','table','a','button','input','textarea','select'].includes(childTag)
+          || ['div','header','nav','main','article','section','aside','footer','form','ul','ol','li','p','blockquote','pre','table','a','button','input','textarea','select','img','video','audio','canvas','iframe','embed','object','details','summary'].includes(childTag)
           || ['flex','inline-flex','grid','inline-grid','table','table-row','table-cell'].includes(childStyle.display)
           || child.getAttribute('role');
       })
       .slice(0, 80)
       .map((child) => layoutNode(child, depth + 1))
       .filter(Boolean);
-    const actionable = tag === 'a' || isControl(el);
+    const mediaActionable = tag === 'video' || tag === 'audio' || tag === 'details' || tag === 'summary';
+    const actionable = tag === 'a' || isControl(el) || mediaActionable;
     const runs = ['p','li','blockquote'].includes(tag) ? inlineRuns(el) : [];
     const text = runs.length ? '' : clean(el.getAttribute('aria-label') || el.getAttribute('title') || (actionable ? el.innerText || el.textContent : ''));
     return {
@@ -1816,6 +2010,9 @@ const DOM_EXTRACTION_JS: &str = r#"
       url: tag === 'a' ? el.href || '' : '',
       control_type: isControl(el) ? controlType(el) : '',
       value: isControl(el) ? clean(el.value || '') : '',
+      media_kind: ['video','audio','canvas','iframe','embed','object'].includes(tag) ? mediaKind(tag) : 'Unknown',
+      source_url: ['video','audio','canvas','iframe','embed','object'].includes(tag) ? (mediaSources(el)[0] || { url: '' }).url : '',
+      poster_url: tag === 'video' ? clean(el.poster || '') : '',
       children,
     };
   };
@@ -1831,7 +2028,40 @@ const DOM_EXTRACTION_JS: &str = r#"
     return { headers, rows };
   };
 
-  const selector = `h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,table,hr,a,img,${controlSelector}`;
+  const mediaKind = (tag) => {
+    if (tag === 'video') return 'Video';
+    if (tag === 'audio') return 'Audio';
+    if (tag === 'canvas') return 'Canvas';
+    if (tag === 'iframe') return 'Iframe';
+    if (tag === 'embed') return 'Embed';
+    if (tag === 'object') return 'Object';
+    return 'Unknown';
+  };
+  const mediaSources = (el) => {
+    const sources = [];
+    const add = (url, mimeType = '', media = '') => {
+      const cleanUrl = clean(url);
+      if (cleanUrl && !sources.some((source) => source.url === cleanUrl)) {
+        sources.push({ url: cleanUrl, mime_type: clean(mimeType), media: clean(media) });
+      }
+    };
+    add(el.currentSrc || el.src || el.data || '');
+    for (const source of Array.from(el.querySelectorAll('source'))) {
+      add(source.src || source.getAttribute('src') || '', source.type || '', source.media || '');
+    }
+    return sources;
+  };
+  const finiteSeconds = (value) => Number.isFinite(value) && value >= 0 ? Math.round(value) : null;
+  const mediaLabel = (el) => clean(
+    el.getAttribute('aria-label')
+    || el.getAttribute('title')
+    || el.getAttribute('alt')
+    || (el.closest('figure') && el.closest('figure').querySelector('figcaption') && el.closest('figure').querySelector('figcaption').innerText)
+    || el.name
+    || ''
+  );
+
+  const selector = `h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,table,hr,a,img,video,audio,canvas,iframe,embed,object,summary,details,${controlSelector}`;
   for (const el of document.body.querySelectorAll(selector)) {
     if (!visible(el)) continue;
     const tag = el.tagName.toLowerCase();
@@ -1868,6 +2098,28 @@ const DOM_EXTRACTION_JS: &str = r#"
         url: el.currentSrc || el.src || '',
         width: el.naturalWidth || null,
         height: el.naturalHeight || null,
+        layout: layout(el),
+        region: region(el),
+      });
+    } else if (['video','audio','canvas','iframe','embed','object'].includes(tag)) {
+      const sources = mediaSources(el);
+      const primarySource = (sources[0] || { url: '' }).url;
+      blocks.push({
+        kind: 'media',
+        action_id: (tag === 'video' || tag === 'audio') ? actionId(el) : null,
+        media_kind: mediaKind(tag),
+        label: mediaLabel(el),
+        source_url: primarySource,
+        poster_url: tag === 'video' ? clean(el.poster || '') : '',
+        sources,
+        width: el.videoWidth || el.naturalWidth || el.clientWidth || null,
+        height: el.videoHeight || el.naturalHeight || el.clientHeight || null,
+        duration_seconds: finiteSeconds(el.duration),
+        current_time_seconds: finiteSeconds(el.currentTime),
+        paused: Boolean(el.paused),
+        muted: Boolean(el.muted),
+        controls: Boolean(el.controls),
+        autoplay: Boolean(el.autoplay),
         layout: layout(el),
         region: region(el),
       });

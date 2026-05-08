@@ -144,6 +144,8 @@ impl TrowserServer {
             semantic_snapshots: true,
             tabs: true,
             navigation: true,
+            media_elements: true,
+            image_previews: true,
         }
     }
 
