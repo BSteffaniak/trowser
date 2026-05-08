@@ -75,41 +75,20 @@ pub enum Command {
         text: String,
     },
     /// Manage browser tabs.
-    Tab {
-        /// Tab command.
+    Tabs {
+        /// Tabs command.
         #[command(subcommand)]
-        command: TabCommand,
+        command: TabsCommand,
     },
-    /// Switch to a tab.
-    #[command(hide = true)]
-    Switch {
-        /// Tab id to activate.
-        tab_id: String,
-    },
-    /// Close a tab.
-    #[command(hide = true)]
-    Close {
-        /// Tab id to close.
-        tab_id: String,
-    },
-    /// Switch to the next tab.
-    #[command(hide = true)]
-    NextTab,
-    /// Switch to the previous tab.
-    #[command(hide = true)]
-    PreviousTab,
-    /// List daemon tabs.
-    #[command(hide = true)]
-    Tabs,
     /// Print resolved paths.
     Paths,
     /// Print terminal capability information.
     Doctor,
 }
 
-/// Tab commands.
+/// Tabs commands.
 #[derive(Debug, Clone, Subcommand)]
-pub enum TabCommand {
+pub enum TabsCommand {
     /// List daemon tabs.
     List,
     /// Switch to a tab.
@@ -174,52 +153,57 @@ pub enum BrowserBackendArg {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, TabCommand};
+    use super::{Cli, Command, TabsCommand};
 
     #[test]
-    fn parses_tab_list_command() {
-        let cli = Cli::try_parse_from(["trowser", "tab", "list"]).expect("parse command");
+    fn parses_tabs_list_command() {
+        let cli = Cli::try_parse_from(["trowser", "tabs", "list"]).expect("parse command");
 
-        let Some(Command::Tab {
-            command: TabCommand::List,
+        let Some(Command::Tabs {
+            command: TabsCommand::List,
         }) = cli.command
         else {
-            panic!("expected tab list command");
+            panic!("expected tabs list command");
         };
     }
 
     #[test]
-    fn parses_tab_close_all_flag() {
-        let cli = Cli::try_parse_from(["trowser", "tab", "close", "--all"]).expect("parse command");
+    fn parses_tabs_close_all_flag() {
+        let cli =
+            Cli::try_parse_from(["trowser", "tabs", "close", "--all"]).expect("parse command");
 
-        let Some(Command::Tab {
-            command: TabCommand::Close(args),
+        let Some(Command::Tabs {
+            command: TabsCommand::Close(args),
         }) = cli.command
         else {
-            panic!("expected tab close command");
+            panic!("expected tabs close command");
         };
         assert!(args.all);
         assert!(args.tab_id.is_none());
     }
 
     #[test]
-    fn parses_tab_close_all_command() {
-        let cli = Cli::try_parse_from(["trowser", "tab", "close-all"]).expect("parse command");
+    fn parses_tabs_close_all_command() {
+        let cli = Cli::try_parse_from(["trowser", "tabs", "close-all"]).expect("parse command");
 
-        let Some(Command::Tab {
-            command: TabCommand::CloseAll,
+        let Some(Command::Tabs {
+            command: TabsCommand::CloseAll,
         }) = cli.command
         else {
-            panic!("expected tab close-all command");
+            panic!("expected tabs close-all command");
         };
     }
 
     #[test]
-    fn parses_legacy_tabs_command() {
-        let cli = Cli::try_parse_from(["trowser", "tabs"]).expect("parse command");
+    fn rejects_legacy_tab_command() {
+        assert!(Cli::try_parse_from(["trowser", "tab", "list"]).is_err());
+    }
 
-        let Some(Command::Tabs) = cli.command else {
-            panic!("expected legacy tabs command");
-        };
+    #[test]
+    fn rejects_legacy_top_level_tab_commands() {
+        assert!(Cli::try_parse_from(["trowser", "switch", "tab-0"]).is_err());
+        assert!(Cli::try_parse_from(["trowser", "close", "tab-0"]).is_err());
+        assert!(Cli::try_parse_from(["trowser", "next-tab"]).is_err());
+        assert!(Cli::try_parse_from(["trowser", "previous-tab"]).is_err());
     }
 }

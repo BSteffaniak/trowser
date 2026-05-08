@@ -26,7 +26,7 @@ use crossterm::terminal::{
 };
 use crossterm::{execute, queue};
 use trowser_browser_cdp::discover_browser_binary;
-use trowser_cli_schema::{Cli, Command, ServerCommand, SessionCommand, TabCloseArgs, TabCommand};
+use trowser_cli_schema::{Cli, Command, ServerCommand, SessionCommand, TabCloseArgs, TabsCommand};
 use trowser_client::{ClientError, TrowserClient};
 use trowser_config::{ConfigPaths, TROWSER_DAEMON_READY_FILE_ENV, TrowserConfig};
 use trowser_ipc::{Request, Response, ServerStatus, ViewportHint};
@@ -70,7 +70,7 @@ pub async fn run() -> Result<u8> {
         Command::Interactive => run_interactive(&paths, &config, None).await,
         Command::Server { command } => run_server(&command, &paths, cli.json).await,
         Command::Session { command } => run_session(&command, &paths, cli.json).await,
-        Command::Tab { command } => run_tab(&command, &paths, &config, cli.json).await,
+        Command::Tabs { command } => run_tabs_command(&command, &paths, &config, cli.json).await,
         Command::Status => run_status(&paths, cli.json).await,
         Command::Follow { link_id } => run_follow(&paths, &config, link_id, cli.json).await,
         Command::Back => {
@@ -113,33 +113,6 @@ pub async fn run() -> Result<u8> {
             )
             .await
         }
-        Command::Switch { tab_id } => {
-            run_navigation(
-                &paths,
-                &config,
-                Request::SwitchTab {
-                    tab_id: trowser_session_models::TabId::new(tab_id),
-                },
-                cli.json,
-            )
-            .await
-        }
-        Command::Close { tab_id } => {
-            run_maybe_navigation(
-                &paths,
-                &config,
-                Request::CloseTab {
-                    tab_id: trowser_session_models::TabId::new(tab_id),
-                },
-                cli.json,
-            )
-            .await
-        }
-        Command::NextTab => run_navigation(&paths, &config, Request::NextTab, cli.json).await,
-        Command::PreviousTab => {
-            run_navigation(&paths, &config, Request::PreviousTab, cli.json).await
-        }
-        Command::Tabs => run_tabs(&paths, cli.json).await,
         Command::Paths => Ok(run_paths(&paths, cli.json)),
         Command::Doctor => Ok(run_doctor(&config, cli.json)),
     }
@@ -1680,15 +1653,15 @@ async fn run_session(command: &SessionCommand, paths: &ConfigPaths, json: bool) 
     Ok(0)
 }
 
-async fn run_tab(
-    command: &TabCommand,
+async fn run_tabs_command(
+    command: &TabsCommand,
     paths: &ConfigPaths,
     config: &TrowserConfig,
     json: bool,
 ) -> Result<u8> {
     match command {
-        TabCommand::List => run_tabs(paths, json).await,
-        TabCommand::Switch { tab_id } => {
+        TabsCommand::List => run_tabs(paths, json).await,
+        TabsCommand::Switch { tab_id } => {
             run_navigation(
                 paths,
                 config,
@@ -1699,10 +1672,10 @@ async fn run_tab(
             )
             .await
         }
-        TabCommand::Close(args) => run_tab_close(args, paths, config, json).await,
-        TabCommand::CloseAll => run_close_all_tabs(paths, json).await,
-        TabCommand::Next => run_navigation(paths, config, Request::NextTab, json).await,
-        TabCommand::Previous => run_navigation(paths, config, Request::PreviousTab, json).await,
+        TabsCommand::Close(args) => run_tab_close(args, paths, config, json).await,
+        TabsCommand::CloseAll => run_close_all_tabs(paths, json).await,
+        TabsCommand::Next => run_navigation(paths, config, Request::NextTab, json).await,
+        TabsCommand::Previous => run_navigation(paths, config, Request::PreviousTab, json).await,
     }
 }
 
