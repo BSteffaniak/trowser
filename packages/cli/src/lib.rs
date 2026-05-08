@@ -1072,7 +1072,19 @@ fn queue_styled_line<W: Write>(
     width: u16,
     is_focused: bool,
 ) -> Result<()> {
-    let mut used = 0usize;
+    let mut used = if is_focused && width >= 2 {
+        queue!(
+            out,
+            SetForegroundColor(Color::Yellow),
+            SetAttribute(Attribute::Bold),
+            Print("▶ "),
+            ResetColor,
+            SetAttribute(Attribute::Reset)
+        )?;
+        2usize
+    } else {
+        0usize
+    };
     let spans = if line.spans.is_empty() {
         vec![trowser_terminal::StyledSpan {
             text: line.text.clone(),

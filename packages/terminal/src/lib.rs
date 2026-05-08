@@ -218,28 +218,28 @@ pub fn render_document_mode(
     match mode {
         RenderMode::Reader => {
             push_nav_summary_lines(&page, width, &mut next_link_id, &mut document);
-            for block in reader_blocks(&page.blocks) {
-                push_reader_block_lines(
-                    block,
-                    &mut next_link_id,
-                    &mut next_control_id,
-                    width,
-                    options,
-                    &mut document,
-                );
-            }
+            let blocks = reader_blocks(&page.blocks);
+            push_blocks_with_layout(
+                &blocks,
+                mode,
+                width,
+                options,
+                &mut next_link_id,
+                &mut next_control_id,
+                &mut document,
+            );
         }
         RenderMode::Page => {
-            for block in &page.blocks {
-                push_reader_block_lines(
-                    block,
-                    &mut next_link_id,
-                    &mut next_control_id,
-                    width,
-                    options,
-                    &mut document,
-                );
-            }
+            let blocks = page.blocks.iter().collect::<Vec<_>>();
+            push_blocks_with_layout(
+                &blocks,
+                mode,
+                width,
+                options,
+                &mut next_link_id,
+                &mut next_control_id,
+                &mut document,
+            );
         }
         RenderMode::Outline => push_outline_lines(
             &page,
@@ -250,6 +250,7 @@ pub fn render_document_mode(
         ),
     }
 
+    normalize_document_spacing(&mut document);
     document
 }
 
@@ -257,6 +258,150 @@ fn push_header_lines(page: &SemanticPage, width: usize, document: &mut RenderedD
     let mut output = String::new();
     render_header(page, width, &mut output);
     push_text_lines(document, &output, None);
+}
+
+fn push_blocks_with_layout(
+    blocks: &[&SemanticBlock],
+    mode: RenderMode,
+    width: usize,
+    options: &TerminalRenderOptions,
+    next_link_id: &mut usize,
+    next_control_id: &mut usize,
+    document: &mut RenderedDocument,
+) {
+    let mut index = 0usize;
+    let mut current_region = None;
+    while let Some(block) = blocks.get(index) {
+        if mode == RenderMode::Page && current_region != Some(block.region()) {
+            current_region = Some(block.region());
+            push_region_heading(document, block.region(), width);
+        }
+
+        if block.region() == SemanticRegion::Navigation
+            && mode == RenderMode::Page
+            && !block_link_targets(block).is_empty()
+        {
+            index = push_navigation_group(blocks, index, width, next_link_id, document);
+            continue;
+        }
+
+        if matches!(block, SemanticBlock::FormControl { .. }) {
+            index = push_control_group(blocks, index, width, next_control_id, document);
+            continue;
+        }
+
+        push_reader_block_lines(
+            block,
+            next_link_id,
+            next_control_id,
+            width,
+            options,
+            document,
+        );
+        index += 1;
+    }
+}
+
+fn push_navigation_group(
+    blocks: &[&SemanticBlock],
+    start: usize,
+    width: usize,
+    next_link_id: &mut usize,
+    document: &mut RenderedDocument,
+) -> usize {
+    let mut index = start;
+    let mut targets = Vec::new();
+    while let Some(block) = blocks.get(index) {
+        if block.region() != SemanticRegion::Navigation {
+            break;
+        }
+        let block_targets = block_link_targets(block);
+        if block_targets.is_empty() {
+            break;
+        }
+        targets.extend(block_targets);
+        index += 1;
+    }
+    push_nav_chip_lines(document, targets, width, next_link_id);
+    document.lines.push(RenderedLine::default());
+    index
+}
+
+fn push_control_group(
+    blocks: &[&SemanticBlock],
+    start: usize,
+    width: usize,
+    next_control_id: &mut usize,
+    document: &mut RenderedDocument,
+) -> usize {
+    push_section_heading(document, "Actions", width);
+    let mut index = start;
+    while let Some(SemanticBlock::FormControl {
+        action_id,
+        label,
+        control_type,
+        value,
+        ..
+    }) = blocks.get(index)
+    {
+        push_form_control_line(
+            document,
+            action_id.as_ref(),
+            label,
+            control_type,
+            value,
+            ReaderPlacement::full_width(width),
+            next_control_id,
+        );
+        index += 1;
+    }
+    document.lines.push(RenderedLine::default());
+    index
+}
+
+fn push_region_heading(document: &mut RenderedDocument, region: SemanticRegion, width: usize) {
+    let Some(title) = region_title(region) else {
+        return;
+    };
+    push_section_heading(document, title, width);
+}
+
+const fn region_title(region: SemanticRegion) -> Option<&'static str> {
+    match region {
+        SemanticRegion::Header => Some("Header"),
+        SemanticRegion::Navigation => Some("Navigation"),
+        SemanticRegion::Aside => Some("Aside"),
+        SemanticRegion::Footer => Some("Footer"),
+        SemanticRegion::Unknown => Some("Page"),
+        SemanticRegion::Main => None,
+    }
+}
+
+fn push_section_heading(document: &mut RenderedDocument, title: &str, width: usize) {
+    let prefix = format!("── {title} ");
+    let fill = width.saturating_sub(prefix.chars().count()).min(80);
+    document.lines.push(RenderedLine::default());
+    document.lines.push(line_with_style(
+        format!("{prefix}{}", "─".repeat(fill)),
+        SpanStyle::Chrome,
+    ));
+}
+
+fn normalize_document_spacing(document: &mut RenderedDocument) {
+    let mut lines = Vec::with_capacity(document.lines.len());
+    let mut previous_blank = true;
+    for line in document.lines.drain(..) {
+        let blank = line.text.trim().is_empty();
+        if blank && previous_blank {
+            continue;
+        }
+        previous_blank = blank;
+        lines.push(line);
+    }
+    while lines.last().is_some_and(|line| line.text.trim().is_empty()) {
+        lines.pop();
+    }
+    document.lines = lines;
 }
 
 fn line_with_style(text: String, style: SpanStyle) -> RenderedLine {
@@ -572,14 +717,30 @@ fn push_form_control_block_lines(
     placement: ReaderPlacement,
     next_control_id: &mut usize,
 ) {
+    push_form_control_line(
+        document,
+        action_id,
+        label,
+        control_type,
+        value,
+        placement,
+        next_control_id,
+    );
+    document.lines.push(RenderedLine::default());
+}
+
+fn push_form_control_line(
+    document: &mut RenderedDocument,
+    action_id: Option<&ActionId>,
+    label: &str,
+    control_type: &str,
+    value: &str,
+    placement: ReaderPlacement,
+    next_control_id: &mut usize,
+) {
     let control_id = u32::try_from(*next_control_id).unwrap_or(u32::MAX);
     *next_control_id += 1;
-    let label = if label.is_empty() { "unnamed" } else { label };
-    let text = if value.is_empty() {
-        format!("[control {control_id}] {control_type:<8} {label}")
-    } else {
-        format!("[control {control_id}] {control_type:<8} {label}: {value}")
-    };
+    let text = format_control_text(control_id, label, control_type, value);
     push_wrapped_control_lines(
         document,
         &text,
@@ -589,7 +750,15 @@ fn push_form_control_block_lines(
         action_id.cloned(),
         control_action(control_type),
     );
-    document.lines.push(RenderedLine::default());
+}
+
+fn format_control_text(control_id: u32, label: &str, control_type: &str, value: &str) -> String {
+    let label = if label.is_empty() { "unnamed" } else { label };
+    if value.is_empty() {
+        format!("[control {control_id}] {control_type:<8} {label}")
+    } else {
+        format!("[control {control_id}] {control_type:<8} {label}: {value}")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1079,6 +1248,13 @@ struct ReaderPlacement {
 }
 
 impl ReaderPlacement {
+    const fn full_width(terminal_width: usize) -> Self {
+        Self {
+            indent: 0,
+            width: terminal_width,
+        }
+    }
+
     fn from_block(block: &SemanticBlock, terminal_width: usize) -> Self {
         let raw_indent = block
             .layout()
