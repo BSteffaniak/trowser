@@ -75,7 +75,7 @@ impl Default for CdpResourcePolicy {
     fn default() -> Self {
         Self {
             block_images: false,
-            block_media: true,
+            block_media: false,
             block_fonts: false,
             block_ads: true,
             block_trackers: true,

@@ -130,7 +130,7 @@ impl Default for ResourcePolicyConfig {
             max_tabs: None,
             max_awake_tabs: Some(8),
             block_images: false,
-            block_video: true,
+            block_video: false,
             block_fonts: false,
             block_ads: true,
             block_trackers: true,

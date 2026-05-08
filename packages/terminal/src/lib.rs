@@ -1693,10 +1693,17 @@ fn attach_preview_image(
     }) else {
         return;
     };
-    let Some(line) = document.lines.iter_mut().skip(start_line).find(|line| {
-        let trimmed = line.text.trim_start();
-        trimmed.starts_with('│') || trimmed.contains("preview:")
-    }) else {
+    let Some(line_index) =
+        document
+            .lines
+            .iter()
+            .enumerate()
+            .skip(start_line)
+            .find_map(|(index, line)| {
+                let trimmed = line.text.trim_start();
+                (trimmed.starts_with('│') || trimmed.contains("preview:")).then_some(index)
+            })
+    else {
         return;
     };
     let pixel_width = preview.width.unwrap_or(1).max(1);
@@ -1706,6 +1713,17 @@ fn attach_preview_image(
         .max(1);
     let ratio = f64::from(pixel_height) / f64::from(pixel_width);
     let cell_height = ((f64::from(cell_width) * ratio / 2.0).round() as u16).clamp(1, 24);
+    let image_line = preview_placeholder_line(placement, usize::from(cell_width));
+    let Some(line) = document.lines.get_mut(line_index) else {
+        return;
+    };
+    line.text.clone_from(&image_line);
+    line.spans = vec![StyledSpan {
+        text: image_line,
+        style: SpanStyle::Chrome,
+    }];
+    line.links.clear();
+    line.controls.clear();
     line.images.push(RenderedImage {
         mime_type: preview.mime_type.clone(),
         data: preview.data.clone(),
@@ -1715,6 +1733,22 @@ fn attach_preview_image(
         cell_height,
         start_col: u16::try_from(placement.indent.saturating_add(2)).unwrap_or(u16::MAX),
     });
+    let reserved = usize::from(cell_height.saturating_sub(1));
+    let rows = (0..reserved).map(|_| {
+        line_with_style(
+            preview_placeholder_line(placement, usize::from(cell_width)),
+            SpanStyle::Chrome,
+        )
+    });
+    document.lines.splice((line_index + 1)..=line_index, rows);
+}
+
+fn preview_placeholder_line(placement: ReaderPlacement, cell_width: usize) -> String {
+    format!(
+        "{}│ {} │",
+        " ".repeat(placement.indent),
+        " ".repeat(cell_width)
+    )
 }
 
 fn push_form_control_block_lines(

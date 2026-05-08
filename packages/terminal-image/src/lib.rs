@@ -36,6 +36,8 @@ pub struct TerminalImageCapabilities {
     pub max_pixel_width: Option<u32>,
     /// Maximum image height in pixels, when known.
     pub max_pixel_height: Option<u32>,
+    /// Wrap terminal image escape sequences for tmux passthrough.
+    pub tmux_passthrough: bool,
 }
 
 impl TerminalImageCapabilities {
@@ -88,58 +90,173 @@ pub fn encode_png_image(
     capabilities: &TerminalImageCapabilities,
     placement: &PngImagePlacement<'_>,
 ) -> Option<Vec<u8>> {
+    encode_png_image_placement(capabilities, placement, true)
+}
+
+/// Encodes a PNG image placement, optionally transmitting the payload first.
+#[must_use]
+pub fn encode_png_image_placement(
+    capabilities: &TerminalImageCapabilities,
+    placement: &PngImagePlacement<'_>,
+    transmit: bool,
+) -> Option<Vec<u8>> {
     match capabilities.preferred_png_protocol()? {
-        ImageProtocol::Kitty => Some(encode_kitty_png(placement)),
-        ImageProtocol::Iterm2 => Some(encode_iterm2_png(placement)),
+        ImageProtocol::Kitty => Some(encode_kitty_png_with_options(
+            placement,
+            capabilities.tmux_passthrough,
+            transmit,
+        )),
+        ImageProtocol::Iterm2 => Some(encode_iterm2_png_with_options(
+            placement,
+            capabilities.tmux_passthrough,
+        )),
         ImageProtocol::Sixel => None,
     }
 }
 
-/// Encodes a Kitty graphics transmit+place sequence for PNG bytes.
+/// Encodes a protocol-specific command that clears visible image placements.
+#[must_use]
+pub fn encode_clear_visible_images(capabilities: &TerminalImageCapabilities) -> Option<Vec<u8>> {
+    match capabilities.preferred_png_protocol()? {
+        ImageProtocol::Kitty => Some(encode_kitty_clear_visible_images(
+            capabilities.tmux_passthrough,
+        )),
+        ImageProtocol::Iterm2 | ImageProtocol::Sixel => None,
+    }
+}
+
+const KITTY_CHUNK_SIZE: usize = 4096;
+
+/// Encodes a Kitty graphics transmit-and-place sequence for PNG bytes.
 #[must_use]
 pub fn encode_kitty_png(placement: &PngImagePlacement<'_>) -> Vec<u8> {
+    encode_kitty_png_with_options(placement, false, true)
+}
+
+fn encode_kitty_png_with_options(
+    placement: &PngImagePlacement<'_>,
+    tmux_passthrough: bool,
+    transmit: bool,
+) -> Vec<u8> {
     let payload = base64_encode(placement.data);
+    let chunks = payload
+        .as_bytes()
+        .chunks(KITTY_CHUNK_SIZE)
+        .collect::<Vec<_>>();
+    let mut output = cursor_move(placement.row, placement.col).into_bytes();
+
+    if transmit {
+        if chunks.is_empty() {
+            let sequence = kitty_sequence(first_kitty_chunk_header(placement, false).as_bytes());
+            append_image_sequence(&mut output, &sequence, tmux_passthrough);
+        }
+
+        for (index, chunk) in chunks.iter().enumerate() {
+            let has_more = index + 1 < chunks.len();
+            let header = if index == 0 {
+                first_kitty_chunk_header(placement, has_more)
+            } else {
+                kitty_continuation_chunk_header(has_more)
+            };
+            let mut body = header.into_bytes();
+            body.extend_from_slice(chunk);
+            let sequence = kitty_sequence(&body);
+            append_image_sequence(&mut output, &sequence, tmux_passthrough);
+        }
+    }
+
+    output.extend_from_slice(cursor_move(placement.row, placement.col).as_bytes());
+    let sequence = kitty_sequence(kitty_place_header(placement).as_bytes());
+    append_image_sequence(&mut output, &sequence, tmux_passthrough);
+    output
+}
+
+fn first_kitty_chunk_header(placement: &PngImagePlacement<'_>, has_more: bool) -> String {
+    format!(
+        "Ga=t,q=2,t=d,i={},f=100,s={},v={},m={};",
+        placement.image_id,
+        placement.pixel_width,
+        placement.pixel_height,
+        u8::from(has_more)
+    )
+}
+
+fn kitty_continuation_chunk_header(has_more: bool) -> String {
+    format!("Gq=2,m={};", u8::from(has_more))
+}
+
+fn kitty_place_header(placement: &PngImagePlacement<'_>) -> String {
+    format!(
+        "Ga=p,q=2,i={},p={},c={},r={},z=1",
+        placement.image_id,
+        placement.image_id,
+        placement.cell_width.max(1),
+        placement.cell_height.max(1)
+    )
+}
+
+fn kitty_sequence(body: &[u8]) -> Vec<u8> {
+    let mut sequence = Vec::with_capacity(body.len() + 4);
+    sequence.extend_from_slice(b"\x1b_");
+    sequence.extend_from_slice(body);
+    sequence.extend_from_slice(b"\x1b\\");
+    sequence
+}
+
+fn encode_kitty_clear_visible_images(tmux_passthrough: bool) -> Vec<u8> {
     let mut output = Vec::new();
-    output.extend_from_slice(b"\x1b_");
-    output.extend_from_slice(
-        format!(
-            "Ga=T,i={},f=100,s={},v={},c={},r={};{}",
-            placement.image_id,
-            placement.pixel_width,
-            placement.pixel_height,
-            placement.cell_width.max(1),
-            placement.cell_height.max(1),
-            payload
-        )
-        .as_bytes(),
-    );
-    output.extend_from_slice(b"\x1b\\");
-    output.extend_from_slice(b"\x1b_");
-    output.extend_from_slice(
-        format!(
-            "Ga=p,i={},p={},C={},R={},c={},r={}",
-            placement.image_id,
-            placement.image_id,
-            placement.col,
-            placement.row,
-            placement.cell_width.max(1),
-            placement.cell_height.max(1)
-        )
-        .as_bytes(),
-    );
-    output.extend_from_slice(b"\x1b\\");
+    let sequence = kitty_sequence(b"Ga=d,q=2,d=a");
+    append_image_sequence(&mut output, &sequence, tmux_passthrough);
     output
 }
 
 /// Encodes an iTerm2 inline image sequence for PNG bytes.
 #[must_use]
 pub fn encode_iterm2_png(placement: &PngImagePlacement<'_>) -> Vec<u8> {
+    encode_iterm2_png_with_options(placement, false)
+}
+
+fn encode_iterm2_png_with_options(
+    placement: &PngImagePlacement<'_>,
+    tmux_passthrough: bool,
+) -> Vec<u8> {
     let payload = base64_encode(placement.data);
-    format!(
-        "\x1b]1337;File=inline=1;width={}px;height={}px;preserveAspectRatio=1:{}\x07",
-        placement.pixel_width, placement.pixel_height, payload
+    let mut output = cursor_move(placement.row, placement.col).into_bytes();
+    let sequence = format!(
+        "\x1b]1337;File=inline=1;width={};height={};preserveAspectRatio=1:{}\x07",
+        placement.cell_width.max(1),
+        placement.cell_height.max(1),
+        payload
     )
-    .into_bytes()
+    .into_bytes();
+    append_image_sequence(&mut output, &sequence, tmux_passthrough);
+    output
+}
+
+fn append_image_sequence(output: &mut Vec<u8>, sequence: &[u8], tmux_passthrough: bool) {
+    if tmux_passthrough {
+        output.extend_from_slice(&wrap_tmux_passthrough(sequence));
+    } else {
+        output.extend_from_slice(sequence);
+    }
+}
+
+fn wrap_tmux_passthrough(sequence: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(sequence.len().saturating_add(16));
+    output.extend_from_slice(b"\x1bPtmux;");
+    for byte in sequence {
+        if *byte == b'\x1b' {
+            output.extend_from_slice(b"\x1b\x1b");
+        } else {
+            output.push(*byte);
+        }
+    }
+    output.extend_from_slice(b"\x1b\\");
+    output
+}
+
+fn cursor_move(row: u16, col: u16) -> String {
+    format!("\x1b[{};{}H", row.saturating_add(1), col.saturating_add(1))
 }
 
 /// Detects image support from common terminal environment variables.
@@ -150,7 +267,8 @@ pub fn detect_from_env() -> TerminalImageCapabilities {
     let term = std::env::var("TERM").unwrap_or_default();
     let mut protocols = Vec::new();
 
-    if std::env::var_os("KITTY_WINDOW_ID").is_some()
+    if std::env::var_os("TROWSER_FORCE_KITTY").is_some()
+        || std::env::var_os("KITTY_WINDOW_ID").is_some()
         || term.contains("kitty")
         || term_program.eq_ignore_ascii_case("WezTerm")
         || term_program.eq_ignore_ascii_case("ghostty")
@@ -170,7 +288,8 @@ pub fn detect_from_env() -> TerminalImageCapabilities {
         push_protocol(&mut protocols, ImageProtocol::Sixel);
     }
 
-    if term_program.eq_ignore_ascii_case("iTerm.app")
+    if std::env::var_os("TROWSER_FORCE_ITERM2").is_some()
+        || term_program.eq_ignore_ascii_case("iTerm.app")
         || lc_terminal.eq_ignore_ascii_case("iTerm2")
         || term_program.eq_ignore_ascii_case("WezTerm")
     {
@@ -178,6 +297,9 @@ pub fn detect_from_env() -> TerminalImageCapabilities {
     }
 
     let (cell_pixel_width, cell_pixel_height) = query_cell_pixel_size();
+    let tmux_passthrough = (std::env::var_os("TMUX").is_some()
+        || std::env::var_os("TROWSER_FORCE_TMUX_PASSTHROUGH").is_some())
+        && std::env::var_os("TROWSER_DISABLE_TMUX_PASSTHROUGH").is_none();
 
     TerminalImageCapabilities {
         protocols,
@@ -185,6 +307,7 @@ pub fn detect_from_env() -> TerminalImageCapabilities {
         cell_pixel_height,
         max_pixel_width: None,
         max_pixel_height: None,
+        tmux_passthrough,
     }
 }
 
@@ -308,7 +431,62 @@ mod tests {
 
         let output = encode_png_image(&caps, &placement).expect("kitty should encode PNG");
         let output = String::from_utf8(output).expect("kitty escape is UTF-8");
-        assert!(output.contains("Ga=T,i=9,f=100"));
-        assert!(output.contains("Ga=p,i=9,p=9,C=3,R=2"));
+        assert!(output.contains("\x1b[3;4H"));
+        assert!(output.contains("Ga=t,q=2,t=d,i=9,f=100"));
+        assert!(output.contains("m=0;"));
+        assert!(output.contains("Ga=p,q=2,i=9,p=9,c=4,r=5,z=1"));
+    }
+
+    #[test]
+    fn wraps_kitty_sequences_for_tmux_passthrough() {
+        let caps = TerminalImageCapabilities {
+            protocols: vec![ImageProtocol::Kitty],
+            tmux_passthrough: true,
+            ..TerminalImageCapabilities::default()
+        };
+        let placement = PngImagePlacement {
+            data: b"png",
+            row: 1,
+            col: 2,
+            pixel_width: 10,
+            pixel_height: 20,
+            cell_width: 4,
+            cell_height: 5,
+            image_id: 9,
+        };
+
+        let output = encode_png_image(&caps, &placement).expect("kitty should encode PNG");
+        let output = String::from_utf8(output).expect("kitty escape is UTF-8");
+
+        assert!(output.contains("\x1b[2;3H"));
+        assert!(output.contains("\x1bPtmux;\x1b\x1b_Ga=t"));
+        assert!(output.contains("\x1bPtmux;\x1b\x1b_Ga=p"));
+    }
+
+    #[test]
+    fn chunks_large_kitty_png_payloads() {
+        let caps = TerminalImageCapabilities {
+            protocols: vec![ImageProtocol::Kitty],
+            ..TerminalImageCapabilities::default()
+        };
+        let data = vec![42; 16 * 1024];
+        let placement = PngImagePlacement {
+            data: &data,
+            row: 0,
+            col: 0,
+            pixel_width: 100,
+            pixel_height: 100,
+            cell_width: 10,
+            cell_height: 5,
+            image_id: 11,
+        };
+
+        let output = encode_png_image(&caps, &placement).expect("kitty should encode PNG");
+        let output = String::from_utf8(output).expect("kitty escape is UTF-8");
+
+        assert!(output.contains("Ga=t,q=2,t=d,i=11"));
+        assert!(output.contains("m=1;"));
+        assert!(output.contains("Gq=2,m=0;"));
+        assert!(output.contains("Ga=p,q=2,i=11,p=11,c=10,r=5,z=1"));
     }
 }

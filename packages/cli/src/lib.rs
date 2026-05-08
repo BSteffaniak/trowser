@@ -4,6 +4,7 @@
 
 //! Command-line interface for trowser.
 
+use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::future::Future;
 use std::io::{ErrorKind, Write, stdout};
@@ -35,7 +36,9 @@ use trowser_terminal::{
     ControlHitboxAction, RenderMode, RenderedDocument, SpanStyle, TerminalRenderOptions,
     render_document_mode, render_plain_text,
 };
-use trowser_terminal_image::{PngImagePlacement, detect_from_env, encode_png_image};
+use trowser_terminal_image::{
+    PngImagePlacement, detect_from_env, encode_clear_visible_images, encode_png_image_placement,
+};
 
 mod trace;
 
@@ -322,9 +325,18 @@ async fn run_interactive(
         "q quit · j/k scroll · m mode · o/t open tab · Tab switch · x close · f follow · i input · c click · b back · F forward · r reload",
     );
     let _guard = TerminalGuard::enter()?;
+    let mut image_state = TerminalImageState::default();
 
     loop {
-        draw_viewport(&page, &rendered, offset, &message, &tab_status, render_mode)?;
+        draw_viewport(
+            &page,
+            &rendered,
+            offset,
+            &message,
+            &tab_status,
+            render_mode,
+            &mut image_state,
+        )?;
         match read()? {
             Event::Key(key) => match key {
                 KeyEvent {
@@ -788,7 +800,18 @@ async fn run_interactive(
         }
     }
 
+    clear_terminal_images()?;
     Ok(0)
+}
+
+fn clear_terminal_images() -> Result<()> {
+    let capabilities = detect_from_env();
+    if let Some(encoded) = encode_clear_visible_images(&capabilities) {
+        let mut out = stdout();
+        out.write_all(&encoded)?;
+        out.flush()?;
+    }
+    Ok(())
 }
 
 fn next_request_id() -> String {
@@ -1189,6 +1212,7 @@ fn draw_viewport(
     message: &str,
     tab_status: &str,
     render_mode: RenderMode,
+    image_state: &mut TerminalImageState,
 ) -> Result<()> {
     let (width, height) = size()?;
     let body_height = height.saturating_sub(2);
@@ -1223,9 +1247,17 @@ fn draw_viewport(
         if let Some(line) = line {
             let is_focused = row == 0 && line_target(line).is_some();
             queue_styled_line(&mut out, line, width, is_focused)?;
-            queue_line_images(&mut out, line, row.saturating_add(1), &image_capabilities)?;
         }
     }
+
+    queue_visible_images(
+        &mut out,
+        document,
+        offset,
+        body_height,
+        &image_capabilities,
+        image_state,
+    )?;
 
     queue!(
         out,
@@ -1279,11 +1311,41 @@ fn queue_styled_line<W: Write>(
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct TerminalImageState {
+    transmitted_ids: BTreeSet<u32>,
+}
+
+fn queue_visible_images<W: Write>(
+    out: &mut W,
+    document: &RenderedDocument,
+    offset: usize,
+    body_height: u16,
+    capabilities: &trowser_terminal_image::TerminalImageCapabilities,
+    image_state: &mut TerminalImageState,
+) -> Result<()> {
+    if capabilities.preferred_png_protocol().is_none() {
+        image_state.transmitted_ids.clear();
+        return Ok(());
+    }
+    if let Some(encoded) = encode_clear_visible_images(capabilities) {
+        out.write_all(&encoded)?;
+    }
+    for row in 0..body_height {
+        let Some(line) = document.lines.get(offset + usize::from(row)) else {
+            continue;
+        };
+        queue_line_images(out, line, row.saturating_add(1), capabilities, image_state)?;
+    }
+    Ok(())
+}
+
 fn queue_line_images<W: Write>(
     out: &mut W,
     line: &trowser_terminal::RenderedLine,
     row: u16,
     capabilities: &trowser_terminal_image::TerminalImageCapabilities,
+    image_state: &mut TerminalImageState,
 ) -> Result<()> {
     if line.images.is_empty() || capabilities.preferred_png_protocol().is_none() {
         return Ok(());
@@ -1292,9 +1354,8 @@ fn queue_line_images<W: Write>(
         if image.mime_type != "image/png" {
             continue;
         }
-        let image_id = u32::from(row)
-            .saturating_mul(1024)
-            .saturating_add(u32::try_from(index + 1).unwrap_or(u32::MAX));
+        let image_id = image_content_id(image, index);
+        let transmit = image_state.transmitted_ids.insert(image_id);
         let placement = PngImagePlacement {
             data: &image.data,
             row,
@@ -1305,11 +1366,27 @@ fn queue_line_images<W: Write>(
             cell_height: image.cell_height,
             image_id,
         };
-        if let Some(encoded) = encode_png_image(capabilities, &placement) {
+        if let Some(encoded) = encode_png_image_placement(capabilities, &placement, transmit) {
             out.write_all(&encoded)?;
         }
     }
     Ok(())
+}
+
+fn image_content_id(image: &trowser_terminal::RenderedImage, index: usize) -> u32 {
+    let mut hash = 2_166_136_261u32;
+    for byte in image
+        .data
+        .iter()
+        .copied()
+        .chain(image.pixel_width.to_le_bytes())
+        .chain(image.pixel_height.to_le_bytes())
+        .chain(u32::try_from(index).unwrap_or(u32::MAX).to_le_bytes())
+    {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    hash.max(1)
 }
 
 fn queue_span_style<W: Write>(out: &mut W, style: SpanStyle, is_focused: bool) -> Result<()> {
