@@ -294,16 +294,38 @@ fn push_nav_summary_lines(
         return;
     }
 
-    document
-        .lines
-        .push(line_with_style("nav:".to_string(), SpanStyle::Chrome));
+    push_nav_chip_lines(document, nav_links, width, next_link_id);
+    document.lines.push(RenderedLine::default());
+}
+
+fn push_nav_chip_lines(
+    document: &mut RenderedDocument,
+    nav_links: Vec<(Option<ActionId>, String, String)>,
+    width: usize,
+    next_link_id: &mut usize,
+) {
+    let max_width = width.max(MIN_BLOCK_WIDTH);
+    let mut current = inline_cells("nav: ", SpanStyle::Chrome, None);
     for (action_id, label, url) in nav_links {
         let link_id = u32::try_from(*next_link_id).unwrap_or(u32::MAX);
         *next_link_id += 1;
-        let value = format!("[{link_id}] {label} <{url}>");
-        push_wrapped_lines(document, &value, 0, width, Some((link_id, action_id)));
+        let label = if label.is_empty() {
+            url.as_str()
+        } else {
+            label.as_str()
+        };
+        let chip = format!("[{link_id}] {label}");
+        let mut cells = inline_cells(&chip, SpanStyle::Link, Some(&(link_id, action_id)));
+        cells.extend(inline_cells("  ", SpanStyle::Normal, None));
+        if current.len() > 5 && current.len().saturating_add(cells.len()) > max_width {
+            push_inline_cells_line(document, &current);
+            current = inline_cells("nav: ", SpanStyle::Chrome, None);
+        }
+        current.extend(cells);
     }
-    document.lines.push(RenderedLine::default());
+    if !current.is_empty() {
+        push_inline_cells_line(document, &current);
+    }
 }
 
 fn push_outline_lines(
@@ -552,10 +574,11 @@ fn push_form_control_block_lines(
 ) {
     let control_id = u32::try_from(*next_control_id).unwrap_or(u32::MAX);
     *next_control_id += 1;
+    let label = if label.is_empty() { "unnamed" } else { label };
     let text = if value.is_empty() {
-        format!("[control {control_id}] {control_type} {label}")
+        format!("[control {control_id}] {control_type:<8} {label}")
     } else {
-        format!("[control {control_id}] {control_type} {label}: {value}")
+        format!("[control {control_id}] {control_type:<8} {label}: {value}")
     };
     push_wrapped_control_lines(
         document,

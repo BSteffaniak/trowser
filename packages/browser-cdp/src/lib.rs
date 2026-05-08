@@ -677,7 +677,7 @@ impl CdpConnection {
             .await
             .ok()
             .flatten();
-        let mut page = ax_page.unwrap_or(dom_page);
+        let mut page = merge_accessibility_page(dom_page, ax_page);
         if page.blocks.is_empty() {
             page.blocks.push(SemanticBlock::Paragraph {
                 text: "No semantic text content was found on this page.".to_string(),
@@ -774,6 +774,181 @@ struct CdpMessage {
     method: Option<String>,
     result: Option<Value>,
     error: Option<Value>,
+}
+
+fn merge_accessibility_page(
+    mut dom_page: SemanticPage,
+    ax_page: Option<SemanticPage>,
+) -> SemanticPage {
+    let Some(ax_page) = ax_page else {
+        return dom_page;
+    };
+    if should_use_ax_fallback(&dom_page, &ax_page) {
+        return ax_page;
+    }
+    enrich_dom_blocks_with_ax(&mut dom_page.blocks, &ax_page.blocks);
+    dom_page
+}
+
+fn should_use_ax_fallback(dom_page: &SemanticPage, ax_page: &SemanticPage) -> bool {
+    if dom_page.blocks.is_empty() {
+        return true;
+    }
+    let dom_richness = dom_page
+        .blocks
+        .iter()
+        .filter(|block| is_structured_dom_block(block))
+        .count();
+    dom_page.blocks.len() < 3 && dom_richness == 0 && ax_page.blocks.len() > dom_page.blocks.len()
+}
+
+const fn is_structured_dom_block(block: &SemanticBlock) -> bool {
+    matches!(
+        block,
+        SemanticBlock::RichParagraph { .. }
+            | SemanticBlock::RichListItem { .. }
+            | SemanticBlock::Quote { .. }
+            | SemanticBlock::CodeBlock { .. }
+            | SemanticBlock::Table { .. }
+    )
+}
+
+fn enrich_dom_blocks_with_ax(dom_blocks: &mut [SemanticBlock], ax_blocks: &[SemanticBlock]) {
+    for block in dom_blocks {
+        match block {
+            SemanticBlock::FormControl {
+                action_id,
+                label,
+                control_type,
+                value,
+                ..
+            } => enrich_dom_control(action_id.as_ref(), label, control_type, value, ax_blocks),
+            SemanticBlock::Link {
+                action_id,
+                text,
+                url,
+                ..
+            } => enrich_dom_link(action_id.as_ref(), text, url, ax_blocks),
+            SemanticBlock::RichParagraph { runs, .. }
+            | SemanticBlock::RichListItem { runs, .. }
+            | SemanticBlock::Quote { runs, .. } => {
+                for run in runs {
+                    if run.is_link() {
+                        enrich_dom_run(run, ax_blocks);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn enrich_dom_control(
+    action_id: Option<&ActionId>,
+    label: &mut String,
+    control_type: &str,
+    value: &mut String,
+    ax_blocks: &[SemanticBlock],
+) {
+    let Some(ax_block) = matching_ax_control(action_id, label, control_type, ax_blocks) else {
+        return;
+    };
+    let SemanticBlock::FormControl {
+        label: ax_label,
+        value: ax_value,
+        ..
+    } = ax_block
+    else {
+        return;
+    };
+    if is_better_label(ax_label, label) {
+        *label = ax_label.clone();
+    }
+    if value.is_empty() && !ax_value.is_empty() {
+        value.clone_from(ax_value);
+    }
+}
+
+fn matching_ax_control<'a>(
+    action_id: Option<&ActionId>,
+    label: &str,
+    control_type: &str,
+    ax_blocks: &'a [SemanticBlock],
+) -> Option<&'a SemanticBlock> {
+    ax_blocks.iter().find(|block| {
+        let SemanticBlock::FormControl {
+            action_id: ax_action_id,
+            label: ax_label,
+            control_type: ax_control_type,
+            ..
+        } = block
+        else {
+            return false;
+        };
+        action_id.is_some_and(|value| ax_action_id.as_ref() == Some(value))
+            || normalized_match(label, ax_label)
+            || (!control_type.is_empty() && control_type == ax_control_type)
+    })
+}
+
+fn enrich_dom_link(
+    action_id: Option<&ActionId>,
+    text: &mut String,
+    url: &str,
+    ax_blocks: &[SemanticBlock],
+) {
+    let Some(ax_text) = matching_ax_link_text(action_id, text, url, ax_blocks) else {
+        return;
+    };
+    if is_better_label(ax_text, text) {
+        *text = ax_text.to_string();
+    }
+}
+
+fn enrich_dom_run(run: &mut TextRun, ax_blocks: &[SemanticBlock]) {
+    let Some(ax_text) = matching_ax_link_text(
+        run.action_id.as_ref(),
+        &run.text,
+        run.url.as_deref().unwrap_or_default(),
+        ax_blocks,
+    ) else {
+        return;
+    };
+    if is_better_label(ax_text, &run.text) {
+        run.text = ax_text.to_string();
+    }
+}
+
+fn matching_ax_link_text<'a>(
+    action_id: Option<&ActionId>,
+    text: &str,
+    url: &str,
+    ax_blocks: &'a [SemanticBlock],
+) -> Option<&'a str> {
+    ax_blocks.iter().find_map(|block| {
+        let SemanticBlock::Link {
+            action_id: ax_action_id,
+            text: ax_text,
+            url: ax_url,
+            ..
+        } = block
+        else {
+            return None;
+        };
+        (action_id.is_some_and(|value| ax_action_id.as_ref() == Some(value))
+            || (!url.is_empty() && url == ax_url)
+            || normalized_match(text, ax_text))
+        .then_some(ax_text.as_str())
+    })
+}
+
+fn is_better_label(candidate: &str, current: &str) -> bool {
+    let candidate = candidate.trim();
+    let current = current.trim();
+    !candidate.is_empty()
+        && (current.is_empty()
+            || candidate.contains('(') && !current.contains('(')
+            || candidate.chars().count() > current.chars().count() + 8)
 }
 
 fn ax_blocks(nodes: &[AxNode]) -> Vec<SemanticBlock> {

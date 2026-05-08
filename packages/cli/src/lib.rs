@@ -1050,7 +1050,8 @@ fn draw_viewport(
             Clear(ClearType::CurrentLine)
         )?;
         if let Some(line) = line {
-            queue_styled_line(&mut out, line, width)?;
+            let is_focused = row == 0 && line_target(line).is_some();
+            queue_styled_line(&mut out, line, width, is_focused)?;
         }
     }
 
@@ -1069,6 +1070,7 @@ fn queue_styled_line<W: Write>(
     out: &mut W,
     line: &trowser_terminal::RenderedLine,
     width: u16,
+    is_focused: bool,
 ) -> Result<()> {
     let mut used = 0usize;
     let spans = if line.spans.is_empty() {
@@ -1086,15 +1088,18 @@ fn queue_styled_line<W: Write>(
         let remaining = usize::from(width) - used;
         let text = span.text.chars().take(remaining).collect::<String>();
         used += text.chars().count();
-        queue_span_style(out, span.style)?;
+        queue_span_style(out, span.style, is_focused)?;
         queue!(out, Print(text))?;
     }
     queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
     Ok(())
 }
 
-fn queue_span_style<W: Write>(out: &mut W, style: SpanStyle) -> Result<()> {
+fn queue_span_style<W: Write>(out: &mut W, style: SpanStyle, is_focused: bool) -> Result<()> {
     queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
+    if is_focused {
+        queue!(out, SetAttribute(Attribute::Reverse))?;
+    }
     match style {
         SpanStyle::Normal => {}
         SpanStyle::Chrome => queue!(out, SetForegroundColor(Color::DarkGrey))?,
