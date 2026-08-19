@@ -127,6 +127,8 @@ pub struct RenderedImage {
     pub cell_height: u16,
     /// Start column on the rendered line.
     pub start_col: u16,
+    /// Row offset from the image anchor line for continuation rows.
+    pub row_offset: u16,
 }
 
 /// A styled text span.
@@ -1179,6 +1181,7 @@ fn offset_images(images: &[RenderedImage], offset: usize) -> Vec<RenderedImage> 
             cell_width: image.cell_width,
             cell_height: image.cell_height,
             start_col: offset_col(image.start_col, offset),
+            row_offset: image.row_offset,
         })
         .collect()
 }
@@ -1724,7 +1727,7 @@ fn attach_preview_image(
     }];
     line.links.clear();
     line.controls.clear();
-    line.images.push(RenderedImage {
+    let rendered_image = RenderedImage {
         mime_type: preview.mime_type.clone(),
         data: preview.data.clone(),
         pixel_width,
@@ -1732,13 +1735,19 @@ fn attach_preview_image(
         cell_width,
         cell_height,
         start_col: u16::try_from(placement.indent.saturating_add(2)).unwrap_or(u16::MAX),
-    });
+        row_offset: 0,
+    };
+    line.images.push(rendered_image.clone());
     let reserved = usize::from(cell_height.saturating_sub(1));
-    let rows = (0..reserved).map(|_| {
-        line_with_style(
+    let rows = (1..=reserved).map(|row_offset| {
+        let mut line = line_with_style(
             preview_placeholder_line(placement, usize::from(cell_width)),
             SpanStyle::Chrome,
-        )
+        );
+        let mut image = rendered_image.clone();
+        image.row_offset = u16::try_from(row_offset).unwrap_or(u16::MAX);
+        line.images.push(image);
+        line
     });
     document.lines.splice((line_index + 1)..=line_index, rows);
 }

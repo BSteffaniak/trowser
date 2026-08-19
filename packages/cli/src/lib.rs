@@ -4,7 +4,7 @@
 
 //! Command-line interface for trowser.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::future::Future;
 use std::io::{ErrorKind, Write, stdout};
@@ -37,7 +37,8 @@ use trowser_terminal::{
     render_document_mode, render_plain_text,
 };
 use trowser_terminal_image::{
-    PngImagePlacement, detect_from_env, encode_clear_visible_images, encode_png_image_placement,
+    PngImagePlacement, detect_from_env, encode_clear_visible_images,
+    encode_delete_image_placements, encode_png_image_placement,
 };
 
 mod trace;
@@ -1237,6 +1238,8 @@ fn draw_viewport(
         Print(truncate_for_terminal(&header, width))
     )?;
 
+    queue_clear_previous_images(&mut out, &image_capabilities, image_state)?;
+
     for row in 0..body_height {
         let line = document.lines.get(offset + usize::from(row));
         queue!(
@@ -1313,7 +1316,50 @@ fn queue_styled_line<W: Write>(
 
 #[derive(Debug, Default)]
 struct TerminalImageState {
+    content_ids: BTreeMap<u32, u32>,
+    next_image_id: u32,
     transmitted_ids: BTreeSet<u32>,
+    visible_placements: BTreeSet<(u32, u32)>,
+}
+
+impl TerminalImageState {
+    fn image_id_for_content(&mut self, content_key: u32) -> u32 {
+        if let Some(image_id) = self.content_ids.get(&content_key).copied() {
+            return image_id;
+        }
+        let image_id = self.next_image_id.max(1);
+        self.next_image_id = image_id.saturating_add(1).max(1);
+        self.content_ids.insert(content_key, image_id);
+        image_id
+    }
+
+    fn clear(&mut self) {
+        self.content_ids.clear();
+        self.next_image_id = 1;
+        self.transmitted_ids.clear();
+        self.visible_placements.clear();
+    }
+}
+
+fn queue_clear_previous_images<W: Write>(
+    out: &mut W,
+    capabilities: &trowser_terminal_image::TerminalImageCapabilities,
+    image_state: &mut TerminalImageState,
+) -> Result<()> {
+    if capabilities.preferred_png_protocol().is_none() {
+        image_state.clear();
+        return Ok(());
+    }
+    let old_placements = image_state
+        .visible_placements
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    if let Some(encoded) = encode_delete_image_placements(capabilities, &old_placements) {
+        out.write_all(&encoded)?;
+    }
+    image_state.visible_placements.clear();
+    Ok(())
 }
 
 fn queue_visible_images<W: Write>(
@@ -1325,17 +1371,22 @@ fn queue_visible_images<W: Write>(
     image_state: &mut TerminalImageState,
 ) -> Result<()> {
     if capabilities.preferred_png_protocol().is_none() {
-        image_state.transmitted_ids.clear();
         return Ok(());
     }
-    if let Some(encoded) = encode_clear_visible_images(capabilities) {
-        out.write_all(&encoded)?;
-    }
+    let mut placed_images = BTreeSet::new();
     for row in 0..body_height {
         let Some(line) = document.lines.get(offset + usize::from(row)) else {
             continue;
         };
-        queue_line_images(out, line, row.saturating_add(1), capabilities, image_state)?;
+        queue_line_images(
+            out,
+            line,
+            row.saturating_add(1),
+            body_height,
+            capabilities,
+            image_state,
+            &mut placed_images,
+        )?;
     }
     Ok(())
 }
@@ -1344,8 +1395,10 @@ fn queue_line_images<W: Write>(
     out: &mut W,
     line: &trowser_terminal::RenderedLine,
     row: u16,
+    body_height: u16,
     capabilities: &trowser_terminal_image::TerminalImageCapabilities,
     image_state: &mut TerminalImageState,
+    placed_images: &mut BTreeSet<(u32, i32, u16)>,
 ) -> Result<()> {
     if line.images.is_empty() || capabilities.preferred_png_protocol().is_none() {
         return Ok(());
@@ -1354,26 +1407,94 @@ fn queue_line_images<W: Write>(
         if image.mime_type != "image/png" {
             continue;
         }
-        let image_id = image_content_id(image, index);
+        let content_key = image_content_key(image, index);
+        let anchor_row = i32::from(row) - i32::from(image.row_offset);
+        if !placed_images.insert((content_key, anchor_row, image.start_col)) {
+            continue;
+        }
+        let Some(clipped) = clipped_image_placement(image, row, body_height) else {
+            continue;
+        };
+        let image_id = image_state.image_id_for_content(content_key);
+        let placement_id = image_placement_id(clipped.anchor_row, image.start_col, index);
         let transmit = image_state.transmitted_ids.insert(image_id);
         let placement = PngImagePlacement {
             data: &image.data,
-            row,
+            row: clipped.row,
             col: image.start_col,
             pixel_width: image.pixel_width,
             pixel_height: image.pixel_height,
             cell_width: image.cell_width,
-            cell_height: image.cell_height,
+            cell_height: clipped.cell_height,
+            source_y: clipped.source_y,
+            source_height: clipped.source_height,
             image_id,
+            placement_id,
         };
         if let Some(encoded) = encode_png_image_placement(capabilities, &placement, transmit) {
             out.write_all(&encoded)?;
+            image_state
+                .visible_placements
+                .insert((image_id, placement_id));
         }
     }
     Ok(())
 }
 
-fn image_content_id(image: &trowser_terminal::RenderedImage, index: usize) -> u32 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClippedImagePlacement {
+    row: u16,
+    anchor_row: u16,
+    cell_height: u16,
+    source_y: u32,
+    source_height: Option<u32>,
+}
+
+fn clipped_image_placement(
+    image: &trowser_terminal::RenderedImage,
+    row: u16,
+    body_height: u16,
+) -> Option<ClippedImagePlacement> {
+    let anchor_row = i32::from(row) - i32::from(image.row_offset);
+    let image_bottom = anchor_row + i32::from(image.cell_height).saturating_sub(1);
+    let visible_top = anchor_row.max(1);
+    let visible_bottom = image_bottom.min(i32::from(body_height));
+    if visible_top > visible_bottom {
+        return None;
+    }
+
+    let clipped_top_cells = u32::try_from(visible_top.saturating_sub(anchor_row)).ok()?;
+    let visible_cells = u16::try_from(visible_bottom.saturating_sub(visible_top).saturating_add(1))
+        .ok()?
+        .max(1);
+    let source_y = scaled_image_pixels(image.pixel_height, clipped_top_cells, image.cell_height);
+    let source_height = if visible_cells == image.cell_height && source_y == 0 {
+        None
+    } else {
+        Some(scaled_image_pixels(
+            image.pixel_height,
+            u32::from(visible_cells),
+            image.cell_height,
+        ))
+    };
+
+    Some(ClippedImagePlacement {
+        row: u16::try_from(visible_top).ok()?,
+        anchor_row: u16::try_from(anchor_row.max(1)).ok()?,
+        cell_height: visible_cells,
+        source_y,
+        source_height,
+    })
+}
+
+fn scaled_image_pixels(pixel_height: u32, cells: u32, total_cells: u16) -> u32 {
+    let total_cells = u32::from(total_cells).max(1);
+    let pixels =
+        u64::from(pixel_height.max(1)).saturating_mul(u64::from(cells)) / u64::from(total_cells);
+    u32::try_from(pixels.max(1)).unwrap_or(u32::MAX)
+}
+
+fn image_content_key(image: &trowser_terminal::RenderedImage, index: usize) -> u32 {
     let mut hash = 2_166_136_261u32;
     for byte in image
         .data
@@ -1381,6 +1502,20 @@ fn image_content_id(image: &trowser_terminal::RenderedImage, index: usize) -> u3
         .copied()
         .chain(image.pixel_width.to_le_bytes())
         .chain(image.pixel_height.to_le_bytes())
+        .chain(u32::try_from(index).unwrap_or(u32::MAX).to_le_bytes())
+    {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    hash.max(1)
+}
+
+fn image_placement_id(row: u16, col: u16, index: usize) -> u32 {
+    let mut hash = 2_166_136_261u32;
+    for byte in row
+        .to_le_bytes()
+        .into_iter()
+        .chain(col.to_le_bytes())
         .chain(u32::try_from(index).unwrap_or(u32::MAX).to_le_bytes())
     {
         hash ^= u32::from(byte);
@@ -2223,7 +2358,10 @@ fn run_doctor(config: &TrowserConfig, json: bool) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{daemon_process_matches, legacy_daemon_pids_from_ps, parse_pid, parse_ps_line};
+    use super::{
+        TerminalImageState, clipped_image_placement, daemon_process_matches,
+        legacy_daemon_pids_from_ps, parse_pid, parse_ps_line,
+    };
 
     #[test]
     fn parses_valid_positive_pid() {
@@ -2265,5 +2403,39 @@ mod tests {
               12 /usr/bin/other server start --foreground\n\
               13 /repo/target/debug/trowser server start --foreground\n";
         assert_eq!(legacy_daemon_pids_from_ps(output, 13), vec![10]);
+    }
+
+    #[test]
+    fn assigns_distinct_terminal_image_ids() {
+        let mut state = TerminalImageState::default();
+
+        let first = state.image_id_for_content(100);
+        let second = state.image_id_for_content(200);
+        let first_again = state.image_id_for_content(100);
+
+        assert_eq!(first, 1);
+        assert_eq!(second, 2);
+        assert_eq!(first_again, first);
+    }
+
+    #[test]
+    fn clips_scrolled_inline_images_to_visible_rows() {
+        let image = trowser_terminal::RenderedImage {
+            mime_type: "image/png".to_string(),
+            data: vec![1, 2, 3],
+            pixel_width: 100,
+            pixel_height: 80,
+            cell_width: 10,
+            cell_height: 4,
+            start_col: 2,
+            row_offset: 2,
+        };
+
+        let clipped = clipped_image_placement(&image, 1, 20).expect("image should be visible");
+
+        assert_eq!(clipped.row, 1);
+        assert_eq!(clipped.cell_height, 2);
+        assert_eq!(clipped.source_y, 40);
+        assert_eq!(clipped.source_height, Some(40));
     }
 }

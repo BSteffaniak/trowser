@@ -8,6 +8,8 @@
 //! capabilities, prefer protocols that can place PNG payloads efficiently, and
 //! keep protocol-specific escape generation outside the semantic renderer.
 
+use std::fmt::Write as _;
+
 use serde::{Deserialize, Serialize};
 
 /// Supported terminal image protocol families.
@@ -80,8 +82,14 @@ pub struct PngImagePlacement<'a> {
     pub cell_width: u16,
     /// Desired height in terminal cells.
     pub cell_height: u16,
-    /// Stable per-render image id for Kitty transmit/place.
+    /// Source y-offset in image pixels for clipped Kitty placement.
+    pub source_y: u32,
+    /// Source height in image pixels for clipped Kitty placement.
+    pub source_height: Option<u32>,
+    /// Stable image-content id for Kitty transmit.
     pub image_id: u32,
+    /// Stable per-screen placement id for Kitty place/delete.
+    pub placement_id: u32,
 }
 
 /// Encodes a PNG image for the best directly-supported terminal protocol.
@@ -114,7 +122,22 @@ pub fn encode_png_image_placement(
     }
 }
 
-/// Encodes a protocol-specific command that clears visible image placements.
+/// Encodes protocol-specific commands that delete image placements without deleting payloads.
+#[must_use]
+pub fn encode_delete_image_placements(
+    capabilities: &TerminalImageCapabilities,
+    placements: &[(u32, u32)],
+) -> Option<Vec<u8>> {
+    match capabilities.preferred_png_protocol()? {
+        ImageProtocol::Kitty => Some(encode_kitty_delete_image_placements(
+            placements,
+            capabilities.tmux_passthrough,
+        )),
+        ImageProtocol::Iterm2 | ImageProtocol::Sixel => None,
+    }
+}
+
+/// Encodes a protocol-specific command that clears transmitted images.
 #[must_use]
 pub fn encode_clear_visible_images(capabilities: &TerminalImageCapabilities) -> Option<Vec<u8>> {
     match capabilities.preferred_png_protocol()? {
@@ -186,13 +209,20 @@ fn kitty_continuation_chunk_header(has_more: bool) -> String {
 }
 
 fn kitty_place_header(placement: &PngImagePlacement<'_>) -> String {
-    format!(
+    let mut header = format!(
         "Ga=p,q=2,i={},p={},c={},r={},z=1",
         placement.image_id,
-        placement.image_id,
+        placement.placement_id,
         placement.cell_width.max(1),
         placement.cell_height.max(1)
-    )
+    );
+    if placement.source_y > 0 || placement.source_height.is_some() {
+        let _ = write!(header, ",y={}", placement.source_y);
+        if let Some(source_height) = placement.source_height {
+            let _ = write!(header, ",h={source_height}");
+        }
+    }
+    header
 }
 
 fn kitty_sequence(body: &[u8]) -> Vec<u8> {
@@ -201,6 +231,19 @@ fn kitty_sequence(body: &[u8]) -> Vec<u8> {
     sequence.extend_from_slice(body);
     sequence.extend_from_slice(b"\x1b\\");
     sequence
+}
+
+fn encode_kitty_delete_image_placements(
+    placements: &[(u32, u32)],
+    tmux_passthrough: bool,
+) -> Vec<u8> {
+    let mut output = Vec::new();
+    for (image_id, placement_id) in placements {
+        let body = format!("Ga=d,q=2,d=p,i={image_id},p={placement_id}");
+        let sequence = kitty_sequence(body.as_bytes());
+        append_image_sequence(&mut output, &sequence, tmux_passthrough);
+    }
+    output
 }
 
 fn encode_kitty_clear_visible_images(tmux_passthrough: bool) -> Vec<u8> {
@@ -426,7 +469,10 @@ mod tests {
             pixel_height: 20,
             cell_width: 4,
             cell_height: 5,
+            source_y: 0,
+            source_height: None,
             image_id: 9,
+            placement_id: 19,
         };
 
         let output = encode_png_image(&caps, &placement).expect("kitty should encode PNG");
@@ -434,7 +480,7 @@ mod tests {
         assert!(output.contains("\x1b[3;4H"));
         assert!(output.contains("Ga=t,q=2,t=d,i=9,f=100"));
         assert!(output.contains("m=0;"));
-        assert!(output.contains("Ga=p,q=2,i=9,p=9,c=4,r=5,z=1"));
+        assert!(output.contains("Ga=p,q=2,i=9,p=19,c=4,r=5,z=1"));
     }
 
     #[test]
@@ -452,7 +498,10 @@ mod tests {
             pixel_height: 20,
             cell_width: 4,
             cell_height: 5,
+            source_y: 0,
+            source_height: None,
             image_id: 9,
+            placement_id: 19,
         };
 
         let output = encode_png_image(&caps, &placement).expect("kitty should encode PNG");
@@ -478,7 +527,10 @@ mod tests {
             pixel_height: 100,
             cell_width: 10,
             cell_height: 5,
+            source_y: 0,
+            source_height: None,
             image_id: 11,
+            placement_id: 21,
         };
 
         let output = encode_png_image(&caps, &placement).expect("kitty should encode PNG");
@@ -487,6 +539,6 @@ mod tests {
         assert!(output.contains("Ga=t,q=2,t=d,i=11"));
         assert!(output.contains("m=1;"));
         assert!(output.contains("Gq=2,m=0;"));
-        assert!(output.contains("Ga=p,q=2,i=11,p=11,c=10,r=5,z=1"));
+        assert!(output.contains("Ga=p,q=2,i=11,p=21,c=10,r=5,z=1"));
     }
 }
