@@ -206,6 +206,29 @@ impl ImagePreview {
     pub const fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
+
+    /// Return dimensions encoded in a supported image payload.
+    #[must_use]
+    pub fn intrinsic_dimensions(&self) -> Option<(u32, u32)> {
+        if self.mime_type != "image/png" {
+            return None;
+        }
+        png_dimensions(&self.data)
+    }
+}
+
+fn png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    const PNG_HEADER_LENGTH: usize = 24;
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if data.len() < PNG_HEADER_LENGTH
+        || data.get(..8) != Some(PNG_SIGNATURE)
+        || data.get(12..16) != Some(b"IHDR")
+    {
+        return None;
+    }
+    let width = u32::from_be_bytes(data.get(16..20)?.try_into().ok()?);
+    let height = u32::from_be_bytes(data.get(20..24)?.try_into().ok()?);
+    (width > 0 && height > 0).then_some((width, height))
 }
 
 /// Browser-derived layout tree node used by layout-preserving renderers.
@@ -867,8 +890,23 @@ fn sanitize_text_run(run: &TextRun) -> TextRun {
 #[cfg(test)]
 mod tests {
     use super::{
-        SemanticBlock, SemanticPage, SemanticRegion, reader_links, sanitize_terminal_text,
+        ImagePreview, SemanticBlock, SemanticPage, SemanticRegion, reader_links,
+        sanitize_terminal_text,
     };
+
+    #[test]
+    fn reads_intrinsic_png_dimensions() {
+        let mut data = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        data.extend_from_slice(&37_u32.to_be_bytes());
+        data.extend_from_slice(&19_u32.to_be_bytes());
+        let preview = ImagePreview {
+            mime_type: "image/png".to_string(),
+            data,
+            width: Some(1),
+            height: Some(1),
+        };
+        assert_eq!(preview.intrinsic_dimensions(), Some((37, 19)));
+    }
 
     #[test]
     fn strips_escape_characters() {

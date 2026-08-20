@@ -1174,11 +1174,21 @@ impl CdpConnection {
             .ok_or(CdpError::MissingField("Page.captureScreenshot.data"))?;
         let data = base64_decode(encoded.as_bytes())
             .ok_or_else(|| CdpError::Extraction("invalid screenshot base64".to_string()))?;
+        let (width, height) = ImagePreview {
+            mime_type: "image/png".to_string(),
+            data: data.clone(),
+            width: None,
+            height: None,
+        }
+        .intrinsic_dimensions()
+        .ok_or_else(|| {
+            CdpError::Extraction("captured screenshot has invalid PNG dimensions".to_string())
+        })?;
         Ok(ImagePreview {
             mime_type: "image/png".to_string(),
             data,
-            width: Some(f64_to_u32(width)),
-            height: Some(f64_to_u32(height)),
+            width: Some(width),
+            height: Some(height),
         })
     }
 
@@ -1754,15 +1764,6 @@ fn normalized_match(left: &str, right: &str) -> bool {
     let left = left.trim().to_lowercase();
     let right = right.trim().to_lowercase();
     !left.is_empty() && (left == right || left.contains(&right) || right.contains(&left))
-}
-
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "CDP screenshot clip dimensions are clamped positive CSS pixel values"
-)]
-fn f64_to_u32(value: f64) -> u32 {
-    value.round().max(1.0).min(f64::from(u32::MAX)) as u32
 }
 
 fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {

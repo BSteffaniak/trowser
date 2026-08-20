@@ -1707,8 +1707,12 @@ fn attach_preview_image(
     else {
         return;
     };
-    let pixel_width = preview.width.unwrap_or(1).max(1);
-    let pixel_height = preview.height.unwrap_or(1).max(1);
+    let (pixel_width, pixel_height) = preview
+        .intrinsic_dimensions()
+        .or_else(|| preview.width.zip(preview.height))
+        .unwrap_or((1, 1));
+    let pixel_width = pixel_width.max(1);
+    let pixel_height = pixel_height.max(1);
     let cell_width = u16::try_from(placement.width.saturating_sub(4).clamp(10, 80))
         .unwrap_or(u16::MAX)
         .max(1);
@@ -2724,6 +2728,43 @@ mod tests {
                     && matches!(placement.payload, bmux_tui::image::ImagePayload::Png { .. })
         ));
         assert!(rendered.to_plain_text().contains("diagram"));
+    }
+
+    #[test]
+    fn uses_intrinsic_png_dimensions_for_image_intent() {
+        let mut data = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        data.extend_from_slice(&37_u32.to_be_bytes());
+        data.extend_from_slice(&19_u32.to_be_bytes());
+        let page = SemanticPage {
+            url: "https://example.com/image".to_string(),
+            title: "Image".to_string(),
+            blocks: vec![SemanticBlock::Image {
+                alt: "diagram".to_string(),
+                url: "https://example.com/diagram.png".to_string(),
+                width: Some(320),
+                height: Some(160),
+                preview: Some(ImagePreview {
+                    mime_type: "image/png".to_string(),
+                    data,
+                    width: Some(320),
+                    height: Some(160),
+                }),
+                layout: None,
+                region: SemanticRegion::Main,
+            }],
+            layout_tree: None,
+            viewport: None,
+            scroll_y_px: 0,
+        };
+
+        let rendered =
+            render_document_mode(&page, &TerminalRenderOptions::default(), RenderMode::Page);
+        let image = rendered
+            .lines
+            .iter()
+            .find_map(|line| line.images.first())
+            .expect("rendered image intent");
+        assert_eq!((image.pixel_width, image.pixel_height), (37, 19));
     }
 
     #[test]
