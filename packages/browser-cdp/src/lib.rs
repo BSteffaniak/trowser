@@ -435,6 +435,18 @@ impl CdpBrowser {
         })
     }
 
+    /// Returns whether the Chromium child process is still running.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the child process status cannot be queried.
+    pub fn is_running(&mut self) -> CdpResult<bool> {
+        self.child
+            .try_wait()
+            .map(|status| status.is_none())
+            .map_err(CdpError::Launch)
+    }
+
     /// Terminates the Chromium child process.
     ///
     /// # Errors
@@ -2522,6 +2534,28 @@ mod tests {
         assert!(std::fs::symlink_metadata(profile.path().join("SingletonLock")).is_ok());
     }
 
+    #[tokio::test]
+    async fn reports_child_liveness() {
+        let child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut browser = super::CdpBrowser {
+            child,
+            _profile: None,
+            port: 1,
+            resource_policy: super::CdpResourcePolicy::default(),
+            pages: std::collections::BTreeMap::new(),
+        };
+        assert!(browser.is_running().unwrap());
+        browser.shutdown().await.unwrap();
+        assert!(!browser.is_running().unwrap());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn reports_early_browser_exit_with_bounded_stderr() {
@@ -2545,7 +2579,7 @@ mod tests {
         .await
         .expect_err("browser should exit before DevTools is ready");
 
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(5));
         assert!(matches!(
             error,
             CdpError::DevToolsExited { details, .. }

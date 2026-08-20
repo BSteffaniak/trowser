@@ -809,10 +809,7 @@ impl TrowserServer {
         viewport: Option<SemanticViewport>,
     ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
         let mut browser = self.browser.lock().await;
-        if browser.is_none() {
-            let config = self.cdp_config();
-            *browser = Some(CdpBrowser::launch(&config).await?);
-        }
+        self.ensure_browser_running(&mut browser).await?;
         let Some(browser) = browser.as_mut() else {
             unreachable!("browser initialized above")
         };
@@ -830,14 +827,26 @@ impl TrowserServer {
         viewport: Option<SemanticViewport>,
     ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
         let mut browser = self.browser.lock().await;
-        if browser.is_none() {
-            let config = self.cdp_config();
-            *browser = Some(CdpBrowser::launch(&config).await?);
-        }
+        self.ensure_browser_running(&mut browser).await?;
         let Some(browser) = browser.as_mut() else {
             unreachable!("browser initialized above")
         };
         browser.navigate_tab(tab_id, url, viewport).await
+    }
+
+    async fn ensure_browser_running(
+        &self,
+        browser: &mut Option<CdpBrowser>,
+    ) -> Result<(), trowser_browser_cdp::CdpError> {
+        let needs_launch = match browser.as_mut() {
+            Some(browser) => !browser.is_running()?,
+            None => true,
+        };
+        if needs_launch {
+            *browser = None;
+            *browser = Some(CdpBrowser::launch(&self.cdp_config()).await?);
+        }
+        Ok(())
     }
 
     async fn ensure_browser_tab_awake(
@@ -845,6 +854,19 @@ impl TrowserServer {
         tab_id: &TabId,
         viewport: Option<SemanticViewport>,
     ) -> Result<(), trowser_browser_cdp::CdpError> {
+        let browser_needs_restart = {
+            let mut browser = self.browser.lock().await;
+            match browser.as_mut() {
+                Some(running_browser) => {
+                    let running = running_browser.is_running()?;
+                    if !running {
+                        *browser = None;
+                    }
+                    !running
+                }
+                None => true,
+            }
+        };
         let state = self.state.lock().await;
         let Some(tab) = state.tabs.get(tab_id) else {
             return Err(trowser_browser_cdp::CdpError::PageAction(format!(
@@ -852,7 +874,8 @@ impl TrowserServer {
                 tab_id.as_str()
             )));
         };
-        let needs_wake = tab.lifecycle.is_sleeping() || tab.cached_page.is_none();
+        let needs_wake =
+            browser_needs_restart || tab.lifecycle.is_sleeping() || tab.cached_page.is_none();
         let url = tab.url.clone();
         drop(state);
 
@@ -933,18 +956,9 @@ impl TrowserServer {
         viewport: Option<SemanticViewport>,
     ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
         let mut browser = self.browser.lock().await;
-        if browser.is_none() {
-            let config = self.cdp_config();
-            *browser = Some(CdpBrowser::launch(&config).await?);
-            let Some(browser) = browser.as_mut() else {
-                unreachable!("browser initialized above")
-            };
-            return browser
-                .open_tab(tab_id.clone(), fallback_url, viewport)
-                .await;
-        }
+        self.ensure_browser_running(&mut browser).await?;
         let Some(browser) = browser.as_mut() else {
-            unreachable!("browser checked above")
+            unreachable!("browser initialized above")
         };
         match browser.reload_tab(tab_id, viewport).await {
             Ok(page) => Ok(page),
