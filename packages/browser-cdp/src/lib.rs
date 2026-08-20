@@ -144,6 +144,9 @@ pub enum CdpError {
     /// Stale Chromium profile ownership files could not be removed.
     #[error("failed to recover stale Chromium profile ownership: {0}")]
     ProfileRecovery(std::io::Error),
+    /// A crashing persistent profile could not be preserved for recovery.
+    #[error("failed to preserve crashing Chromium profile: {0}")]
+    ProfileBackup(std::io::Error),
     /// Browser process exited before its `DevTools` endpoint became ready.
     #[error("Chromium exited before exposing its DevTools endpoint ({status}){details}")]
     DevToolsExited {
@@ -240,6 +243,25 @@ impl CdpBrowser {
     pub async fn launch(config: &CdpBackendConfig) -> CdpResult<Self> {
         let discovery = discover_browser_binary(config.browser_binary.as_ref());
         let browser_binary = discovery.binary.ok_or(CdpError::BrowserNotFound)?;
+        match Self::launch_once(config, &browser_binary).await {
+            Err(error @ CdpError::DevToolsExited { .. }) => {
+                let Some(profile_dir) = config.profile_dir.as_ref() else {
+                    return Err(error);
+                };
+                preserve_crashing_profile(profile_dir)?;
+                Self::launch_once(config, &browser_binary)
+                    .await
+                    .map_err(|retry_error| {
+                        CdpError::PageAction(format!(
+                            "Chromium profile recovery failed after {error}: {retry_error}"
+                        ))
+                    })
+            }
+            result => result,
+        }
+    }
+
+    async fn launch_once(config: &CdpBackendConfig, browser_binary: &Path) -> CdpResult<Self> {
         let (profile_path, profile) = if let Some(profile_dir) = &config.profile_dir {
             std::fs::create_dir_all(profile_dir).map_err(CdpError::TempDir)?;
             (profile_dir.clone(), None)
@@ -254,7 +276,7 @@ impl CdpBrowser {
             recover_stale_profile_ownership(&profile_path)?;
         }
         let previous_devtools_port = read_devtools_port_file(&profile_path)?;
-        let mut child = launch_browser(&browser_binary, &profile_path, config.headless)?;
+        let mut child = launch_browser(browser_binary, &profile_path, config.headless)?;
         let stderr_task = capture_browser_stderr(&mut child);
         let stderr = stderr_task
             .as_ref()
@@ -667,6 +689,35 @@ pub async fn fetch_semantic_page(config: &CdpBackendConfig, url: &str) -> CdpRes
     result
 }
 
+fn profile_backup_path(profile_dir: &Path) -> PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    let file_name = profile_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("profile");
+    profile_dir.with_file_name(format!("{file_name}.crashed-{timestamp}"))
+}
+
+fn preserve_crashing_profile(profile_dir: &Path) -> CdpResult<PathBuf> {
+    if !profile_dir.exists() {
+        std::fs::create_dir_all(profile_dir).map_err(CdpError::ProfileBackup)?;
+        return Ok(profile_dir.to_path_buf());
+    }
+    let mut backup = profile_backup_path(profile_dir);
+    let mut suffix = 0_u32;
+    while backup.exists() {
+        suffix = suffix.saturating_add(1);
+        backup = profile_backup_path(profile_dir).with_extension(format!("crashed-{suffix}"));
+    }
+    std::fs::rename(profile_dir, &backup).map_err(CdpError::ProfileBackup)?;
+    std::fs::create_dir_all(profile_dir).map_err(CdpError::ProfileBackup)?;
+    Ok(backup)
+}
+
 #[cfg(unix)]
 fn current_hostname() -> std::io::Result<String> {
     let mut buffer = [0_i8; 256];
@@ -739,7 +790,7 @@ struct BrowserStderrCapture {
     task: JoinHandle<std::io::Result<()>>,
 }
 
-fn launch_browser(binary: &PathBuf, profile_dir: &Path, headless: bool) -> CdpResult<Child> {
+fn launch_browser(binary: &Path, profile_dir: &Path, headless: bool) -> CdpResult<Child> {
     let mut command = Command::new(binary);
     command
         .arg("--remote-debugging-port=0")
@@ -2529,7 +2580,7 @@ mod tests {
 
     use super::{
         BrowserStderr, CdpError, MAX_BROWSER_STDERR_BYTES, browser_stderr_details,
-        capture_browser_stderr, current_hostname, parse_devtools_port,
+        capture_browser_stderr, current_hostname, parse_devtools_port, preserve_crashing_profile,
         recover_stale_profile_ownership,
     };
 
@@ -2563,6 +2614,22 @@ mod tests {
         assert_eq!(
             browser_stderr_details(&stderr),
             ": profile is already in use"
+        );
+    }
+
+    #[test]
+    fn preserves_crashing_profile_before_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("default");
+        std::fs::create_dir(&profile).unwrap();
+        std::fs::write(profile.join("Cookies"), b"preserve me").unwrap();
+
+        let backup = preserve_crashing_profile(&profile).unwrap();
+
+        assert!(profile.is_dir());
+        assert_eq!(
+            std::fs::read(backup.join("Cookies")).unwrap(),
+            b"preserve me"
         );
     }
 
