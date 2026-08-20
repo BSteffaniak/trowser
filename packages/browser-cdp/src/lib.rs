@@ -173,6 +173,9 @@ pub enum CdpError {
     /// `CDP` returned an error object.
     #[error("CDP method {method} failed: {message}")]
     Method { method: String, message: String },
+    /// A `CDP` request or event wait exceeded its deadline.
+    #[error("CDP operation timed out: {0}")]
+    OperationTimeout(String),
     /// Expected `CDP` response field was missing.
     #[error("CDP response missing field: {0}")]
     MissingField(&'static str),
@@ -857,8 +860,17 @@ struct DevToolsTarget {
     web_socket_debugger_url: String,
 }
 
+const CDP_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn cdp_http_client() -> CdpResult<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(CDP_HTTP_TIMEOUT)
+        .build()
+        .map_err(CdpError::Http)
+}
+
 async fn create_page_target(port: u16) -> CdpResult<DevToolsTarget> {
-    let client = reqwest::Client::new();
+    let client = cdp_http_client()?;
     let url = format!("http://127.0.0.1:{port}/json/new?about:blank");
     let response = client.put(&url).send().await?;
     response
@@ -869,7 +881,7 @@ async fn create_page_target(port: u16) -> CdpResult<DevToolsTarget> {
 }
 
 async fn close_page_target(port: u16, target_id: &str) -> CdpResult<()> {
-    let client = reqwest::Client::new();
+    let client = cdp_http_client()?;
     let url = format!("http://127.0.0.1:{port}/json/close/{target_id}");
     let response = client.get(&url).send().await?;
     response.error_for_status()?;
@@ -933,6 +945,8 @@ enum CdpActionOutcome {
     Navigate(String),
 }
 
+const CDP_CALL_TIMEOUT: Duration = Duration::from_secs(15);
+
 struct CdpConnection {
     socket: WsStream,
     next_id: u64,
@@ -945,6 +959,13 @@ impl CdpConnection {
     }
 
     async fn call(&mut self, method: &str, params: Value) -> CdpResult<Value> {
+        let method_name = method.to_string();
+        tokio::time::timeout(CDP_CALL_TIMEOUT, self.call_inner(method, params))
+            .await
+            .map_err(|_| CdpError::OperationTimeout(method_name))?
+    }
+
+    async fn call_inner(&mut self, method: &str, params: Value) -> CdpResult<Value> {
         let id = self.next_id;
         self.next_id += 1;
         let request = json!({
@@ -977,6 +998,13 @@ impl CdpConnection {
     }
 
     async fn wait_for_event(&mut self, method: &str) -> CdpResult<()> {
+        let method_name = method.to_string();
+        tokio::time::timeout(CDP_CALL_TIMEOUT, self.wait_for_event_inner(method))
+            .await
+            .map_err(|_| CdpError::OperationTimeout(method_name))?
+    }
+
+    async fn wait_for_event_inner(&mut self, method: &str) -> CdpResult<()> {
         while let Some(message) = self.socket.next().await {
             let message = message?;
             let Message::Text(text) = message else {

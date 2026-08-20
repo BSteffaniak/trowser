@@ -19,6 +19,8 @@ pub type BrowserEffect = std::sync::Arc<
 /// Application messages produced by asynchronous browser/daemon commands.
 #[derive(Debug, Clone)]
 pub enum BrowserMessage {
+    /// Begin one browser action after the runtime starts admitting terminal input.
+    StartAction(BrowserAction),
     /// A page and its freshly projected terminal document are ready.
     PageLoaded {
         /// Sanitized browser page.
@@ -722,6 +724,7 @@ impl Program for BrowserProgram {
     ) -> Result<Update<Self::Message>, Self::Error> {
         let update = match event {
             RuntimeEvent::Terminal(event) => self.handle_terminal(&event),
+            RuntimeEvent::Message(BrowserMessage::StartAction(action)) => self.action(action),
             RuntimeEvent::Message(BrowserMessage::PageLoaded {
                 page,
                 document,

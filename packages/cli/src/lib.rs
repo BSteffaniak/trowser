@@ -261,28 +261,8 @@ async fn run_bmux_interactive(
     initial_url: Option<String>,
 ) -> Result<u8> {
     let client = ensure_server(paths).await?;
-    let page = if let Some(url) = initial_url {
-        open_and_snapshot(&client, &url).await?
-    } else {
-        active_snapshot_or_empty(&client).await
-    };
-    bmux_interactive::run(client, config, page).await
-}
-
-async fn open_and_snapshot(
-    client: &TrowserClient,
-    url: &str,
-) -> Result<trowser_render::SemanticPage> {
-    let opened = client
-        .send(&Request::Open {
-            url: url.to_string(),
-            viewport: current_viewport_hint(),
-        })
-        .await?;
-    let Response::Opened { tab_id } = opened else {
-        anyhow::bail!("unexpected open response: {opened:?}");
-    };
-    snapshot_tab(client, tab_id).await
+    let page = active_snapshot_or_empty(&client).await;
+    bmux_interactive::run(client, config, page, initial_url).await
 }
 
 async fn follow_and_snapshot(

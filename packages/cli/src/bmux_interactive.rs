@@ -26,6 +26,7 @@ pub async fn run(
     client: TrowserClient,
     config: &TrowserConfig,
     initial_page: trowser_render::SemanticPage,
+    initial_url: Option<String>,
 ) -> Result<u8> {
     let size = terminal_size()?;
     if size.width < 2 || size.height < 2 {
@@ -42,6 +43,7 @@ pub async fn run(
     );
     let mut program = BrowserProgram::new(initial_page, document, size);
     program.set_effect(effect_factory(client.clone()));
+    let startup = initial_url.map(BrowserAction::OpenUrl);
     if let Response::Tabs(snapshot) = client.send(&Request::ListTabs).await? {
         program.set_tabs(snapshot.tabs);
     }
@@ -74,6 +76,11 @@ pub async fn run(
         },
     );
     let (runtime, handle) = Runtime::new(program, presenter, RuntimeConfig::default());
+    if let Some(action) = startup {
+        handle
+            .try_send(BrowserMessage::StartAction(action))
+            .map_err(|_| anyhow::anyhow!("failed to queue initial browser navigation"))?;
+    }
     let input = TerminalInput::start::<BrowserProgram>(handle, |error| BrowserMessage::Failed {
         message: error.to_string(),
         generation: u64::MAX,
