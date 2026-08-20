@@ -8,15 +8,18 @@
 //! implementation details should live.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
-use std::process::Stdio;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use trowser_browser::{
     BrowserBackend, BrowserCapabilities, BrowserError, BrowserResult, ExtractedPage,
@@ -126,18 +129,38 @@ pub enum CdpError {
     /// No Chromium-compatible browser binary could be found.
     #[error("Chromium-compatible browser binary was not found")]
     BrowserNotFound,
-    /// No available local port could be allocated for `CDP`.
-    #[error("failed to allocate local CDP port: {0}")]
-    Port(std::io::Error),
+    /// The `DevToolsActivePort` file could not be read.
+    #[error("failed to read Chromium DevToolsActivePort: {0}")]
+    DevToolsPortIo(std::io::Error),
     /// Browser process failed to spawn.
     #[error("failed to launch browser: {0}")]
     Launch(std::io::Error),
     /// Browser temporary profile directory could not be created.
     #[error("failed to create temporary browser profile: {0}")]
     TempDir(std::io::Error),
-    /// Browser did not expose a page target in time.
-    #[error("timed out waiting for Chromium DevTools endpoint")]
-    DevToolsTimeout,
+    /// Persistent Chromium profile is already owned by another process.
+    #[error("Chromium profile is already in use: {0}")]
+    ProfileInUse(PathBuf),
+    /// Stale Chromium profile ownership files could not be removed.
+    #[error("failed to recover stale Chromium profile ownership: {0}")]
+    ProfileRecovery(std::io::Error),
+    /// Browser process exited before its `DevTools` endpoint became ready.
+    #[error("Chromium exited before exposing its DevTools endpoint ({status}){details}")]
+    DevToolsExited {
+        /// Browser exit status.
+        status: ExitStatus,
+        /// Bounded browser diagnostic output.
+        details: String,
+    },
+    /// Browser did not expose its `DevTools` endpoint in time.
+    #[error("timed out waiting for Chromium DevTools endpoint{details}")]
+    DevToolsTimeout {
+        /// Bounded browser diagnostic output.
+        details: String,
+    },
+    /// Chromium wrote an invalid dynamic `DevTools` port file.
+    #[error("invalid Chromium DevToolsActivePort file: {0}")]
+    DevToolsPort(String),
     /// HTTP request to the `CDP` discovery endpoint failed.
     #[error("CDP HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
@@ -208,12 +231,11 @@ impl CdpBrowser {
     ///
     /// # Errors
     ///
-    /// Returns an error if a browser binary cannot be found, a debug port cannot
-    /// be allocated, a profile directory cannot be created, or Chromium fails to spawn.
+    /// Returns an error if a browser binary cannot be found, a profile directory cannot
+    /// be created, Chromium fails to spawn, or its `DevTools` endpoint does not become ready.
     pub async fn launch(config: &CdpBackendConfig) -> CdpResult<Self> {
         let discovery = discover_browser_binary(config.browser_binary.as_ref());
         let browser_binary = discovery.binary.ok_or(CdpError::BrowserNotFound)?;
-        let port = allocate_local_port().map_err(CdpError::Port)?;
         let (profile_path, profile) = if let Some(profile_dir) = &config.profile_dir {
             std::fs::create_dir_all(profile_dir).map_err(CdpError::TempDir)?;
             (profile_dir.clone(), None)
@@ -224,8 +246,34 @@ impl CdpBrowser {
                 .map_err(CdpError::TempDir)?;
             (profile.path().to_path_buf(), Some(profile))
         };
-        let child = launch_browser(&browser_binary, &profile_path, port, config.headless)?;
-        wait_for_devtools(port).await?;
+        if profile.is_none() {
+            recover_stale_profile_ownership(&profile_path)?;
+        }
+        let previous_devtools_port = read_devtools_port_file(&profile_path)?;
+        let mut child = launch_browser(&browser_binary, &profile_path, config.headless)?;
+        let stderr_task = capture_browser_stderr(&mut child);
+        let stderr = stderr_task
+            .as_ref()
+            .map_or_else(BrowserStderr::default, |capture| {
+                Arc::clone(&capture.buffer)
+            });
+        let port = match wait_for_devtools(
+            &mut child,
+            &profile_path,
+            previous_devtools_port.as_deref(),
+            &stderr,
+        )
+        .await
+        {
+            Ok(port) => port,
+            Err(error) => {
+                terminate_child(&mut child).await;
+                if let Some(capture) = stderr_task {
+                    let _ = capture.task.await;
+                }
+                return Err(error);
+            }
+        };
         Ok(Self {
             child,
             _profile: profile,
@@ -393,7 +441,8 @@ impl CdpBrowser {
     ///
     /// Returns an error if process termination fails.
     pub async fn shutdown(&mut self) -> CdpResult<()> {
-        self.child.kill().await.map_err(CdpError::Launch)
+        terminate_child(&mut self.child).await;
+        Ok(())
     }
 }
 
@@ -595,15 +644,82 @@ pub async fn fetch_semantic_page(config: &CdpBackendConfig, url: &str) -> CdpRes
     result
 }
 
-fn launch_browser(
-    binary: &PathBuf,
-    profile_dir: &std::path::Path,
-    port: u16,
-    headless: bool,
-) -> CdpResult<Child> {
+#[cfg(unix)]
+fn current_hostname() -> std::io::Result<String> {
+    let mut buffer = [0_i8; 256];
+    // SAFETY: `buffer` is writable for the supplied length and remains alive for the call.
+    if unsafe { libc::gethostname(buffer.as_mut_ptr(), buffer.len()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let bytes = buffer
+        .iter()
+        .take_while(|byte| **byte != 0)
+        .map(|byte| byte.to_ne_bytes()[0])
+        .collect::<Vec<_>>();
+    String::from_utf8(bytes).map_err(std::io::Error::other)
+}
+
+#[cfg(unix)]
+fn parse_singleton_owner(owner: &str) -> Option<(&str, u32)> {
+    let (hostname, pid) = owner.rsplit_once('-')?;
+    Some((hostname, pid.parse().ok()?))
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 performs an existence/permission check and sends no signal.
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(unix)]
+fn recover_stale_profile_ownership(profile_dir: &Path) -> CdpResult<()> {
+    let lock_path = profile_dir.join("SingletonLock");
+    let owner = match std::fs::read_link(&lock_path) {
+        Ok(owner) => owner.to_string_lossy().into_owned(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(CdpError::ProfileRecovery(error)),
+    };
+    let Some((owner_host, owner_pid)) = parse_singleton_owner(&owner) else {
+        return Err(CdpError::ProfileInUse(profile_dir.to_path_buf()));
+    };
+    let hostname = current_hostname().map_err(CdpError::ProfileRecovery)?;
+    if owner_host != hostname || process_is_alive(owner_pid) {
+        return Err(CdpError::ProfileInUse(profile_dir.to_path_buf()));
+    }
+    for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+        match std::fs::remove_file(profile_dir.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(CdpError::ProfileRecovery(error)),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn recover_stale_profile_ownership(_profile_dir: &Path) -> CdpResult<()> {
+    Ok(())
+}
+
+const DEVTOOLS_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const DEVTOOLS_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_BROWSER_STDERR_BYTES: usize = 32 * 1024;
+
+type BrowserStderr = Arc<Mutex<Vec<u8>>>;
+
+struct BrowserStderrCapture {
+    buffer: BrowserStderr,
+    task: JoinHandle<std::io::Result<()>>,
+}
+
+fn launch_browser(binary: &PathBuf, profile_dir: &Path, headless: bool) -> CdpResult<Child> {
     let mut command = Command::new(binary);
     command
-        .arg(format!("--remote-debugging-port={port}"))
+        .arg("--remote-debugging-port=0")
         .arg(format!("--user-data-dir={}", profile_dir.display()))
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
@@ -613,7 +729,8 @@ fn launch_browser(
         .arg("about:blank")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
 
     if headless {
         command.arg("--headless=new").arg("--disable-gpu");
@@ -622,9 +739,103 @@ fn launch_browser(
     command.spawn().map_err(CdpError::Launch)
 }
 
-fn allocate_local_port() -> std::io::Result<u16> {
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
-    listener.local_addr().map(|addr| addr.port())
+fn capture_browser_stderr(child: &mut Child) -> Option<BrowserStderrCapture> {
+    let mut stderr = child.stderr.take()?;
+    let buffer = BrowserStderr::default();
+    let task_buffer = Arc::clone(&buffer);
+    let task = tokio::spawn(async move {
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = stderr.read(&mut chunk).await?;
+            if read == 0 {
+                return Ok(());
+            }
+            let mut output = task_buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let remaining = MAX_BROWSER_STDERR_BYTES.saturating_sub(output.len());
+            output.extend_from_slice(&chunk[..read.min(remaining)]);
+        }
+    });
+    Some(BrowserStderrCapture { buffer, task })
+}
+
+async fn terminate_child(child: &mut Child) {
+    if child.try_wait().ok().flatten().is_none() {
+        let _ = child.kill().await;
+    }
+    let _ = child.wait().await;
+}
+
+fn browser_stderr_details(stderr: &BrowserStderr) -> String {
+    let message = {
+        let output = stderr
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        String::from_utf8_lossy(&output).trim().to_string()
+    };
+    if message.is_empty() {
+        String::new()
+    } else {
+        format!(": {message}")
+    }
+}
+
+fn read_devtools_port_file(profile_dir: &Path) -> CdpResult<Option<String>> {
+    let path = profile_dir.join("DevToolsActivePort");
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(CdpError::DevToolsPortIo(error)),
+    }
+}
+
+fn parse_devtools_port(contents: &str) -> CdpResult<u16> {
+    let port = contents
+        .lines()
+        .next()
+        .ok_or_else(|| CdpError::DevToolsPort("missing port".to_string()))?
+        .parse::<u16>()
+        .map_err(|error| CdpError::DevToolsPort(error.to_string()))?;
+    if port == 0 {
+        return Err(CdpError::DevToolsPort("port must not be zero".to_string()));
+    }
+    Ok(port)
+}
+
+async fn wait_for_devtools(
+    child: &mut Child,
+    profile_dir: &Path,
+    previous_devtools_port: Option<&str>,
+    stderr: &BrowserStderr,
+) -> CdpResult<u16> {
+    let client = reqwest::Client::new();
+    let deadline = Instant::now() + DEVTOOLS_STARTUP_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait().map_err(CdpError::Launch)? {
+            return Err(CdpError::DevToolsExited {
+                status,
+                details: browser_stderr_details(stderr),
+            });
+        }
+        if let Some(contents) = read_devtools_port_file(profile_dir)?
+            && previous_devtools_port != Some(contents.as_str())
+        {
+            let port = parse_devtools_port(&contents)?;
+            let url = format!("http://127.0.0.1:{port}/json/version");
+            if let Ok(response) = client.get(url).send().await
+                && response.status().is_success()
+            {
+                return Ok(port);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(CdpError::DevToolsTimeout {
+                details: browser_stderr_details(stderr),
+            });
+        }
+        tokio::time::sleep(DEVTOOLS_POLL_INTERVAL).await;
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -632,20 +843,6 @@ struct DevToolsTarget {
     id: String,
     #[serde(rename = "webSocketDebuggerUrl")]
     web_socket_debugger_url: String,
-}
-
-async fn wait_for_devtools(port: u16) -> CdpResult<()> {
-    let client = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{port}/json/version");
-    for _ in 0..100 {
-        if let Ok(response) = client.get(&url).send().await
-            && response.status().is_success()
-        {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    Err(CdpError::DevToolsTimeout)
 }
 
 async fn create_page_target(port: u16) -> CdpResult<DevToolsTarget> {
@@ -2247,5 +2444,141 @@ impl BrowserBackend for CdpBackend {
                 scroll_y_px: 0,
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Stdio;
+
+    use super::{
+        BrowserStderr, CdpError, MAX_BROWSER_STDERR_BYTES, browser_stderr_details,
+        capture_browser_stderr, current_hostname, parse_devtools_port,
+        recover_stale_profile_ownership,
+    };
+
+    #[test]
+    fn parses_dynamic_devtools_port() {
+        assert_eq!(
+            parse_devtools_port("9222\n/devtools/browser/id\n").unwrap(),
+            9222
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_dynamic_devtools_port() {
+        assert!(matches!(
+            parse_devtools_port("not-a-port\n"),
+            Err(CdpError::DevToolsPort(_))
+        ));
+        assert!(matches!(
+            parse_devtools_port("0\n"),
+            Err(CdpError::DevToolsPort(_))
+        ));
+    }
+
+    #[test]
+    fn formats_browser_stderr_for_errors() {
+        let stderr = BrowserStderr::default();
+        stderr
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(b"profile is already in use\n");
+        assert_eq!(
+            browser_stderr_details(&stderr),
+            ": profile is already in use"
+        );
+    }
+
+    #[test]
+    fn recovers_provably_stale_local_profile_ownership() {
+        let profile = tempfile::tempdir().unwrap();
+        let owner = format!("{}-{}", current_hostname().unwrap(), u32::MAX);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(owner, profile.path().join("SingletonLock")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("cookie", profile.path().join("SingletonCookie")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("socket", profile.path().join("SingletonSocket")).unwrap();
+
+        recover_stale_profile_ownership(profile.path()).unwrap();
+
+        assert!(!profile.path().join("SingletonLock").exists());
+        assert!(!profile.path().join("SingletonCookie").exists());
+        assert!(!profile.path().join("SingletonSocket").exists());
+    }
+
+    #[test]
+    fn does_not_recover_live_local_profile_ownership() {
+        let profile = tempfile::tempdir().unwrap();
+        let owner = format!("{}-{}", current_hostname().unwrap(), std::process::id());
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(owner, profile.path().join("SingletonLock")).unwrap();
+
+        assert!(matches!(
+            recover_stale_profile_ownership(profile.path()),
+            Err(CdpError::ProfileInUse(_))
+        ));
+        assert!(std::fs::symlink_metadata(profile.path().join("SingletonLock")).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reports_early_browser_exit_with_bounded_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let directory = tempfile::tempdir().unwrap();
+        let browser = directory.path().join("fake-chromium");
+        std::fs::write(
+            &browser,
+            "#!/bin/sh\necho 'profile is already in use' >&2\nexit 12\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = Instant::now();
+        let error = super::CdpBrowser::launch(&super::CdpBackendConfig {
+            browser_binary: Some(browser),
+            profile_dir: None,
+            ..super::CdpBackendConfig::default()
+        })
+        .await
+        .expect_err("browser should exit before DevTools is ready");
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(
+            error,
+            CdpError::DevToolsExited { details, .. }
+                if details.contains("profile is already in use")
+        ));
+    }
+
+    #[tokio::test]
+    async fn browser_stderr_capture_is_bounded() {
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "head -c {} /dev/zero >&2",
+                MAX_BROWSER_STDERR_BYTES * 2
+            ))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("test shell should launch");
+        let capture = capture_browser_stderr(&mut child).expect("stderr should be piped");
+        child.wait().await.expect("test shell should exit");
+        capture
+            .task
+            .await
+            .expect("capture task should join")
+            .unwrap();
+        assert_eq!(
+            capture
+                .buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            MAX_BROWSER_STDERR_BYTES
+        );
     }
 }

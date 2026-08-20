@@ -1700,6 +1700,7 @@ name = "trowser_browser_cdp"
 version = "0.0.1-alpha.0"
 dependencies = [
  "futures-util",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
