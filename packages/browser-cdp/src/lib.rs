@@ -320,6 +320,22 @@ impl CdpBrowser {
         page.forward().await
     }
 
+    /// Scrolls a tab to an absolute CSS-pixel offset and extracts semantic content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the page target is missing or evaluation/extraction fails.
+    pub async fn scroll_tab(
+        &mut self,
+        tab_id: &TabId,
+        y_px: u32,
+        viewport: Option<SemanticViewport>,
+    ) -> CdpResult<SemanticPage> {
+        let page = self.page_mut(tab_id)?;
+        page.set_viewport(viewport).await?;
+        page.scroll_to(y_px).await
+    }
+
     /// Activates/clicks a stable DOM action in a tab and extracts semantic content.
     ///
     /// # Errors
@@ -454,6 +470,19 @@ impl CdpPage {
     async fn forward(&mut self) -> CdpResult<SemanticPage> {
         let entry_id = self.history_entry(1).await?;
         self.navigate_to_history_entry(entry_id).await
+    }
+
+    async fn scroll_to(&mut self, y_px: u32) -> CdpResult<SemanticPage> {
+        self.cdp
+            .call(
+                "Runtime.evaluate",
+                json!({
+                    "expression": format!("window.scrollTo(0, {y_px}); window.scrollY"),
+                    "returnByValue": true,
+                }),
+            )
+            .await?;
+        self.cdp.extract_semantic_page(self.viewport).await
     }
 
     async fn activate_action(&mut self, action_id: &ActionId) -> CdpResult<SemanticPage> {

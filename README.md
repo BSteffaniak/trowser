@@ -15,23 +15,28 @@ The goal is a daemon-backed terminal browser that uses real browser engines for 
 
 ## Current status
 
-Initial workspace scaffold plus a working local daemon/client IPC vertical slice and first-pass Chromium/CDP semantic extraction:
+Initial workspace scaffold plus a daemon/client IPC vertical slice, Chromium/CDP semantic extraction, and a BMUX-backed interactive terminal client:
 
 ```bash
-# Start the daemon in the foreground
+# Open the interactive browser (the daemon is started automatically when needed)
+cargo run -p trowser_cli -- interactive
+
+# Open a URL directly in the interactive browser
+cargo run -p trowser_cli -- open https://example.com
+
+# Start the daemon explicitly in the foreground
 cargo run -p trowser_cli -- server start --foreground
 
 # In another terminal, query the daemon
 cargo run -p trowser_cli -- status
 
-# Open a URL through the daemon, launch Chromium/CDP, and render semantic page text
-cargo run -p trowser_cli -- open https://example.com
-
 # Stop the daemon
 cargo run -p trowser_cli -- server stop
 ```
 
-`doctor` detects terminal image support and looks for a Chromium-compatible binary. CDP extraction currently launches a short-lived Chromium instance per navigation and uses DOM-based semantic extraction; accessibility-tree extraction and persistent browser process reuse are next.
+The interactive client uses `bmux_tui_runtime` for input, command scheduling, redraw, resize, and shutdown. Trowser projects sanitized browser semantics into BMUX text, interaction, and protocol-neutral image scenes. BMUX owns terminal capability detection, Kitty/Sixel/iTerm2 encoding, image reconciliation, cleanup, and the Crossterm terminal lifecycle. Unsupported graphics hosts continue to receive semantic text and media placeholders.
+
+`doctor` reports BMUX terminal image capabilities and looks for a Chromium-compatible binary. CDP extraction currently launches a short-lived Chromium instance per navigation and uses DOM-based semantic extraction; accessibility-tree extraction and persistent browser process reuse are next.
 
 ## Development
 

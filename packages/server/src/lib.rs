@@ -244,6 +244,7 @@ impl TrowserServer {
             Request::Reload { viewport } => self.handle_reload(viewport).await,
             Request::Back { viewport } => self.handle_back(viewport).await,
             Request::Forward { viewport } => self.handle_forward(viewport).await,
+            Request::ScrollTo { y_px, viewport } => self.handle_scroll_to(y_px, viewport).await,
             Request::ActivateAction {
                 action_id,
                 viewport,
@@ -623,6 +624,23 @@ impl TrowserServer {
         }
     }
 
+    async fn handle_scroll_to(&self, y_px: u32, viewport: Option<ViewportHint>) -> Response {
+        let Some(tab_id) = self.active_tab_id().await else {
+            return Response::Error {
+                message: "no active tab".to_string(),
+            };
+        };
+        match self
+            .scroll_page(&tab_id, y_px, viewport.map(ViewportHint::semantic_viewport))
+            .await
+        {
+            Ok(page) => self.store_page(tab_id, page).await,
+            Err(error) => Response::Error {
+                message: error.to_string(),
+            },
+        }
+    }
+
     async fn handle_activate_action(
         &self,
         action_id: ActionId,
@@ -970,6 +988,26 @@ impl TrowserServer {
             return Err(trowser_browser_cdp::CdpError::NavigationHistory);
         };
         browser.forward_tab(tab_id, viewport).await
+    }
+
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "browser mutex intentionally serializes access to persistent CDP page targets"
+    )]
+    async fn scroll_page(
+        &self,
+        tab_id: &TabId,
+        y_px: u32,
+        viewport: Option<SemanticViewport>,
+    ) -> Result<SemanticPage, trowser_browser_cdp::CdpError> {
+        self.ensure_browser_tab_awake(tab_id, viewport).await?;
+        let mut browser = self.browser.lock().await;
+        let Some(browser) = browser.as_mut() else {
+            return Err(trowser_browser_cdp::CdpError::PageAction(
+                "browser is not connected".to_string(),
+            ));
+        };
+        browser.scroll_tab(tab_id, y_px, viewport).await
     }
 
     #[allow(

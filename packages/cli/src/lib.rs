@@ -4,27 +4,13 @@
 
 //! Command-line interface for trowser.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
-use std::future::Future;
-use std::io::{ErrorKind, Write, stdout};
+use std::io::ErrorKind;
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
-use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton,
-    MouseEventKind, poll, read,
-};
-use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
-use crossterm::terminal::{
-    BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate, EnterAlternateScreen,
-    LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
-};
-use crossterm::{execute, queue};
 use trowser_browser_cdp::discover_browser_binary;
 use trowser_cli_schema::{Cli, Command, ServerCommand, SessionCommand, TabCloseArgs, TabsCommand};
 use trowser_client::{ClientError, TrowserClient};
@@ -32,18 +18,10 @@ use trowser_config::{ConfigPaths, TROWSER_DAEMON_READY_FILE_ENV, TrowserConfig};
 use trowser_ipc::{Request, Response, ServerStatus, ViewportHint};
 use trowser_server::TrowserServer;
 use trowser_session_models::ActionId;
-use trowser_terminal::{
-    ControlHitboxAction, RenderMode, RenderedDocument, SpanStyle, TerminalRenderOptions,
-    render_document_mode, render_plain_text,
-};
-use trowser_terminal_image::{
-    PngImagePlacement, detect_from_env, encode_clear_visible_images,
-    encode_delete_image_placements, encode_png_image_placement,
-};
+use trowser_terminal::{TerminalRenderOptions, render_plain_text};
 
+mod bmux_interactive;
 mod trace;
-
-static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Runs the trowser CLI.
 ///
@@ -67,8 +45,8 @@ pub async fn run() -> Result<u8> {
         Command::Open {
             url,
             non_interactive: _,
-        } => run_interactive(&paths, &config, Some(url)).await,
-        Command::Interactive => run_interactive(&paths, &config, None).await,
+        } => run_bmux_interactive(&paths, &config, Some(url)).await,
+        Command::Interactive => run_bmux_interactive(&paths, &config, None).await,
         Command::Server { command } => run_server(&command, &paths, cli.json).await,
         Command::Session { command } => run_session(&command, &paths, cli.json).await,
         Command::Tabs { command } => run_tabs_command(&command, &paths, &config, cli.json).await,
@@ -171,7 +149,6 @@ async fn run_open(
             &page,
             &TerminalRenderOptions {
                 width: config.render.max_width,
-                image_capabilities: detect_from_env(),
             },
         );
         print!("{rendered}");
@@ -215,7 +192,6 @@ async fn run_follow(
             &page,
             &TerminalRenderOptions {
                 width: config.render.max_width,
-                image_capabilities: detect_from_env(),
             },
         );
         print!("{rendered}");
@@ -268,7 +244,6 @@ fn print_page(
             page,
             &TerminalRenderOptions {
                 width: config.render.max_width,
-                image_capabilities: detect_from_env(),
             },
         );
         print!("{rendered}");
@@ -280,543 +255,18 @@ fn print_page(
     clippy::too_many_lines,
     reason = "small crossterm input loop is clearer while interactive mode is still minimal"
 )]
-async fn run_interactive(
+async fn run_bmux_interactive(
     paths: &ConfigPaths,
     config: &TrowserConfig,
     initial_url: Option<String>,
 ) -> Result<u8> {
     let client = ensure_server(paths).await?;
-    let mut page = if let Some(url) = initial_url {
+    let page = if let Some(url) = initial_url {
         open_and_snapshot(&client, &url).await?
     } else {
         active_snapshot_or_empty(&client).await
     };
-    let mut render_mode = RenderMode::default();
-    let mut rendered = render_page_document(&page, config, render_mode);
-    let mut tab_status = tabs_status(&client).await.unwrap_or_default();
-    let mut offset = page_scroll_offset(&page, &rendered);
-    let mut search_query = String::new();
-    let mut message = String::from(
-        "q quit · j/k scroll · m mode · o/t open tab · Tab switch · x close · X close all · f follow · i input · c click · b back · F forward · r reload",
-    );
-    let _guard = TerminalGuard::enter()?;
-    let mut image_state = TerminalImageState::default();
-
-    loop {
-        draw_viewport(
-            &page,
-            &rendered,
-            offset,
-            &message,
-            &tab_status,
-            render_mode,
-            &mut image_state,
-        )?;
-        match read()? {
-            Event::Key(key) => match key {
-                KeyEvent {
-                    code: KeyCode::Char('q'),
-                    modifiers: KeyModifiers::NONE,
-                    ..
-                }
-                | KeyEvent {
-                    code: KeyCode::Char('c'),
-                    modifiers: KeyModifiers::CONTROL,
-                    ..
-                } => break,
-                KeyEvent {
-                    code: KeyCode::Char('j') | KeyCode::Down,
-                    ..
-                } => {
-                    offset = offset
-                        .saturating_add(1)
-                        .min(rendered.lines.len().saturating_sub(1));
-                }
-                KeyEvent {
-                    code: KeyCode::Char('k') | KeyCode::Up,
-                    ..
-                } => offset = offset.saturating_sub(1),
-                KeyEvent {
-                    code: KeyCode::Char('g'),
-                    ..
-                } => offset = 0,
-                KeyEvent {
-                    code: KeyCode::Char('m'),
-                    ..
-                } => {
-                    render_mode = render_mode.next();
-                    rendered = render_page_document(&page, config, render_mode);
-                    offset = page_scroll_offset(&page, &rendered);
-                    message = format!("render mode: {}", render_mode.label());
-                }
-                KeyEvent {
-                    code: KeyCode::Char('G'),
-                    ..
-                } => offset = rendered.lines.len().saturating_sub(1),
-                KeyEvent {
-                    code: KeyCode::Enter,
-                    ..
-                } => {
-                    if let Some((_, target)) = focused_action(&rendered, offset) {
-                        let client_clone = client.clone();
-                        if let Some(updated_page) =
-                            load_with_ui(&client, "activating action", None, async move {
-                                activate_click_target(&client_clone, target).await
-                            })
-                            .await?
-                        {
-                            page = updated_page;
-                            rendered = render_page_document(&page, config, render_mode);
-                            tab_status = tabs_status(&client).await.unwrap_or_default();
-                            offset = page_scroll_offset(&page, &rendered);
-                            message = "activated focused action".to_string();
-                        } else {
-                            message = "action canceled".to_string();
-                        }
-                    }
-                }
-                KeyEvent {
-                    code: KeyCode::Char('a'),
-                    ..
-                } => {
-                    if let Some((row, _)) = next_action(&rendered, offset.saturating_add(1), true) {
-                        offset = row;
-                        message = "focused next action".to_string();
-                    }
-                }
-                KeyEvent {
-                    code: KeyCode::Char('A'),
-                    ..
-                } => {
-                    if let Some((row, _)) = next_action(&rendered, offset.saturating_sub(1), false)
-                    {
-                        offset = row;
-                        message = "focused previous action".to_string();
-                    }
-                }
-                KeyEvent {
-                    code: KeyCode::Char('/'),
-                    ..
-                } => {
-                    if let Some(query) = prompt_input("Search: ")? {
-                        search_query = query;
-                        if let Some(found) = find_line(&rendered, &search_query, 0, true) {
-                            offset = found;
-                            message = format!("found: {search_query}");
-                        } else {
-                            message = format!("not found: {search_query}");
-                        }
-                    }
-                }
-                KeyEvent {
-                    code: KeyCode::Char('n'),
-                    ..
-                } => {
-                    if let Some(found) =
-                        find_line(&rendered, &search_query, offset.saturating_add(1), true)
-                    {
-                        offset = found;
-                        message = format!("found: {search_query}");
-                    }
-                }
-                KeyEvent {
-                    code: KeyCode::Char('N'),
-                    ..
-                } => {
-                    if let Some(found) =
-                        find_line(&rendered, &search_query, offset.saturating_sub(1), false)
-                    {
-                        offset = found;
-                        message = format!("found: {search_query}");
-                    }
-                }
-                KeyEvent {
-                    code: KeyCode::Char('o' | 't'),
-                    ..
-                } => {
-                    if let Some(url) = prompt_input("Open URL: ")? {
-                        let request_id = next_request_id();
-                        let client_clone = client.clone();
-                        let url_clone = url.clone();
-                        if let Some(updated_page) = load_with_ui(
-                            &client,
-                            &format!("loading {url}"),
-                            Some(request_id.clone()),
-                            async move {
-                                navigate_and_snapshot_with_request(
-                                    &client_clone,
-                                    request_id,
-                                    url_clone,
-                                )
-                                .await
-                            },
-                        )
-                        .await?
-                        {
-                            page = updated_page;
-                            rendered = render_page_document(&page, config, render_mode);
-                            tab_status = tabs_status(&client).await.unwrap_or_default();
-                            offset = page_scroll_offset(&page, &rendered);
-                            message = format!("opened {url}");
-                        } else {
-                            message = "load canceled".to_string();
-                        }
-                    }
-                }
-                KeyEvent {
-                    code: KeyCode::Tab, ..
-                } => match next_tab_and_snapshot(&client).await {
-                    Ok(updated_page) => {
-                        page = updated_page;
-                        rendered = render_page_document(&page, config, render_mode);
-                        tab_status = tabs_status(&client).await.unwrap_or_default();
-                        offset = page_scroll_offset(&page, &rendered);
-                        message = "next tab".to_string();
-                    }
-                    Err(error) => message = error.to_string(),
-                },
-                KeyEvent {
-                    code: KeyCode::BackTab,
-                    ..
-                } => match previous_tab_and_snapshot(&client).await {
-                    Ok(updated_page) => {
-                        page = updated_page;
-                        rendered = render_page_document(&page, config, render_mode);
-                        tab_status = tabs_status(&client).await.unwrap_or_default();
-                        offset = page_scroll_offset(&page, &rendered);
-                        message = "previous tab".to_string();
-                    }
-                    Err(error) => message = error.to_string(),
-                },
-                KeyEvent {
-                    code: KeyCode::Char('x'),
-                    ..
-                } => match close_active_tab_and_snapshot(&client).await {
-                    Ok(updated_page) => {
-                        page = updated_page;
-                        rendered = render_page_document(&page, config, render_mode);
-                        tab_status = tabs_status(&client).await.unwrap_or_default();
-                        offset = page_scroll_offset(&page, &rendered);
-                        message = "closed tab".to_string();
-                    }
-                    Err(error) => message = error.to_string(),
-                },
-                KeyEvent {
-                    code: KeyCode::Char('X'),
-                    ..
-                } => {
-                    if prompt_input("Close all tabs? type yes: ")?
-                        .is_some_and(|answer| answer.trim().eq_ignore_ascii_case("yes"))
-                    {
-                        match close_all_tabs(&client).await {
-                            Ok(outcome) => {
-                                page = empty_page("Press o to open a URL.");
-                                rendered = render_page_document(&page, config, render_mode);
-                                tab_status = tabs_status(&client).await.unwrap_or_default();
-                                offset = page_scroll_offset(&page, &rendered);
-                                let noun = if outcome.closed_tabs.len() == 1 {
-                                    "tab"
-                                } else {
-                                    "tabs"
-                                };
-                                message = format!("closed {} {noun}", outcome.closed_tabs.len());
-                            }
-                            Err(error) => message = error.to_string(),
-                        }
-                    } else {
-                        message = "close all canceled".to_string();
-                    }
-                }
-                KeyEvent {
-                    code: KeyCode::Char(ch),
-                    ..
-                } if ('1'..='9').contains(&ch) => {
-                    let index = usize::try_from(ch.to_digit(10).unwrap_or(1)).unwrap_or(1);
-                    match switch_tab_index_and_snapshot(&client, index).await {
-                        Ok(updated_page) => {
-                            page = updated_page;
-                            rendered = render_page_document(&page, config, render_mode);
-                            tab_status = tabs_status(&client).await.unwrap_or_default();
-                            offset = page_scroll_offset(&page, &rendered);
-                            message = format!("switched to tab {index}");
-                        }
-                        Err(error) => message = error.to_string(),
-                    }
-                }
-                KeyEvent {
-                    code: KeyCode::Char('f'),
-                    ..
-                } => {
-                    if let Some(raw) = prompt_input("Follow link: ")?
-                        && let Ok(link_id) = raw.trim().parse::<u32>()
-                    {
-                        let client_clone = client.clone();
-                        if let Some(updated_page) = load_with_ui(
-                            &client,
-                            &format!("following link {link_id}"),
-                            None,
-                            async move { follow_and_snapshot(&client_clone, link_id).await },
-                        )
-                        .await?
-                        {
-                            page = updated_page;
-                            rendered = render_page_document(&page, config, render_mode);
-                            offset = page_scroll_offset(&page, &rendered);
-                            message = format!("followed link {link_id}");
-                        } else {
-                            message = "follow canceled".to_string();
-                        }
-                    }
-                }
-                KeyEvent {
-                    code: KeyCode::Char('i'),
-                    ..
-                } => {
-                    if let Some(raw) = prompt_input("Input control: ")?
-                        && let Ok(control_id) = raw.trim().parse::<u32>()
-                        && let Some(text) = prompt_input("Text: ")?
-                    {
-                        let client_clone = client.clone();
-                        if let Some(updated_page) = load_with_ui(
-                            &client,
-                            &format!("input into control {control_id}"),
-                            None,
-                            async move { input_and_snapshot(&client_clone, control_id, text).await },
-                        )
-                        .await?
-                        {
-                            page = updated_page;
-                            rendered = render_page_document(&page, config, render_mode);
-                            offset = page_scroll_offset(&page, &rendered);
-                            message = format!("input text into control {control_id}");
-                        } else {
-                            message = "input canceled".to_string();
-                        }
-                    }
-                }
-                KeyEvent {
-                    code: KeyCode::Char('c'),
-                    modifiers: KeyModifiers::NONE,
-                    ..
-                } => {
-                    if let Some(raw) = prompt_input("Click control: ")?
-                        && let Ok(control_id) = raw.trim().parse::<u32>()
-                    {
-                        let client_clone = client.clone();
-                        if let Some(updated_page) = load_with_ui(
-                            &client,
-                            &format!("clicking control {control_id}"),
-                            None,
-                            async move { click_and_snapshot(&client_clone, control_id).await },
-                        )
-                        .await?
-                        {
-                            page = updated_page;
-                            rendered = render_page_document(&page, config, render_mode);
-                            offset = page_scroll_offset(&page, &rendered);
-                            message = format!("clicked control {control_id}");
-                        } else {
-                            message = "click canceled".to_string();
-                        }
-                    }
-                }
-                KeyEvent {
-                    code: KeyCode::Char('b') | KeyCode::Left,
-                    ..
-                } => {
-                    let client_clone = client.clone();
-                    match load_with_ui(&client, "back", None, async move {
-                        back_and_snapshot(&client_clone).await
-                    })
-                    .await
-                    {
-                        Ok(Some(updated_page)) => {
-                            page = updated_page;
-                            rendered = render_page_document(&page, config, render_mode);
-                            offset = page_scroll_offset(&page, &rendered);
-                            message = "back".to_string();
-                        }
-                        Ok(None) => message = "back canceled".to_string(),
-                        Err(error) => message = error.to_string(),
-                    }
-                }
-                KeyEvent {
-                    code: KeyCode::Char('F') | KeyCode::Right,
-                    ..
-                } => {
-                    let client_clone = client.clone();
-                    match load_with_ui(&client, "forward", None, async move {
-                        forward_and_snapshot(&client_clone).await
-                    })
-                    .await
-                    {
-                        Ok(Some(updated_page)) => {
-                            page = updated_page;
-                            rendered = render_page_document(&page, config, render_mode);
-                            offset = page_scroll_offset(&page, &rendered);
-                            message = "forward".to_string();
-                        }
-                        Ok(None) => message = "forward canceled".to_string(),
-                        Err(error) => message = error.to_string(),
-                    }
-                }
-                KeyEvent {
-                    code: KeyCode::Char('r'),
-                    ..
-                } => {
-                    let client_clone = client.clone();
-                    if let Some(updated_page) =
-                        load_with_ui(&client, "reloading", None, async move {
-                            reload_and_snapshot(&client_clone).await
-                        })
-                        .await?
-                    {
-                        page = updated_page;
-                        rendered = render_page_document(&page, config, render_mode);
-                        offset = page_scroll_offset(&page, &rendered);
-                        message = "reloaded".to_string();
-                    } else {
-                        message = "reload canceled".to_string();
-                    }
-                }
-                _ => {}
-            },
-            Event::Resize(_, _) => {
-                rendered = render_page_document(&page, config, render_mode);
-                offset = offset.min(rendered.lines.len().saturating_sub(1));
-                let client_clone = client.clone();
-                match load_with_ui(&client, "resizing viewport", None, async move {
-                    active_snapshot(&client_clone).await
-                })
-                .await
-                {
-                    Ok(Some(updated_page)) => {
-                        page = updated_page;
-                        rendered = render_page_document(&page, config, render_mode);
-                        offset = page_scroll_offset(&page, &rendered);
-                        message = "resized viewport".to_string();
-                    }
-                    Ok(None) => message = "resize canceled".to_string(),
-                    Err(error) => message = error.to_string(),
-                }
-            }
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollDown => {
-                    offset = offset
-                        .saturating_add(3)
-                        .min(rendered.lines.len().saturating_sub(1));
-                }
-                MouseEventKind::ScrollUp => offset = offset.saturating_sub(3),
-                MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(target) = target_at(&rendered, offset, mouse.row, mouse.column) {
-                        match target {
-                            ClickTarget::Link { link_id, action_id } => {
-                                let client_clone = client.clone();
-                                if let Some(updated_page) = load_with_ui(
-                                    &client,
-                                    &format!("following link {link_id}"),
-                                    None,
-                                    async move {
-                                        activate_or_follow_link(&client_clone, link_id, action_id)
-                                            .await
-                                    },
-                                )
-                                .await?
-                                {
-                                    page = updated_page;
-                                    rendered = render_page_document(&page, config, render_mode);
-                                    offset = page_scroll_offset(&page, &rendered);
-                                    message = format!("followed link {link_id}");
-                                } else {
-                                    message = "follow canceled".to_string();
-                                }
-                            }
-                            ClickTarget::Control {
-                                control_id,
-                                action_id,
-                                action: ControlHitboxAction::Click,
-                            } => {
-                                let client_clone = client.clone();
-                                if let Some(updated_page) = load_with_ui(
-                                    &client,
-                                    &format!("clicking control {control_id}"),
-                                    None,
-                                    async move {
-                                        activate_or_click_control(
-                                            &client_clone,
-                                            control_id,
-                                            action_id,
-                                        )
-                                        .await
-                                    },
-                                )
-                                .await?
-                                {
-                                    page = updated_page;
-                                    rendered = render_page_document(&page, config, render_mode);
-                                    offset = page_scroll_offset(&page, &rendered);
-                                    message = format!("clicked control {control_id}");
-                                } else {
-                                    message = "click canceled".to_string();
-                                }
-                            }
-                            ClickTarget::Control {
-                                control_id,
-                                action_id,
-                                action: ControlHitboxAction::InputText,
-                            } => {
-                                if let Some(text) = prompt_input("Text: ")? {
-                                    let client_clone = client.clone();
-                                    if let Some(updated_page) = load_with_ui(
-                                        &client,
-                                        &format!("input into control {control_id}"),
-                                        None,
-                                        async move {
-                                            input_control_or_action(
-                                                &client_clone,
-                                                control_id,
-                                                action_id,
-                                                text,
-                                            )
-                                            .await
-                                        },
-                                    )
-                                    .await?
-                                    {
-                                        page = updated_page;
-                                        rendered = render_page_document(&page, config, render_mode);
-                                        offset = page_scroll_offset(&page, &rendered);
-                                        message = format!("input text into control {control_id}");
-                                    } else {
-                                        message = "input canceled".to_string();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            },
-            _ => {}
-        }
-    }
-
-    clear_terminal_images()?;
-    Ok(0)
-}
-
-fn clear_terminal_images() -> Result<()> {
-    let capabilities = detect_from_env();
-    if let Some(encoded) = encode_clear_visible_images(&capabilities) {
-        let mut out = stdout();
-        out.write_all(&encoded)?;
-        out.flush()?;
-    }
-    Ok(())
-}
-
-fn next_request_id() -> String {
-    format!("cli-{}", REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed))
+    bmux_interactive::run(client, config, page).await
 }
 
 async fn open_and_snapshot(
@@ -835,83 +285,6 @@ async fn open_and_snapshot(
     snapshot_tab(client, tab_id).await
 }
 
-async fn navigate_and_snapshot_with_request(
-    client: &TrowserClient,
-    request_id: String,
-    url: String,
-) -> Result<trowser_render::SemanticPage> {
-    let opened = client
-        .send(&Request::Navigate {
-            request_id,
-            url,
-            viewport: current_viewport_hint(),
-        })
-        .await?;
-    let Response::Opened { tab_id } = opened else {
-        anyhow::bail!("unexpected navigate response: {opened:?}");
-    };
-    snapshot_tab(client, tab_id).await
-}
-
-async fn load_with_ui<F>(
-    client: &TrowserClient,
-    label: &str,
-    request_id: Option<String>,
-    future: F,
-) -> Result<Option<trowser_render::SemanticPage>>
-where
-    F: Future<Output = Result<trowser_render::SemanticPage>> + Send + 'static,
-{
-    let handle = tokio::spawn(future);
-    let started = Instant::now();
-    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let mut frame = 0usize;
-    while !handle.is_finished() {
-        draw_loading_status(
-            label,
-            frames[frame % frames.len()],
-            load_phase(started.elapsed()),
-        )?;
-        frame += 1;
-        if poll(Duration::from_millis(80))?
-            && let Event::Key(key) = read()?
-            && key.code == KeyCode::Esc
-        {
-            if let Some(request_id) = request_id {
-                let _ = client.send(&Request::Cancel { request_id }).await;
-            }
-            handle.abort();
-            return Ok(None);
-        }
-    }
-    Ok(Some(handle.await??))
-}
-
-const fn load_phase(elapsed: Duration) -> &'static str {
-    match elapsed.as_secs() {
-        0..=1 => "resolving",
-        2..=8 => "loading",
-        9..=20 => "extracting",
-        _ => "still working",
-    }
-}
-
-fn draw_loading_status(label: &str, frame: &str, phase: &str) -> Result<()> {
-    let (width, height) = size()?;
-    let mut out = stdout();
-    queue!(
-        out,
-        MoveTo(0, height.saturating_sub(1)),
-        Clear(ClearType::CurrentLine),
-        Print(truncate_for_terminal(
-            &format!("{frame} {phase}: {label} · Esc cancel"),
-            width,
-        ))
-    )?;
-    out.flush()?;
-    Ok(())
-}
-
 async fn follow_and_snapshot(
     client: &TrowserClient,
     link_id: u32,
@@ -926,62 +299,6 @@ async fn follow_and_snapshot(
         anyhow::bail!("unexpected follow response: {followed:?}");
     };
     snapshot_tab(client, tab_id).await
-}
-
-async fn reload_and_snapshot(client: &TrowserClient) -> Result<trowser_render::SemanticPage> {
-    navigation_and_snapshot(
-        client,
-        Request::Reload {
-            viewport: current_viewport_hint(),
-        },
-    )
-    .await
-}
-
-async fn back_and_snapshot(client: &TrowserClient) -> Result<trowser_render::SemanticPage> {
-    navigation_and_snapshot(
-        client,
-        Request::Back {
-            viewport: current_viewport_hint(),
-        },
-    )
-    .await
-}
-
-async fn forward_and_snapshot(client: &TrowserClient) -> Result<trowser_render::SemanticPage> {
-    navigation_and_snapshot(
-        client,
-        Request::Forward {
-            viewport: current_viewport_hint(),
-        },
-    )
-    .await
-}
-
-async fn next_tab_and_snapshot(client: &TrowserClient) -> Result<trowser_render::SemanticPage> {
-    navigation_and_snapshot(client, Request::NextTab).await
-}
-
-async fn switch_tab_index_and_snapshot(
-    client: &TrowserClient,
-    one_based_index: usize,
-) -> Result<trowser_render::SemanticPage> {
-    let response = client.send(&Request::ListTabs).await?;
-    let Response::Tabs(snapshot) = response else {
-        anyhow::bail!("unexpected tabs response: {response:?}");
-    };
-    let tab_id = snapshot
-        .tabs
-        .get(one_based_index.saturating_sub(1))
-        .map(|tab| tab.id.clone());
-    let Some(tab_id) = tab_id else {
-        anyhow::bail!("unknown tab index {one_based_index}");
-    };
-    navigation_and_snapshot(client, Request::SwitchTab { tab_id }).await
-}
-
-async fn previous_tab_and_snapshot(client: &TrowserClient) -> Result<trowser_render::SemanticPage> {
-    navigation_and_snapshot(client, Request::PreviousTab).await
 }
 
 async fn close_active_tab_and_snapshot(
@@ -1105,22 +422,6 @@ async fn snapshot_tab(
     Ok(page)
 }
 
-async fn tabs_status(client: &TrowserClient) -> Result<String> {
-    let response = client.send(&Request::ListTabs).await?;
-    let Response::Tabs(snapshot) = response else {
-        anyhow::bail!("unexpected tabs response: {response:?}");
-    };
-    if snapshot.tabs.is_empty() {
-        return Ok("no tabs".to_string());
-    }
-    let active_index = snapshot
-        .tabs
-        .iter()
-        .position(|tab| tab.active)
-        .map_or(1, |index| index + 1);
-    Ok(format!("tab {active_index}/{}", snapshot.tabs.len()))
-}
-
 async fn active_snapshot(client: &TrowserClient) -> Result<trowser_render::SemanticPage> {
     match client
         .send(&Request::ActiveSnapshot {
@@ -1156,8 +457,8 @@ fn empty_page(message: &str) -> trowser_render::SemanticPage {
 }
 
 fn current_viewport_hint() -> Option<ViewportHint> {
-    size().ok().map(|(width_cells, height_cells)| {
-        ViewportHint::from_terminal_cells(width_cells, viewport_body_height(height_cells))
+    bmux_tui::crossterm::terminal_size().ok().map(|size| {
+        ViewportHint::from_terminal_cells(size.width, viewport_body_height(size.height))
     })
 }
 
@@ -1168,595 +469,9 @@ const fn config_viewport_hint(config: &TrowserConfig) -> ViewportHint {
     }
 }
 
-fn render_page_document(
-    page: &trowser_render::SemanticPage,
-    _config: &TrowserConfig,
-    render_mode: RenderMode,
-) -> RenderedDocument {
-    render_document_mode(page, &current_terminal_render_options(), render_mode)
-}
-
-fn current_terminal_render_options() -> TerminalRenderOptions {
-    TerminalRenderOptions {
-        width: current_terminal_width(),
-        image_capabilities: detect_from_env(),
-    }
-}
-
-fn current_terminal_width() -> u16 {
-    size().map_or(80, |(width, _)| width.max(40))
-}
-
 const fn viewport_body_height(height_cells: u16) -> u16 {
     let body_height = height_cells.saturating_sub(2);
     if body_height == 0 { 1 } else { body_height }
-}
-
-fn page_scroll_offset(page: &trowser_render::SemanticPage, document: &RenderedDocument) -> usize {
-    if page.scroll_y_px == 0 {
-        return 0;
-    }
-    document
-        .lines
-        .iter()
-        .position(|line| {
-            line.source_y_px
-                .is_some_and(|source_y_px| source_y_px >= page.scroll_y_px)
-        })
-        .unwrap_or_else(|| document.lines.len().saturating_sub(1))
-}
-
-fn draw_viewport(
-    page: &trowser_render::SemanticPage,
-    document: &RenderedDocument,
-    offset: usize,
-    message: &str,
-    tab_status: &str,
-    render_mode: RenderMode,
-    image_state: &mut TerminalImageState,
-) -> Result<()> {
-    let (width, height) = size()?;
-    let body_height = height.saturating_sub(2);
-    let mut out = stdout();
-    let image_capabilities = detect_from_env();
-    let scroll = scroll_percent(document, offset);
-    let title = if page.title.is_empty() {
-        page.url.as_str()
-    } else {
-        page.title.as_str()
-    };
-    let header = format!(
-        "trowser | {tab_status} | {} | {scroll}% | {title}",
-        render_mode.label()
-    );
-
-    queue!(out, BeginSynchronizedUpdate, Hide)?;
-    queue!(
-        out,
-        MoveTo(0, 0),
-        Clear(ClearType::CurrentLine),
-        Print(truncate_for_terminal(&header, width))
-    )?;
-
-    queue_clear_previous_images(&mut out, &image_capabilities, image_state)?;
-
-    for row in 0..body_height {
-        let line = document.lines.get(offset + usize::from(row));
-        queue!(
-            out,
-            MoveTo(0, row.saturating_add(1)),
-            Clear(ClearType::CurrentLine)
-        )?;
-        if let Some(line) = line {
-            let is_focused = row == 0 && line_target(line).is_some();
-            queue_styled_line(&mut out, line, width, is_focused)?;
-        }
-    }
-
-    queue_visible_images(
-        &mut out,
-        document,
-        offset,
-        body_height,
-        &image_capabilities,
-        image_state,
-    )?;
-
-    queue!(
-        out,
-        MoveTo(0, height.saturating_sub(1)),
-        Clear(ClearType::CurrentLine),
-        Print(truncate_for_terminal(message, width)),
-        EndSynchronizedUpdate
-    )?;
-    out.flush()?;
-    Ok(())
-}
-
-fn queue_styled_line<W: Write>(
-    out: &mut W,
-    line: &trowser_terminal::RenderedLine,
-    width: u16,
-    is_focused: bool,
-) -> Result<()> {
-    let mut used = if is_focused && width >= 2 {
-        queue!(
-            out,
-            SetForegroundColor(Color::Yellow),
-            SetAttribute(Attribute::Bold),
-            Print("▶ "),
-            ResetColor,
-            SetAttribute(Attribute::Reset)
-        )?;
-        2usize
-    } else {
-        0usize
-    };
-    let spans = if line.spans.is_empty() {
-        vec![trowser_terminal::StyledSpan {
-            text: line.text.clone(),
-            style: SpanStyle::Normal,
-        }]
-    } else {
-        line.spans.clone()
-    };
-    for span in spans {
-        if used >= usize::from(width) {
-            break;
-        }
-        let remaining = usize::from(width) - used;
-        let text = span.text.chars().take(remaining).collect::<String>();
-        used += text.chars().count();
-        queue_span_style(out, span.style, is_focused)?;
-        queue!(out, Print(text))?;
-    }
-    queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
-    Ok(())
-}
-
-#[derive(Debug, Default)]
-struct TerminalImageState {
-    content_ids: BTreeMap<u32, u32>,
-    next_image_id: u32,
-    transmitted_ids: BTreeSet<u32>,
-    visible_placements: BTreeSet<(u32, u32)>,
-}
-
-impl TerminalImageState {
-    fn image_id_for_content(&mut self, content_key: u32) -> u32 {
-        if let Some(image_id) = self.content_ids.get(&content_key).copied() {
-            return image_id;
-        }
-        let image_id = self.next_image_id.max(1);
-        self.next_image_id = image_id.saturating_add(1).max(1);
-        self.content_ids.insert(content_key, image_id);
-        image_id
-    }
-
-    fn clear(&mut self) {
-        self.content_ids.clear();
-        self.next_image_id = 1;
-        self.transmitted_ids.clear();
-        self.visible_placements.clear();
-    }
-}
-
-fn queue_clear_previous_images<W: Write>(
-    out: &mut W,
-    capabilities: &trowser_terminal_image::TerminalImageCapabilities,
-    image_state: &mut TerminalImageState,
-) -> Result<()> {
-    if capabilities.preferred_png_protocol().is_none() {
-        image_state.clear();
-        return Ok(());
-    }
-    let old_placements = image_state
-        .visible_placements
-        .iter()
-        .copied()
-        .collect::<Vec<_>>();
-    if let Some(encoded) = encode_delete_image_placements(capabilities, &old_placements) {
-        out.write_all(&encoded)?;
-    }
-    image_state.visible_placements.clear();
-    Ok(())
-}
-
-fn queue_visible_images<W: Write>(
-    out: &mut W,
-    document: &RenderedDocument,
-    offset: usize,
-    body_height: u16,
-    capabilities: &trowser_terminal_image::TerminalImageCapabilities,
-    image_state: &mut TerminalImageState,
-) -> Result<()> {
-    if capabilities.preferred_png_protocol().is_none() {
-        return Ok(());
-    }
-    let mut placed_images = BTreeSet::new();
-    for row in 0..body_height {
-        let Some(line) = document.lines.get(offset + usize::from(row)) else {
-            continue;
-        };
-        queue_line_images(
-            out,
-            line,
-            row.saturating_add(1),
-            body_height,
-            capabilities,
-            image_state,
-            &mut placed_images,
-        )?;
-    }
-    Ok(())
-}
-
-fn queue_line_images<W: Write>(
-    out: &mut W,
-    line: &trowser_terminal::RenderedLine,
-    row: u16,
-    body_height: u16,
-    capabilities: &trowser_terminal_image::TerminalImageCapabilities,
-    image_state: &mut TerminalImageState,
-    placed_images: &mut BTreeSet<(u32, i32, u16)>,
-) -> Result<()> {
-    if line.images.is_empty() || capabilities.preferred_png_protocol().is_none() {
-        return Ok(());
-    }
-    for (index, image) in line.images.iter().enumerate() {
-        if image.mime_type != "image/png" {
-            continue;
-        }
-        let content_key = image_content_key(image, index);
-        let anchor_row = i32::from(row) - i32::from(image.row_offset);
-        if !placed_images.insert((content_key, anchor_row, image.start_col)) {
-            continue;
-        }
-        let Some(clipped) = clipped_image_placement(image, row, body_height) else {
-            continue;
-        };
-        let image_id = image_state.image_id_for_content(content_key);
-        let placement_id = image_placement_id(clipped.anchor_row, image.start_col, index);
-        let transmit = image_state.transmitted_ids.insert(image_id);
-        let placement = PngImagePlacement {
-            data: &image.data,
-            row: clipped.row,
-            col: image.start_col,
-            pixel_width: image.pixel_width,
-            pixel_height: image.pixel_height,
-            cell_width: image.cell_width,
-            cell_height: clipped.cell_height,
-            source_y: clipped.source_y,
-            source_height: clipped.source_height,
-            image_id,
-            placement_id,
-        };
-        if let Some(encoded) = encode_png_image_placement(capabilities, &placement, transmit) {
-            out.write_all(&encoded)?;
-            image_state
-                .visible_placements
-                .insert((image_id, placement_id));
-        }
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ClippedImagePlacement {
-    row: u16,
-    anchor_row: u16,
-    cell_height: u16,
-    source_y: u32,
-    source_height: Option<u32>,
-}
-
-fn clipped_image_placement(
-    image: &trowser_terminal::RenderedImage,
-    row: u16,
-    body_height: u16,
-) -> Option<ClippedImagePlacement> {
-    let anchor_row = i32::from(row) - i32::from(image.row_offset);
-    let image_bottom = anchor_row + i32::from(image.cell_height).saturating_sub(1);
-    let visible_top = anchor_row.max(1);
-    let visible_bottom = image_bottom.min(i32::from(body_height));
-    if visible_top > visible_bottom {
-        return None;
-    }
-
-    let clipped_top_cells = u32::try_from(visible_top.saturating_sub(anchor_row)).ok()?;
-    let visible_cells = u16::try_from(visible_bottom.saturating_sub(visible_top).saturating_add(1))
-        .ok()?
-        .max(1);
-    let source_y = scaled_image_pixels(image.pixel_height, clipped_top_cells, image.cell_height);
-    let source_height = if visible_cells == image.cell_height && source_y == 0 {
-        None
-    } else {
-        Some(scaled_image_pixels(
-            image.pixel_height,
-            u32::from(visible_cells),
-            image.cell_height,
-        ))
-    };
-
-    Some(ClippedImagePlacement {
-        row: u16::try_from(visible_top).ok()?,
-        anchor_row: u16::try_from(anchor_row.max(1)).ok()?,
-        cell_height: visible_cells,
-        source_y,
-        source_height,
-    })
-}
-
-fn scaled_image_pixels(pixel_height: u32, cells: u32, total_cells: u16) -> u32 {
-    let total_cells = u32::from(total_cells).max(1);
-    let pixels =
-        u64::from(pixel_height.max(1)).saturating_mul(u64::from(cells)) / u64::from(total_cells);
-    u32::try_from(pixels.max(1)).unwrap_or(u32::MAX)
-}
-
-fn image_content_key(image: &trowser_terminal::RenderedImage, index: usize) -> u32 {
-    let mut hash = 2_166_136_261u32;
-    for byte in image
-        .data
-        .iter()
-        .copied()
-        .chain(image.pixel_width.to_le_bytes())
-        .chain(image.pixel_height.to_le_bytes())
-        .chain(u32::try_from(index).unwrap_or(u32::MAX).to_le_bytes())
-    {
-        hash ^= u32::from(byte);
-        hash = hash.wrapping_mul(16_777_619);
-    }
-    hash.max(1)
-}
-
-fn image_placement_id(row: u16, col: u16, index: usize) -> u32 {
-    let mut hash = 2_166_136_261u32;
-    for byte in row
-        .to_le_bytes()
-        .into_iter()
-        .chain(col.to_le_bytes())
-        .chain(u32::try_from(index).unwrap_or(u32::MAX).to_le_bytes())
-    {
-        hash ^= u32::from(byte);
-        hash = hash.wrapping_mul(16_777_619);
-    }
-    hash.max(1)
-}
-
-fn queue_span_style<W: Write>(out: &mut W, style: SpanStyle, is_focused: bool) -> Result<()> {
-    queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
-    if is_focused {
-        queue!(out, SetAttribute(Attribute::Reverse))?;
-    }
-    match style {
-        SpanStyle::Normal => {}
-        SpanStyle::Chrome => queue!(out, SetForegroundColor(Color::DarkGrey))?,
-        SpanStyle::Heading => queue!(
-            out,
-            SetForegroundColor(Color::Yellow),
-            SetAttribute(Attribute::Bold)
-        )?,
-        SpanStyle::Link => queue!(
-            out,
-            SetForegroundColor(Color::Blue),
-            SetAttribute(Attribute::Underlined)
-        )?,
-        SpanStyle::Control => queue!(
-            out,
-            SetForegroundColor(Color::Cyan),
-            SetAttribute(Attribute::Bold)
-        )?,
-        SpanStyle::Dim => queue!(out, SetForegroundColor(Color::DarkGrey))?,
-        SpanStyle::Code => queue!(out, SetForegroundColor(Color::Green))?,
-        SpanStyle::Quote => queue!(out, SetForegroundColor(Color::DarkGrey))?,
-        SpanStyle::Error => queue!(
-            out,
-            SetForegroundColor(Color::Red),
-            SetAttribute(Attribute::Bold)
-        )?,
-    }
-    Ok(())
-}
-
-fn scroll_percent(document: &RenderedDocument, offset: usize) -> u8 {
-    let max_offset = document.lines.len().saturating_sub(1);
-    if max_offset == 0 {
-        return 0;
-    }
-    u8::try_from((offset.saturating_mul(100) / max_offset).min(100)).unwrap_or(100)
-}
-
-fn find_line(
-    document: &RenderedDocument,
-    query: &str,
-    start: usize,
-    forward: bool,
-) -> Option<usize> {
-    if query.is_empty() {
-        return None;
-    }
-    let needle = query.to_lowercase();
-    if forward {
-        return document
-            .lines
-            .iter()
-            .enumerate()
-            .skip(start)
-            .find(|(_, line)| line.text.to_lowercase().contains(&needle))
-            .map(|(index, _)| index);
-    }
-    document
-        .lines
-        .iter()
-        .enumerate()
-        .take(start.saturating_add(1))
-        .rev()
-        .find(|(_, line)| line.text.to_lowercase().contains(&needle))
-        .map(|(index, _)| index)
-}
-
-#[derive(Debug, Clone)]
-enum ClickTarget {
-    Link {
-        link_id: u32,
-        action_id: Option<ActionId>,
-    },
-    Control {
-        control_id: u32,
-        action_id: Option<ActionId>,
-        action: ControlHitboxAction,
-    },
-}
-
-async fn activate_click_target(
-    client: &TrowserClient,
-    target: ClickTarget,
-) -> Result<trowser_render::SemanticPage> {
-    match target {
-        ClickTarget::Link { link_id, action_id } => {
-            activate_or_follow_link(client, link_id, action_id).await
-        }
-        ClickTarget::Control {
-            control_id,
-            action_id,
-            action: ControlHitboxAction::Click,
-        } => activate_or_click_control(client, control_id, action_id).await,
-        ClickTarget::Control {
-            control_id,
-            action_id,
-            action: ControlHitboxAction::InputText,
-        } => {
-            let text = prompt_input("Text: ")?.unwrap_or_default();
-            input_control_or_action(client, control_id, action_id, text).await
-        }
-    }
-}
-
-fn focused_action(document: &RenderedDocument, offset: usize) -> Option<(usize, ClickTarget)> {
-    next_action(document, offset, true)
-}
-
-fn next_action(
-    document: &RenderedDocument,
-    start: usize,
-    forward: bool,
-) -> Option<(usize, ClickTarget)> {
-    let mut iter: Box<dyn Iterator<Item = (usize, &trowser_terminal::RenderedLine)>> = if forward {
-        Box::new(document.lines.iter().enumerate().skip(start))
-    } else {
-        Box::new(
-            document
-                .lines
-                .iter()
-                .enumerate()
-                .take(start.saturating_add(1))
-                .rev(),
-        )
-    };
-    iter.find_map(|(row, line)| line_target(line).map(|target| (row, target)))
-}
-
-fn line_target(line: &trowser_terminal::RenderedLine) -> Option<ClickTarget> {
-    line.links
-        .first()
-        .map(|link| ClickTarget::Link {
-            link_id: link.link_id,
-            action_id: link.action_id.clone(),
-        })
-        .or_else(|| {
-            line.controls.first().map(|control| ClickTarget::Control {
-                control_id: control.control_id,
-                action_id: control.action_id.clone(),
-                action: control.action,
-            })
-        })
-}
-
-fn target_at(
-    document: &RenderedDocument,
-    offset: usize,
-    screen_row: u16,
-    column: u16,
-) -> Option<ClickTarget> {
-    let (_, height) = size().ok()?;
-    if screen_row == 0 || screen_row >= height.saturating_sub(1) {
-        return None;
-    }
-    let line_index = offset + usize::from(screen_row.saturating_sub(1));
-    let line = document.lines.get(line_index)?;
-    line.links
-        .iter()
-        .find(|link| link.contains(column))
-        .map(|link| ClickTarget::Link {
-            link_id: link.link_id,
-            action_id: link.action_id.clone(),
-        })
-        .or_else(|| {
-            line.controls
-                .iter()
-                .find(|control| control.contains(column))
-                .map(|control| ClickTarget::Control {
-                    control_id: control.control_id,
-                    action_id: control.action_id.clone(),
-                    action: control.action,
-                })
-        })
-}
-
-fn truncate_for_terminal(text: &str, width: u16) -> String {
-    text.chars().take(usize::from(width)).collect()
-}
-
-fn prompt_input(prompt: &str) -> Result<Option<String>> {
-    let (_, height) = size()?;
-    let mut out = stdout();
-    let mut input = String::new();
-    loop {
-        execute!(
-            out,
-            MoveTo(0, height.saturating_sub(1)),
-            Clear(ClearType::CurrentLine),
-            Print(prompt),
-            Print(&input)
-        )?;
-        out.flush()?;
-        let Event::Key(key) = read()? else {
-            continue;
-        };
-        match key.code {
-            KeyCode::Enter => return Ok(Some(input)),
-            KeyCode::Esc => return Ok(None),
-            KeyCode::Backspace => {
-                input.pop();
-            }
-            KeyCode::Char(ch) => input.push(ch),
-            _ => {}
-        }
-    }
-}
-
-struct TerminalGuard;
-
-impl TerminalGuard {
-    fn enter() -> Result<Self> {
-        enable_raw_mode()?;
-        execute!(
-            stdout(),
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            Hide,
-            Clear(ClearType::All)
-        )?;
-        Ok(Self)
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(stdout(), Show, DisableMouseCapture, LeaveAlternateScreen);
-    }
 }
 
 async fn run_session(command: &SessionCommand, paths: &ConfigPaths, json: bool) -> Result<u8> {
@@ -2332,7 +1047,8 @@ fn run_paths(paths: &ConfigPaths, json: bool) -> u8 {
 }
 
 fn run_doctor(config: &TrowserConfig, json: bool) -> u8 {
-    let image_caps = detect_from_env();
+    let image_caps = bmux_image::host_caps::detect_from_env();
+    let image_protocols = format!("{image_caps:?}");
     let browser = discover_browser_binary(config.browser.binary.as_ref());
     if json {
         println!(
@@ -2340,14 +1056,14 @@ fn run_doctor(config: &TrowserConfig, json: bool) -> u8 {
             serde_json::json!({
                 "browser_backend": config.browser.backend.as_str(),
                 "semantic_first": config.render.semantic_first,
-                "terminal_images": image_caps,
+                "terminal_images": image_protocols,
                 "chromium_binary": browser.binary.as_ref(),
             })
         );
     } else {
         println!("backend: {}", config.browser.backend);
         println!("semantic first: {}", config.render.semantic_first);
-        println!("terminal images: {:?}", image_caps.protocols);
+        println!("terminal images: {image_protocols}");
         match &browser.binary {
             Some(path) => println!("chromium binary: {}", path.display()),
             None => println!("chromium binary: not found"),
@@ -2358,10 +1074,7 @@ fn run_doctor(config: &TrowserConfig, json: bool) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        TerminalImageState, clipped_image_placement, daemon_process_matches,
-        legacy_daemon_pids_from_ps, parse_pid, parse_ps_line,
-    };
+    use super::{daemon_process_matches, legacy_daemon_pids_from_ps, parse_pid, parse_ps_line};
 
     #[test]
     fn parses_valid_positive_pid() {
@@ -2403,39 +1116,5 @@ mod tests {
               12 /usr/bin/other server start --foreground\n\
               13 /repo/target/debug/trowser server start --foreground\n";
         assert_eq!(legacy_daemon_pids_from_ps(output, 13), vec![10]);
-    }
-
-    #[test]
-    fn assigns_distinct_terminal_image_ids() {
-        let mut state = TerminalImageState::default();
-
-        let first = state.image_id_for_content(100);
-        let second = state.image_id_for_content(200);
-        let first_again = state.image_id_for_content(100);
-
-        assert_eq!(first, 1);
-        assert_eq!(second, 2);
-        assert_eq!(first_again, first);
-    }
-
-    #[test]
-    fn clips_scrolled_inline_images_to_visible_rows() {
-        let image = trowser_terminal::RenderedImage {
-            mime_type: "image/png".to_string(),
-            data: vec![1, 2, 3],
-            pixel_width: 100,
-            pixel_height: 80,
-            cell_width: 10,
-            cell_height: 4,
-            start_col: 2,
-            row_offset: 2,
-        };
-
-        let clipped = clipped_image_placement(&image, 1, 20).expect("image should be visible");
-
-        assert_eq!(clipped.row, 1);
-        assert_eq!(clipped.cell_height, 2);
-        assert_eq!(clipped.source_y, 40);
-        assert_eq!(clipped.source_height, Some(40));
     }
 }

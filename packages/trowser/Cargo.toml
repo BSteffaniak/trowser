@@ -21,7 +21,6 @@ trowser_render         = { workspace = true, optional = true }
 trowser_server         = { workspace = true, optional = true }
 trowser_session_models = { workspace = true, optional = true }
 trowser_terminal       = { workspace = true, optional = true }
-trowser_terminal_image = { workspace = true, optional = true }
 
 [features]
 all = [
@@ -35,7 +34,6 @@ all = [
     "server",
     "session-models",
     "terminal",
-    "terminal-image",
 ]
 browser = ["dep:trowser_browser"]
 browser-cdp = ["browser", "dep:trowser_browser_cdp"]
@@ -54,11 +52,9 @@ fail-on-warnings = [
     "trowser_server?/fail-on-warnings",
     "trowser_session_models?/fail-on-warnings",
     "trowser_terminal?/fail-on-warnings",
-    "trowser_terminal_image?/fail-on-warnings",
 ]
 ipc = ["dep:trowser_ipc", "render", "session-models"]
 render = ["dep:trowser_render"]
 server = ["config", "dep:trowser_server", "ipc"]
 session-models = ["dep:trowser_session_models"]
-terminal = ["dep:trowser_terminal", "render", "terminal-image"]
-terminal-image = ["dep:trowser_terminal_image"]
+terminal = ["dep:trowser_terminal", "render"]

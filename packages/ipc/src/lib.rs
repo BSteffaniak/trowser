@@ -9,7 +9,7 @@ use trowser_render::{SemanticPage, SemanticViewport};
 use trowser_session_models::{ActionId, SessionSnapshot, TabId};
 
 /// Current trowser IPC protocol version.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Initial client hello.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +121,11 @@ pub enum Request {
     Back { viewport: Option<ViewportHint> },
     /// Navigates the active tab forward in browser history.
     Forward { viewport: Option<ViewportHint> },
+    /// Scrolls the active browser page to an absolute CSS-pixel offset and returns fresh semantics.
+    ScrollTo {
+        y_px: u32,
+        viewport: Option<ViewportHint>,
+    },
     /// Activates/clicks a stable DOM action in the active tab.
     ActivateAction {
         action_id: ActionId,
@@ -233,10 +238,17 @@ mod tests {
 
     #[test]
     fn request_round_trips_with_bmux_codec() {
-        let request = Request::Hello(ClientHello::default());
-        let encoded = encode_request(&request).expect("encode request");
-        let decoded = decode_request(&encoded).expect("decode request");
-        assert_eq!(decoded, request);
+        for request in [
+            Request::Hello(ClientHello::default()),
+            Request::ScrollTo {
+                y_px: 720,
+                viewport: Some(super::ViewportHint::from_terminal_cells(100, 40)),
+            },
+        ] {
+            let encoded = encode_request(&request).expect("encode request");
+            let decoded = decode_request(&encoded).expect("decode request");
+            assert_eq!(decoded, request);
+        }
     }
 
     #[test]

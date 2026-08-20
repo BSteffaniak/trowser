@@ -11,14 +11,30 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-trowser_render         = { workspace = true }
+bmux_keyboard = { workspace = true }
+bmux_text_edit = { workspace = true }
+bmux_tui = { workspace = true }
+bmux_tui_components = { workspace = true, features = [
+    "status-bar",
+    "tab-bar",
+    "text-input-box",
+] }
+bmux_tui_runtime = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+trowser_render = { workspace = true }
 trowser_session_models = { workspace = true }
-trowser_terminal_image = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [features]
 default = []
 fail-on-warnings = [
+    "bmux_keyboard/fail-on-warnings",
+    "bmux_text_edit/fail-on-warnings",
+    "bmux_tui/fail-on-warnings",
+    "bmux_tui_components/fail-on-warnings",
+    "bmux_tui_runtime/fail-on-warnings",
     "trowser_render/fail-on-warnings",
     "trowser_session_models/fail-on-warnings",
-    "trowser_terminal_image/fail-on-warnings",
 ]

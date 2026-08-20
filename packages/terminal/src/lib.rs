@@ -4,15 +4,20 @@
 
 //! Terminal rendering primitives for trowser.
 
+pub mod application;
+pub mod bmux;
+pub mod runtime;
+
 use std::collections::{BTreeMap, BTreeSet};
 
+use bmux_tui::geometry::Rect as TuiRect;
+use bmux_tui::image::{ImageContribution, ImageKey, ImageLifecycle, ImagePayload, ImagePlacement};
 use trowser_render::{
     BlockLayout, ImagePreview, MediaKind, NAV_SUMMARY_LINK_LIMIT, SemanticBlock,
     SemanticLayoutNode, SemanticPage, SemanticRegion, TextRun, TextRunStyle, reader_blocks,
     sanitize_page,
 };
 use trowser_session_models::ActionId;
-use trowser_terminal_image::TerminalImageCapabilities;
 
 const CSS_PX_PER_CELL_X: f64 = 9.0;
 const MIN_BLOCK_WIDTH: usize = 20;
@@ -23,16 +28,11 @@ const MAX_READER_INDENT: usize = 6;
 pub struct TerminalRenderOptions {
     /// Maximum terminal width in cells.
     pub width: u16,
-    /// Current terminal image capabilities.
-    pub image_capabilities: TerminalImageCapabilities,
 }
 
 impl Default for TerminalRenderOptions {
     fn default() -> Self {
-        Self {
-            width: 80,
-            image_capabilities: TerminalImageCapabilities::default(),
-        }
+        Self { width: 80 }
     }
 }
 
@@ -113,6 +113,8 @@ pub struct RenderedLine {
 /// Terminal image payload anchored to a rendered line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedImage {
+    /// Stable browser-content identity used across rendered frames.
+    pub key: String,
     /// MIME type of the image payload.
     pub mime_type: String,
     /// Encoded image bytes.
@@ -1174,6 +1176,7 @@ fn offset_images(images: &[RenderedImage], offset: usize) -> Vec<RenderedImage> 
     images
         .iter()
         .map(|image| RenderedImage {
+            key: image.key.clone(),
             mime_type: image.mime_type.clone(),
             data: image.data.clone(),
             pixel_width: image.pixel_width,
@@ -1684,16 +1687,11 @@ fn attach_preview_image(
     start_line: usize,
     preview: Option<&ImagePreview>,
     placement: ReaderPlacement,
-    options: &TerminalRenderOptions,
+    _options: &TerminalRenderOptions,
 ) {
-    let Some(preview) = preview.filter(|preview| {
-        !preview.is_empty()
-            && preview.mime_type == "image/png"
-            && options
-                .image_capabilities
-                .preferred_png_protocol()
-                .is_some()
-    }) else {
+    let Some(preview) =
+        preview.filter(|preview| !preview.is_empty() && preview.mime_type == "image/png")
+    else {
         return;
     };
     let Some(line_index) =
@@ -1728,6 +1726,7 @@ fn attach_preview_image(
     line.links.clear();
     line.controls.clear();
     let rendered_image = RenderedImage {
+        key: preview_image_key(preview, pixel_width, pixel_height),
         mime_type: preview.mime_type.clone(),
         data: preview.data.clone(),
         pixel_width,
@@ -1750,6 +1749,43 @@ fn attach_preview_image(
         line
     });
     document.lines.splice((line_index + 1)..=line_index, rows);
+}
+
+fn preview_image_key(preview: &ImagePreview, pixel_width: u32, pixel_height: u32) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    preview.mime_type.hash(&mut hasher);
+    preview.data.hash(&mut hasher);
+    pixel_width.hash(&mut hasher);
+    pixel_height.hash(&mut hasher);
+    format!("preview:{:016x}", hasher.finish())
+}
+
+/// Convert one rendered image into a protocol-neutral BMUX contribution.
+#[must_use]
+pub fn image_contribution(
+    image: &RenderedImage,
+    line_row: u16,
+    viewport: TuiRect,
+) -> ImageContribution {
+    let anchor_row = line_row.saturating_sub(image.row_offset);
+    ImageContribution::Present(ImagePlacement {
+        key: ImageKey::new(image.key.clone()),
+        payload: ImagePayload::Png {
+            bytes: image.data.clone(),
+            width: image.pixel_width,
+            height: image.pixel_height,
+        },
+        destination: TuiRect::new(
+            image.start_col,
+            anchor_row,
+            image.cell_width,
+            image.cell_height,
+        ),
+        clip: viewport,
+        lifecycle: ImageLifecycle::Frame,
+    })
 }
 
 fn preview_placeholder_line(placement: ReaderPlacement, cell_width: usize) -> String {
@@ -2396,16 +2432,9 @@ fn render_image_box(
     output.push_str("\n\n");
 }
 
-fn image_title(preview: Option<&ImagePreview>, options: &TerminalRenderOptions) -> &'static str {
-    if preview.is_some_and(|preview| !preview.is_empty())
-        && options
-            .image_capabilities
-            .preferred_png_protocol()
-            .is_some()
-    {
+fn image_title(preview: Option<&ImagePreview>, _options: &TerminalRenderOptions) -> &'static str {
+    if preview.is_some_and(|preview| !preview.is_empty()) {
         "image preview"
-    } else if options.image_capabilities.supports_images() {
-        "image available"
     } else {
         "image"
     }
@@ -2433,7 +2462,7 @@ fn render_media_box(
     preview: Option<&ImagePreview>,
     control_id: Option<u32>,
     placement: ReaderPlacement,
-    options: &TerminalRenderOptions,
+    _options: &TerminalRenderOptions,
     output: &mut String,
 ) {
     let box_width = placement.width.clamp(40, 72);
@@ -2441,12 +2470,7 @@ fn render_media_box(
         .zip(media_height)
         .map(|(width, height)| format!(" {width}x{height}"))
         .unwrap_or_default();
-    let title = if preview.is_some_and(|preview| !preview.is_empty())
-        && options
-            .image_capabilities
-            .preferred_png_protocol()
-            .is_some()
-    {
+    let title = if preview.is_some_and(|preview| !preview.is_empty()) {
         format!("{} preview{dimensions}", media_kind.label())
     } else {
         format!("{}{dimensions}", media_kind.label())
@@ -2625,9 +2649,13 @@ fn pad_to_width(output: &mut String, width: usize, used: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{RenderMode, TerminalRenderOptions, render_document_mode, render_plain_text};
+    use super::{
+        RenderMode, TerminalRenderOptions, image_contribution, render_document_mode,
+        render_plain_text,
+    };
     use trowser_render::{
-        BlockLayout, MediaKind, SemanticBlock, SemanticLayoutNode, SemanticPage, SemanticRegion,
+        BlockLayout, ImagePreview, MediaKind, SemanticBlock, SemanticLayoutNode, SemanticPage,
+        SemanticRegion,
     };
 
     #[test]
@@ -2649,6 +2677,53 @@ mod tests {
         let rendered = render_plain_text(&page, &TerminalRenderOptions::default());
         assert!(rendered.contains("Example"));
         assert!(rendered.contains("# Hello"));
+    }
+
+    #[test]
+    fn retains_png_image_intent_without_terminal_capabilities() {
+        let page = SemanticPage {
+            url: "https://example.com/image".to_string(),
+            title: "Image".to_string(),
+            blocks: vec![SemanticBlock::Image {
+                alt: "diagram".to_string(),
+                url: "https://example.com/diagram.png".to_string(),
+                width: Some(320),
+                height: Some(160),
+                preview: Some(ImagePreview {
+                    mime_type: "image/png".to_string(),
+                    data: vec![1, 2, 3],
+                    width: Some(320),
+                    height: Some(160),
+                }),
+                layout: None,
+                region: SemanticRegion::Main,
+            }],
+            layout_tree: None,
+            viewport: None,
+            scroll_y_px: 0,
+        };
+
+        let rendered =
+            render_document_mode(&page, &TerminalRenderOptions::default(), RenderMode::Page);
+
+        let (row, image) = rendered
+            .lines
+            .iter()
+            .enumerate()
+            .find_map(|(row, line)| line.images.first().map(|image| (row, image)))
+            .expect("rendered image intent");
+        let contribution = image_contribution(
+            image,
+            u16::try_from(row).expect("test row"),
+            bmux_tui::geometry::Rect::new(0, 0, 80, 24),
+        );
+        assert!(matches!(
+            contribution,
+            bmux_tui::image::ImageContribution::Present(ref placement)
+                if placement.key.as_str().starts_with("preview:")
+                    && matches!(placement.payload, bmux_tui::image::ImagePayload::Png { .. })
+        ));
+        assert!(rendered.to_plain_text().contains("diagram"));
     }
 
     #[test]
@@ -2720,10 +2795,7 @@ mod tests {
 
         let rendered = render_document_mode(
             &page,
-            &TerminalRenderOptions {
-                width: 120,
-                ..TerminalRenderOptions::default()
-            },
+            &TerminalRenderOptions { width: 120 },
             RenderMode::Browser,
         )
         .to_plain_text();
@@ -2744,10 +2816,7 @@ mod tests {
 
         let rendered = render_document_mode(
             &page,
-            &TerminalRenderOptions {
-                width: 120,
-                ..TerminalRenderOptions::default()
-            },
+            &TerminalRenderOptions { width: 120 },
             RenderMode::Browser,
         )
         .to_plain_text();
@@ -2768,10 +2837,7 @@ mod tests {
 
         let rendered = render_document_mode(
             &page,
-            &TerminalRenderOptions {
-                width: 80,
-                ..TerminalRenderOptions::default()
-            },
+            &TerminalRenderOptions { width: 80 },
             RenderMode::Browser,
         )
         .to_plain_text();
@@ -2794,10 +2860,7 @@ mod tests {
 
         let rendered = render_document_mode(
             &page,
-            &TerminalRenderOptions {
-                width: 120,
-                ..TerminalRenderOptions::default()
-            },
+            &TerminalRenderOptions { width: 120 },
             RenderMode::Browser,
         )
         .to_plain_text();

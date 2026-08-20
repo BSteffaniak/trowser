@@ -24,5 +24,3 @@ pub use trowser_server as server;
 pub use trowser_session_models as session_models;
 #[cfg(feature = "terminal")]
 pub use trowser_terminal as terminal;
-#[cfg(feature = "terminal-image")]
-pub use trowser_terminal_image as terminal_image;

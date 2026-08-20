@@ -11,7 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_codec             = { workspace = true }
+bmux_codec             = { workspace = true, features = ["serde", "stable"] }
 serde                  = { workspace = true, features = ["derive"] }
 trowser_render         = { workspace = true }
 trowser_session_models = { workspace = true }
