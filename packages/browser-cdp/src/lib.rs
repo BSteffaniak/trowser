@@ -215,6 +215,7 @@ pub fn discover_browser_binary(configured: Option<&PathBuf>) -> BrowserDiscovery
 /// Persistent Chromium process controlled by `CDP`.
 pub struct CdpBrowser {
     child: Child,
+    browser_web_socket_url: String,
     _profile: Option<tempfile::TempDir>,
     port: u16,
     resource_policy: CdpResourcePolicy,
@@ -260,7 +261,7 @@ impl CdpBrowser {
             .map_or_else(BrowserStderr::default, |capture| {
                 Arc::clone(&capture.buffer)
             });
-        let port = match wait_for_devtools(
+        let endpoint = match wait_for_devtools(
             &mut child,
             &profile_path,
             previous_devtools_port.as_deref(),
@@ -268,7 +269,7 @@ impl CdpBrowser {
         )
         .await
         {
-            Ok(port) => port,
+            Ok(endpoint) => endpoint,
             Err(error) => {
                 terminate_child(&mut child).await;
                 if let Some(capture) = stderr_task {
@@ -279,8 +280,9 @@ impl CdpBrowser {
         };
         Ok(Self {
             child,
+            browser_web_socket_url: endpoint.browser_web_socket_url,
             _profile: profile,
-            port,
+            port: endpoint.port,
             resource_policy: config.resource_policy.clone(),
             pages: BTreeMap::new(),
         })
@@ -450,13 +452,19 @@ impl CdpBrowser {
             .map_err(CdpError::Launch)
     }
 
-    /// Terminates the Chromium child process.
+    /// Requests graceful Chromium shutdown, then force-terminates it after a bounded deadline.
     ///
     /// # Errors
     ///
-    /// Returns an error if process termination fails.
+    /// Returns an error if graceful shutdown fails and process termination cannot be observed.
     pub async fn shutdown(&mut self) -> CdpResult<()> {
-        terminate_child(&mut self.child).await;
+        if !self.is_running()? {
+            return Ok(());
+        }
+        let _ = request_browser_close(&self.browser_web_socket_url).await;
+        if !wait_for_child_exit(&mut self.child, BROWSER_CLOSE_TIMEOUT).await {
+            terminate_child(&mut self.child).await;
+        }
         Ok(())
     }
 }
@@ -775,6 +783,18 @@ fn capture_browser_stderr(child: &mut Child) -> Option<BrowserStderrCapture> {
     Some(BrowserStderrCapture { buffer, task })
 }
 
+const BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn request_browser_close(web_socket_url: &str) -> CdpResult<()> {
+    let mut connection = CdpConnection::connect(web_socket_url).await?;
+    let _ = connection.call("Browser.close", json!({})).await?;
+    Ok(())
+}
+
+async fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
+    tokio::time::timeout(timeout, child.wait()).await.is_ok()
+}
+
 async fn terminate_child(child: &mut Child) {
     if child.try_wait().ok().flatten().is_none() {
         let _ = child.kill().await;
@@ -818,13 +838,24 @@ fn parse_devtools_port(contents: &str) -> CdpResult<u16> {
     Ok(port)
 }
 
+#[derive(Debug, Deserialize)]
+struct DevToolsVersion {
+    #[serde(rename = "webSocketDebuggerUrl")]
+    web_socket_debugger_url: String,
+}
+
+struct DevToolsEndpoint {
+    port: u16,
+    browser_web_socket_url: String,
+}
+
 async fn wait_for_devtools(
     child: &mut Child,
     profile_dir: &Path,
     previous_devtools_port: Option<&str>,
     stderr: &BrowserStderr,
-) -> CdpResult<u16> {
-    let client = reqwest::Client::new();
+) -> CdpResult<DevToolsEndpoint> {
+    let client = cdp_http_client()?;
     let deadline = Instant::now() + DEVTOOLS_STARTUP_TIMEOUT;
     loop {
         if let Some(status) = child.try_wait().map_err(CdpError::Launch)? {
@@ -839,9 +870,13 @@ async fn wait_for_devtools(
             let port = parse_devtools_port(&contents)?;
             let url = format!("http://127.0.0.1:{port}/json/version");
             if let Ok(response) = client.get(url).send().await
-                && response.status().is_success()
+                && let Ok(response) = response.error_for_status()
+                && let Ok(version) = response.json::<DevToolsVersion>().await
             {
-                return Ok(port);
+                return Ok(DevToolsEndpoint {
+                    port,
+                    browser_web_socket_url: version.web_socket_debugger_url,
+                });
             }
         }
         if Instant::now() >= deadline {
@@ -2574,6 +2609,7 @@ mod tests {
             .unwrap();
         let mut browser = super::CdpBrowser {
             child,
+            browser_web_socket_url: "ws://127.0.0.1:1".to_string(),
             _profile: None,
             port: 1,
             resource_policy: super::CdpResourcePolicy::default(),
