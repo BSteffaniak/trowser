@@ -784,6 +784,12 @@ mod tests {
         )
     }
 
+    #[test]
+    fn rejects_zero_terminal_dimensions() {
+        let size = bmux_tui::geometry::Size::new(0, 0);
+        assert!(size.width < 2 || size.height < 2);
+    }
+
     #[tokio::test]
     async fn complete_state_machine_runs_through_headless_presenter() {
         let (runtime, handle) = bmux_tui_runtime::Runtime::new(

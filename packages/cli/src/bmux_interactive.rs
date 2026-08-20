@@ -28,6 +28,13 @@ pub async fn run(
     initial_page: trowser_render::SemanticPage,
 ) -> Result<u8> {
     let size = terminal_size()?;
+    if size.width < 2 || size.height < 2 {
+        anyhow::bail!(
+            "interactive terminal is too small ({}x{}); resize it to at least 2x2 and retry",
+            size.width,
+            size.height
+        );
+    }
     let document = render_document_mode(
         &initial_page,
         &TerminalRenderOptions { width: size.width },
@@ -74,10 +81,14 @@ pub async fn run(
     let output = match runtime.run().await {
         Ok(output) | Err(RuntimeError::Program { output, .. }) => output,
         Err(RuntimeError::Presenter { error, mut output }) => {
-            let _ = output.presenter.cleanup_images();
+            let cleanup = output.presenter.cleanup_images();
             drop(input);
             drop(output);
-            drop(guard);
+            let leave = guard.leave();
+            if let Err(cleanup_error) = cleanup {
+                return Err(cleanup_error.into());
+            }
+            leave?;
             return Err(error.into());
         }
     };
