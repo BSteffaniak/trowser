@@ -29,6 +29,9 @@ pub enum ClientError {
     /// Local daemon I/O failed.
     #[error("daemon I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    /// A daemon request exceeded its deadline.
+    #[error("timed out waiting for trowser daemon response after {0:?}")]
+    Timeout(std::time::Duration),
     /// Request encoding failed.
     #[error("failed to encode daemon request: {0}")]
     Encode(#[from] bmux_codec::Error),
@@ -39,6 +42,8 @@ pub enum ClientError {
 
 /// Result alias for client operations.
 pub type ClientResult<T> = Result<T, ClientError>;
+
+const DAEMON_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Client handle configured for a local trowser daemon.
 #[derive(Debug, Clone)]
@@ -65,6 +70,12 @@ impl TrowserClient {
     ///
     /// Returns an error when connecting, encoding, writing, reading, or decoding fails.
     pub async fn send(&self, request: &Request) -> ClientResult<Response> {
+        tokio::time::timeout(DAEMON_REQUEST_TIMEOUT, self.send_inner(request))
+            .await
+            .map_err(|_| ClientError::Timeout(DAEMON_REQUEST_TIMEOUT))?
+    }
+
+    async fn send_inner(&self, request: &Request) -> ClientResult<Response> {
         let endpoint = self
             .paths
             .server_socket_path()

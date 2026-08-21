@@ -261,7 +261,7 @@ async fn run_bmux_interactive(
     initial_url: Option<String>,
 ) -> Result<u8> {
     let client = ensure_server(paths).await?;
-    let page = active_snapshot_or_empty(&client).await;
+    let page = empty_page("Loading browser state…");
     bmux_interactive::run(client, config, page, initial_url).await
 }
 
@@ -400,25 +400,6 @@ async fn snapshot_tab(
         anyhow::bail!("unexpected snapshot response: {snapshot:?}");
     };
     Ok(page)
-}
-
-async fn active_snapshot(client: &TrowserClient) -> Result<trowser_render::SemanticPage> {
-    match client
-        .send(&Request::ActiveSnapshot {
-            viewport: current_viewport_hint(),
-        })
-        .await?
-    {
-        Response::ActiveSnapshot { page, .. } => Ok(page),
-        Response::Error { message } => anyhow::bail!(message),
-        unexpected => anyhow::bail!("unexpected active snapshot response: {unexpected:?}"),
-    }
-}
-
-async fn active_snapshot_or_empty(client: &TrowserClient) -> trowser_render::SemanticPage {
-    active_snapshot(client)
-        .await
-        .unwrap_or_else(|_| empty_page("Press o to open a URL."))
 }
 
 fn empty_page(message: &str) -> trowser_render::SemanticPage {
@@ -654,6 +635,7 @@ fn should_recover_daemon(error: &ClientError) -> bool {
         ),
         ClientError::Encode(_)
         | ClientError::Server(_)
+        | ClientError::Timeout(_)
         | ClientError::TransportUnavailable { .. } => false,
     }
 }
@@ -707,11 +689,15 @@ async fn run_server_start_background(paths: &ConfigPaths, json: bool) -> Result<
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_for_stderr));
     let mut child = command.spawn()?;
+    let startup_deadline = Instant::now() + Duration::from_secs(10);
 
     loop {
         if ready_file.exists() {
             let client = TrowserClient::new(paths.clone());
-            if client.send(&Request::Status).await.is_ok() {
+            if tokio::time::timeout(Duration::from_secs(2), client.send(&Request::Status))
+                .await
+                .is_ok_and(|result| result.is_ok())
+            {
                 report_server_started(paths, &log_path, json);
                 return Ok(0);
             }
@@ -727,6 +713,17 @@ async fn run_server_start_background(paths: &ConfigPaths, json: bool) -> Result<
         if let Some(status) = child.try_wait()? {
             anyhow::bail!(
                 "trowser daemon exited during startup with status {status}; log: {}",
+                log_path.display()
+            );
+        }
+
+        if Instant::now() >= startup_deadline {
+            if let Err(error) = child.kill() {
+                eprintln!("failed to kill timed-out trowser daemon: {error}");
+            }
+            remove_stale_runtime_files(paths)?;
+            anyhow::bail!(
+                "timed out waiting for trowser daemon startup; log: {}",
                 log_path.display()
             );
         }

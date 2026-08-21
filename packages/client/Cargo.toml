@@ -14,7 +14,7 @@ version     = { workspace = true }
 bmux_codec     = { workspace = true }
 serde          = { workspace = true }
 thiserror      = { workspace = true }
-tokio          = { workspace = true, features = ["io-util", "net"] }
+tokio          = { workspace = true, features = ["io-util", "net", "time"] }
 trowser_config = { workspace = true }
 trowser_ipc    = { workspace = true }
 

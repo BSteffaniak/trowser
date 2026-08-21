@@ -43,10 +43,8 @@ pub async fn run(
     );
     let mut program = BrowserProgram::new(initial_page, document, size);
     program.set_effect(effect_factory(client.clone()));
-    let startup = initial_url.map(BrowserAction::OpenUrl);
-    if let Response::Tabs(snapshot) = client.send(&Request::ListTabs).await? {
-        program.set_tabs(snapshot.tabs);
-    }
+    let startup =
+        Some(initial_url.map_or(BrowserAction::LoadActiveSnapshot, BrowserAction::OpenUrl));
 
     let mut guard = CrosstermTerminalGuard::enter(stdout())?;
     let capabilities = bmux_image::host_caps::detect_from_env();
@@ -89,7 +87,8 @@ pub async fn run(
         Ok(output) | Err(RuntimeError::Program { output, .. }) => output,
         Err(RuntimeError::Presenter { error, mut output }) => {
             let cleanup = output.presenter.cleanup_images();
-            drop(input);
+            let mut input = input;
+            input.shutdown().await;
             drop(output);
             let leave = guard.leave();
             if let Err(cleanup_error) = cleanup {
@@ -99,7 +98,8 @@ pub async fn run(
             return Err(error.into());
         }
     };
-    drop(input);
+    let mut input = input;
+    input.shutdown().await;
     let mut presenter = output.presenter;
     presenter.cleanup_images()?;
     drop(presenter);
@@ -149,6 +149,7 @@ async fn execute_action(
         size.height.saturating_sub(2).max(1),
     ));
     match action {
+        BrowserAction::LoadActiveSnapshot => active_snapshot_for(client, viewport).await,
         BrowserAction::OpenUrl(url) => {
             let response = client.send(&Request::Open { url, viewport }).await?;
             let Response::Opened { tab_id } = response else {

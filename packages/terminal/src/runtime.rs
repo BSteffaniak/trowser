@@ -49,6 +49,8 @@ pub enum BrowserMessage {
 /// Product actions requested by terminal input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrowserAction {
+    /// Load the daemon's active tab snapshot during application startup.
+    LoadActiveSnapshot,
     /// Open a URL entered through the local prompt.
     OpenUrl(String),
     /// Search within the current rendered document.
@@ -696,6 +698,7 @@ fn find_document_line_reverse(
 
 const fn action_status(action: &BrowserAction) -> &'static str {
     match action {
+        BrowserAction::LoadActiveSnapshot => "loading active tab",
         BrowserAction::OpenUrl(_) => "opening URL",
         BrowserAction::Search(_) => "searching",
         BrowserAction::Back => "back",
