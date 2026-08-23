@@ -80,7 +80,7 @@ pub fn render_browser_frame(
     );
     frame.push_hit(
         HitRegion::new("chrome.header", header)
-            .role(HitRole::Decoration)
+            .role(HitRole::Background)
             .pointer_events(false),
     );
 
@@ -148,7 +148,7 @@ pub fn render_browser_frame(
     if program.prompt.is_none() {
         frame.push_hit(
             HitRegion::new("chrome.status", status)
-                .role(HitRole::Decoration)
+                .role(HitRole::Background)
                 .pointer_events(false),
         );
     }
