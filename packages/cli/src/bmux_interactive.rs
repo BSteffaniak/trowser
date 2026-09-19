@@ -56,7 +56,7 @@ pub async fn run(
     let render_state = Arc::clone(&renderer);
     let presenter = ImageTerminalPresenter::with_commit(
         terminal,
-        move |program: &mut BrowserProgram, frame: &mut bmux_tui::frame::Frame<'_>| {
+        move |program: &mut BrowserProgram, frame: &mut bmux_tui::paint::PaintCx<'_, '_>| {
             render_state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)

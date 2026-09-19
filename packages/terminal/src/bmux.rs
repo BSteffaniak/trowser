@@ -1,9 +1,9 @@
 //! BMUX frame adapter for trowser's browser-specific rendered document.
 
 use super::{RenderedDocument, SpanStyle, image_contribution};
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::hit::{HitRegion, HitRole};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text::{Line, Span};
 
@@ -14,12 +14,12 @@ use bmux_tui::text::{Line, Span};
 /// actions remain represented by trowser's document hitboxes; stable BMUX hit
 /// registration is added by the interactive application layer.
 pub fn render_document_frame(
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     document: &RenderedDocument,
     offset: usize,
     viewport: Rect,
 ) {
-    frame.fill(viewport, " ", Style::new());
+    frame.fill(LocalRect::terminal(viewport), " ", Style::new());
     for (visible_row, line) in document
         .lines
         .iter()
@@ -39,7 +39,7 @@ pub fn render_document_frame(
                 .collect()
         };
         frame.write_line(
-            Rect::new(viewport.x, row, viewport.width, 1),
+            LocalRect::terminal(Rect::new(viewport.x, row, viewport.width, 1)),
             &Line::from_spans(spans),
         );
         for link in &line.links {
@@ -94,6 +94,7 @@ mod tests {
     use bmux_tui::buffer::Buffer;
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::Rect;
+    use bmux_tui::paint::PaintCx;
 
     use super::render_document_frame;
     use crate::{
@@ -147,7 +148,7 @@ mod tests {
         let mut buffer = Buffer::empty(viewport);
         let mut frame = Frame::new(&mut buffer);
 
-        render_document_frame(&mut frame, &document, 1, viewport);
+        render_document_frame(&mut PaintCx::new(&mut frame), &document, 1, viewport);
 
         assert_eq!(frame.images().len(), 1);
         assert_eq!(frame.hits().regions().len(), 2);
