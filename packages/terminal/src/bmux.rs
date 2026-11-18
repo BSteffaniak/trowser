@@ -4,26 +4,101 @@ use std::collections::BTreeMap;
 
 use super::{MAX_IMAGE_CELL_HEIGHT, RenderedDocument, SpanStyle, image_contribution};
 use bmux_tui::geometry::Rect;
-use bmux_tui::hit::{HitRegion, HitRole};
+use bmux_tui::hit::{HitId, HitRegion, HitRole};
 use bmux_tui::image::ImageKey;
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text::{Line, Span};
 
-/// Paint a rendered browser document into a BMUX frame viewport.
+/// A rendered document with its BMUX lines and hit identities prepared once.
 ///
-/// `offset` is the first document line visible in `viewport`. Text, style, and
-/// protocol-neutral image placement are clipped to that viewport. Browser
-/// actions remain represented by trowser's document hitboxes; stable BMUX hit
-/// registration is added by the interactive application layer.
+/// Building this when the document changes keeps per-frame painting to
+/// borrowing prepared lines instead of re-styling spans and formatting hit
+/// ids for every visible line on every frame.
+#[derive(Debug, Clone, Default)]
+pub struct PaintedDocument {
+    document: RenderedDocument,
+    lines: Vec<PaintedLine>,
+}
+
+#[derive(Debug, Clone)]
+struct PaintedLine {
+    line: Line,
+    hits: Vec<PaintedHit>,
+}
+
+#[derive(Debug, Clone)]
+struct PaintedHit {
+    id: HitId,
+    start_col: u16,
+    end_col: u16,
+    tab_order: i32,
+    role: Option<HitRole>,
+}
+
+impl PaintedDocument {
+    /// Prepare `document` for repeated painting.
+    #[must_use]
+    pub fn new(document: RenderedDocument) -> Self {
+        let lines = document.lines.iter().map(paint_line).collect();
+        Self { document, lines }
+    }
+
+    /// The underlying rendered document.
+    #[must_use]
+    pub const fn document(&self) -> &RenderedDocument {
+        &self.document
+    }
+}
+
+impl From<RenderedDocument> for PaintedDocument {
+    fn from(document: RenderedDocument) -> Self {
+        Self::new(document)
+    }
+}
+
+fn paint_line(line: &super::RenderedLine) -> PaintedLine {
+    let spans = if line.spans.is_empty() {
+        vec![Span::raw(line.text.clone())]
+    } else {
+        line.spans
+            .iter()
+            .map(|span| Span::styled(span.text.clone(), span_style(span.style)))
+            .collect()
+    };
+    let links = line.links.iter().map(|link| PaintedHit {
+        id: HitId::new(format!("browser.link.{}", link.link_id)),
+        start_col: link.start_col,
+        end_col: link.end_col,
+        tab_order: i32::try_from(link.link_id).unwrap_or(i32::MAX),
+        role: None,
+    });
+    let controls = line.controls.iter().map(|control| PaintedHit {
+        id: HitId::new(format!("browser.control.{}", control.control_id)),
+        start_col: control.start_col,
+        end_col: control.end_col,
+        tab_order: i32::try_from(control.control_id).unwrap_or(i32::MAX),
+        role: Some(HitRole::TextInput),
+    });
+    PaintedLine {
+        line: Line::from_spans(spans),
+        hits: links.chain(controls).collect(),
+    }
+}
+
+/// Paint a prepared browser document into a BMUX frame viewport.
+///
+/// `offset` is the first document line visible in `viewport`. Text, style,
+/// hit regions, and protocol-neutral image placement are clipped to that
+/// viewport.
 pub fn render_document_frame(
     frame: &mut PaintCx<'_, '_>,
-    document: &RenderedDocument,
+    painted: &PaintedDocument,
     offset: usize,
     viewport: Rect,
 ) {
     frame.fill(LocalRect::terminal(viewport), " ", Style::new());
-    for (visible_row, line) in document
+    for (visible_row, line) in painted
         .lines
         .iter()
         .skip(offset)
@@ -33,41 +108,24 @@ pub fn render_document_frame(
         let row = viewport
             .y
             .saturating_add(u16::try_from(visible_row).unwrap_or(u16::MAX));
-        let spans = if line.spans.is_empty() {
-            vec![Span::raw(line.text.clone())]
-        } else {
-            line.spans
-                .iter()
-                .map(|span| Span::styled(span.text.clone(), span_style(span.style)))
-                .collect()
-        };
         frame.write_line(
             LocalRect::terminal(Rect::new(viewport.x, row, viewport.width, 1)),
-            &Line::from_spans(spans),
+            &line.line,
         );
-        for link in &line.links {
-            frame.push_hit(
-                HitRegion::new(
-                    format!("browser.link.{}", link.link_id),
-                    clipped_hit_area(viewport, row, link.start_col, link.end_col),
-                )
-                .focusable(true)
-                .tab_order(i32::try_from(link.link_id).unwrap_or(i32::MAX)),
-            );
-        }
-        for control in &line.controls {
-            frame.push_hit(
-                HitRegion::new(
-                    format!("browser.control.{}", control.control_id),
-                    clipped_hit_area(viewport, row, control.start_col, control.end_col),
-                )
-                .role(HitRole::TextInput)
-                .focusable(true)
-                .tab_order(i32::try_from(control.control_id).unwrap_or(i32::MAX)),
-            );
+        for hit in &line.hits {
+            let mut region = HitRegion::new(
+                hit.id.clone(),
+                clipped_hit_area(viewport, row, hit.start_col, hit.end_col),
+            )
+            .focusable(true)
+            .tab_order(hit.tab_order);
+            if let Some(role) = hit.role {
+                region = region.role(role);
+            }
+            frame.push_hit(region);
         }
     }
-    paint_document_images(frame, document, offset, viewport);
+    paint_document_images(frame, &painted.document, offset, viewport);
 }
 
 /// Contribute each image that is at least partly visible exactly once.
@@ -142,7 +200,7 @@ mod tests {
     use bmux_tui::image::{ImageContribution, ImageFit, ImageKey, ImagePayload, ImagePlacement};
     use bmux_tui::paint::PaintCx;
 
-    use super::render_document_frame;
+    use super::{PaintedDocument, render_document_frame};
     use crate::{
         ControlHitbox, ControlHitboxAction, LinkHitbox, RenderedDocument, RenderedImage,
         RenderedLine, SpanStyle, StyledSpan,
@@ -184,7 +242,12 @@ mod tests {
         let mut buffer = Buffer::empty(viewport);
         let mut frame = Frame::new(&mut buffer);
 
-        render_document_frame(&mut PaintCx::new(&mut frame), &document, 1, viewport);
+        render_document_frame(
+            &mut PaintCx::new(&mut frame),
+            &PaintedDocument::new(document),
+            1,
+            viewport,
+        );
 
         assert_eq!(frame.images().len(), 1);
         assert_eq!(frame.hits().regions().len(), 2);
@@ -232,7 +295,12 @@ mod tests {
     ) -> Vec<ImagePlacement> {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 12));
         let mut frame = Frame::new(&mut buffer);
-        render_document_frame(&mut PaintCx::new(&mut frame), document, offset, viewport);
+        render_document_frame(
+            &mut PaintCx::new(&mut frame),
+            &PaintedDocument::new(document.clone()),
+            offset,
+            viewport,
+        );
         frame
             .images()
             .iter()

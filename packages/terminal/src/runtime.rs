@@ -1,14 +1,18 @@
 //! Trowser-owned interactive state machine for the BMUX TUI runtime.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::event::{Event, MouseEventKind};
-use bmux_tui::geometry::Size;
+use bmux_tui::geometry::{Rect, Size};
 use bmux_tui::hit::HitMap;
 use bmux_tui::interaction::InteractionRouter;
+use bmux_tui_components::action_row::{
+    ActionButton, ActionRow, ActionRowOutcome, ActionRowPolicy, ActionRowState,
+};
+use bmux_tui_components::scrollbar::{Scrollbar, ScrollbarOutcome, ScrollbarState};
 use bmux_tui_components::spinner::Spinner;
 use bmux_tui_components::text_input::{
     EdgePolicy, KeyboardPolicy, TextInputControl, TextInputOutcome, TextInputPolicy,
@@ -16,9 +20,27 @@ use bmux_tui_components::text_input::{
 };
 use bmux_tui_runtime::{Command, Program, RuntimeEvent, Subscription, SubscriptionKey, Update};
 
+use crate::bmux::PaintedDocument;
+use crate::keymap::{KeyAction, Keymap};
+use crate::layout::{BrowserLayout, document_width};
 use crate::{
     ControlHitboxAction, RenderMode, RenderedDocument, TerminalRenderOptions, render_document_mode,
 };
+
+/// Hit-id prefix of the close-all confirmation dialog's buttons.
+pub const CONFIRM_DIALOG_ID: &str = "chrome.confirm";
+const CONFIRM_ACTIONS_PREFIX: &str = "chrome.confirm.actions.";
+const CONFIRM_CANCEL: &str = "cancel";
+const CONFIRM_CLOSE_ALL: &str = "close-all";
+
+/// Buttons of the close-all confirmation dialog, in display order.
+#[must_use]
+pub fn confirm_close_all_actions() -> [ActionButton; 2] {
+    [
+        ActionButton::new(CONFIRM_CANCEL, "Cancel"),
+        ActionButton::new(CONFIRM_CLOSE_ALL, "Close all"),
+    ]
+}
 
 /// Single-row prompt editing: Enter submits; cursor movement, word editing,
 /// paste, selection and undo use BMUX's standard readline keymap.
@@ -182,8 +204,8 @@ impl PromptState {
 pub struct BrowserProgram {
     /// Current sanitized browser page.
     pub page: trowser_render::SemanticPage,
-    /// Current browser-specific terminal projection.
-    pub document: RenderedDocument,
+    /// Current terminal projection, prepared for painting.
+    document: PaintedDocument,
     /// First visible document line.
     pub offset: usize,
     /// Active semantic projection mode.
@@ -210,6 +232,13 @@ pub struct BrowserProgram {
     pub spinner: Spinner,
     /// Stable committed focus identifier.
     pub focused: Option<String>,
+    /// Whether the key hint bar is shown.
+    pub show_help: bool,
+    /// Focus state of the close-all confirmation dialog buttons.
+    pub confirm_actions: Cell<ActionRowState>,
+    keymap: Keymap,
+    key_hints: Vec<(String, &'static str)>,
+    scrollbar_drag: ScrollbarState,
     interaction_router: InteractionRouter,
     /// Last known terminal size.
     pub terminal_size: Size,
@@ -227,9 +256,10 @@ impl BrowserProgram {
         document: RenderedDocument,
         terminal_size: Size,
     ) -> Self {
+        let keymap = Keymap::defaults();
         Self {
             page,
-            document,
+            document: PaintedDocument::new(document),
             offset: 0,
             render_mode: RenderMode::default(),
             status: String::new(),
@@ -242,12 +272,83 @@ impl BrowserProgram {
             loading_started: Instant::now(),
             spinner: Spinner::braille(),
             focused: None,
+            show_help: false,
+            confirm_actions: Cell::new(ActionRowState::default()),
+            key_hints: keymap.hints(),
+            keymap,
+            scrollbar_drag: ScrollbarState::default(),
             interaction_router: InteractionRouter::new(),
             terminal_size,
             pending_action: None,
             effect: None,
             request_generation: 0,
         }
+    }
+
+    /// Current browser-specific terminal projection.
+    #[must_use]
+    pub const fn document(&self) -> &RenderedDocument {
+        self.document.document()
+    }
+
+    /// Current projection with BMUX lines and hit ids prepared for painting.
+    #[must_use]
+    pub const fn painted_document(&self) -> &PaintedDocument {
+        &self.document
+    }
+
+    /// Replace the terminal projection, preparing it for painting once.
+    pub fn set_document(&mut self, document: RenderedDocument) {
+        self.document = PaintedDocument::new(document);
+    }
+
+    /// Install key bindings (for example built from config overrides).
+    pub fn set_keymap(&mut self, keymap: Keymap) {
+        self.key_hints = keymap.hints();
+        self.keymap = keymap;
+    }
+
+    /// Key hint pairs (key label, action label) for the hint bar.
+    #[must_use]
+    pub fn key_hints(&self) -> &[(String, &'static str)] {
+        &self.key_hints
+    }
+
+    /// Frame layout for the current terminal size and visible chrome.
+    #[must_use]
+    pub const fn layout(&self) -> BrowserLayout {
+        BrowserLayout::new(
+            Rect::new(0, 0, self.terminal_size.width, self.terminal_size.height),
+            !self.tabs.is_empty(),
+            self.show_help,
+        )
+    }
+
+    /// Scrollbar geometry for the current document and viewport.
+    ///
+    /// Line counts beyond `u16::MAX` are scaled down so long documents still
+    /// get a proportional thumb.
+    #[must_use]
+    pub fn scrollbar_state(&self) -> ScrollbarState {
+        let scale = self.scroll_scale();
+        let to_track = |lines: usize| u16::try_from(lines / scale).unwrap_or(u16::MAX);
+        ScrollbarState::new(
+            to_track(self.document().lines.len()),
+            to_track(self.viewport_height()),
+        )
+        .offset(to_track(self.offset))
+    }
+
+    fn scroll_scale(&self) -> usize {
+        self.document()
+            .lines
+            .len()
+            .div_ceil(usize::from(u16::MAX))
+            .max(1)
+    }
+
+    fn viewport_height(&self) -> usize {
+        usize::from(self.layout().body.height.max(1))
     }
 
     /// Install the CLI-owned browser/daemon effect factory.
@@ -300,20 +401,43 @@ impl BrowserProgram {
     }
 
     fn reproject_document(&mut self) {
-        self.document = render_document_mode(
+        self.set_document(render_document_mode(
             &self.page,
             &TerminalRenderOptions {
-                width: self.terminal_size.width,
+                width: document_width(self.terminal_size.width),
             },
             self.render_mode,
-        );
-        self.offset = page_scroll_offset(&self.page, &self.document);
+        ));
+        self.offset = page_scroll_offset(&self.page, self.document());
     }
 
     fn max_offset(&self) -> usize {
-        self.document.lines.len().saturating_sub(usize::from(
-            self.terminal_size.height.saturating_sub(2).max(1),
-        ))
+        self.document()
+            .lines
+            .len()
+            .saturating_sub(self.viewport_height())
+    }
+
+    fn scroll_to(&mut self, offset: usize) -> Update<BrowserMessage> {
+        self.offset = offset.min(self.max_offset());
+        self.scroll_update()
+    }
+
+    /// Route scrollbar clicks and drags; `None` when the event is not for it.
+    fn handle_scrollbar_mouse(&mut self, event: &Event) -> Option<Update<BrowserMessage>> {
+        let area = self.layout().scrollbar;
+        // Keep BMUX's private drag flag; refresh geometry from the document.
+        let current = self.scrollbar_state();
+        self.scrollbar_drag.content_len = current.content_len;
+        self.scrollbar_drag.viewport_len = current.viewport_len;
+        self.scrollbar_drag.offset = current.offset;
+        match Scrollbar::new().handle_event(area, &mut self.scrollbar_drag, event) {
+            ScrollbarOutcome::Changed { offset } => {
+                Some(self.scroll_to(usize::from(offset) * self.scroll_scale()))
+            }
+            ScrollbarOutcome::Redraw => Some(Update::redraw()),
+            ScrollbarOutcome::Ignored => None,
+        }
     }
 
     fn handle_terminal(&mut self, event: &Event) -> Update<BrowserMessage> {
@@ -328,7 +452,13 @@ impl BrowserProgram {
                 self.handle_prompt_event(event)
             }
             Event::Key(stroke) => self.handle_unprompted_key(*stroke),
+            Event::Mouse(_) if matches!(self.prompt, Some(PromptState::ConfirmCloseAll)) => {
+                self.handle_confirm_event(event)
+            }
             Event::Mouse(mouse) => {
+                if let Some(update) = self.handle_scrollbar_mouse(event) {
+                    return update;
+                }
                 let route = self.interaction_router.route(Event::Mouse(*mouse));
                 if let Some(focus) = route.focus_changed {
                     self.focused = Some(focus.as_str().to_owned());
@@ -347,14 +477,8 @@ impl BrowserProgram {
                     return self.activate_target(target);
                 }
                 match mouse.kind {
-                    MouseEventKind::ScrollUp => {
-                        self.offset = self.offset.saturating_sub(3);
-                        self.scroll_update()
-                    }
-                    MouseEventKind::ScrollDown => {
-                        self.offset = self.offset.saturating_add(3).min(self.max_offset());
-                        self.scroll_update()
-                    }
+                    MouseEventKind::ScrollUp => self.scroll_to(self.offset.saturating_sub(3)),
+                    MouseEventKind::ScrollDown => self.scroll_to(self.offset.saturating_add(3)),
                     MouseEventKind::Down(_)
                     | MouseEventKind::Up(_)
                     | MouseEventKind::Drag(_)
@@ -368,93 +492,75 @@ impl BrowserProgram {
     }
 
     fn handle_unprompted_key(&mut self, stroke: KeyStroke) -> Update<BrowserMessage> {
-        if stroke.key == KeyCode::Tab {
-            return self.handle_key(stroke);
+        if stroke.modifiers.ctrl && stroke.key == KeyCode::Char('c') {
+            return Update::exit();
+        }
+        let action = self.keymap.resolve(stroke);
+        // Tab-switch bindings bypass BMUX focus traversal of the committed scene.
+        if matches!(action, Some(KeyAction::NextTab | KeyAction::PreviousTab)) {
+            return self.key_action(action);
         }
         let route = self.interaction_router.route(Event::Key(stroke));
         if let Some(focus) = route.focus_changed {
             self.focused = Some(focus.as_str().to_owned());
             Update::redraw()
         } else {
-            self.handle_key(stroke)
+            self.key_action(action)
         }
     }
 
-    fn handle_key(&mut self, stroke: KeyStroke) -> Update<BrowserMessage> {
-        let KeyStroke { key, modifiers } = stroke;
-        if modifiers.ctrl && key == KeyCode::Char('c') {
-            return Update::exit();
-        }
-        match key {
-            KeyCode::Char('q') => Update::exit(),
-            KeyCode::Tab if modifiers.shift => self.action(BrowserAction::PreviousTab),
-            KeyCode::Tab => self.action(BrowserAction::NextTab),
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.offset = self.offset.saturating_add(1).min(self.max_offset());
-                self.scroll_update()
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.offset = self.offset.saturating_sub(1);
-                self.scroll_update()
-            }
-            KeyCode::PageDown => {
-                self.offset = self
-                    .offset
-                    .saturating_add(usize::from(
-                        self.terminal_size.height.saturating_sub(2).max(1),
-                    ))
-                    .min(self.max_offset());
-                self.scroll_update()
-            }
-            KeyCode::PageUp => {
-                self.offset = self.offset.saturating_sub(usize::from(
-                    self.terminal_size.height.saturating_sub(2).max(1),
-                ));
-                self.scroll_update()
-            }
-            KeyCode::Char('g') if modifiers.shift => {
-                self.offset = self.max_offset();
-                self.scroll_update()
-            }
-            KeyCode::Home | KeyCode::Char('g') => {
-                self.offset = 0;
-                self.scroll_update()
-            }
-            KeyCode::End => {
-                self.offset = self.max_offset();
-                self.scroll_update()
-            }
-            KeyCode::Char('m') => {
+    fn key_action(&mut self, action: Option<KeyAction>) -> Update<BrowserMessage> {
+        let Some(action) = action else {
+            return Update::none();
+        };
+        let page = self.viewport_height();
+        match action {
+            KeyAction::Quit => Update::exit(),
+            KeyAction::NextTab => self.action(BrowserAction::NextTab),
+            KeyAction::PreviousTab => self.action(BrowserAction::PreviousTab),
+            KeyAction::ScrollDown => self.scroll_to(self.offset.saturating_add(1)),
+            KeyAction::ScrollUp => self.scroll_to(self.offset.saturating_sub(1)),
+            KeyAction::PageDown => self.scroll_to(self.offset.saturating_add(page)),
+            KeyAction::PageUp => self.scroll_to(self.offset.saturating_sub(page)),
+            KeyAction::Top => self.scroll_to(0),
+            KeyAction::Bottom => self.scroll_to(usize::MAX),
+            KeyAction::CycleRenderMode => {
                 // A plain redraw keeps retained terminal images that are still valid.
                 self.render_mode = self.render_mode.next();
                 self.reproject_document();
                 self.status = format!("render mode: {}", self.render_mode.label());
                 Update::redraw()
             }
-            KeyCode::Char('o' | 't') => self.open_prompt(PromptState::OpenUrl, ""),
-            KeyCode::Char('/') => {
+            KeyAction::OpenUrl => self.open_prompt(PromptState::OpenUrl, ""),
+            KeyAction::Search => {
                 let query = self.search_query.clone();
                 self.open_prompt(PromptState::Search, &query)
             }
-            KeyCode::Char('n') if modifiers.shift => self.repeat_search(true),
-            KeyCode::Char('n') => self.repeat_search(false),
-            KeyCode::Char('a') if modifiers.shift => self.focus_action(false),
-            KeyCode::Char('a') => self.focus_action(true),
-            KeyCode::Enter => self.activate_focused_action(),
-            KeyCode::Char('x') if modifiers.shift => {
+            KeyAction::SearchNext => self.repeat_search(false),
+            KeyAction::SearchPrevious => self.repeat_search(true),
+            KeyAction::NextAction => self.focus_action(true),
+            KeyAction::PreviousAction => self.focus_action(false),
+            KeyAction::Activate => self.activate_focused_action(),
+            KeyAction::CloseAllTabs => {
+                let mut actions = ActionRowState::default();
+                actions.set_focused(Some(0));
+                self.confirm_actions.set(actions);
                 self.open_prompt(PromptState::ConfirmCloseAll, "")
             }
-            KeyCode::Char('x') => self.action(BrowserAction::CloseTab),
-            KeyCode::Char('b') | KeyCode::Left => self.action(BrowserAction::Back),
-            KeyCode::Char('f') if modifiers.shift => self.action(BrowserAction::Forward),
-            KeyCode::Char('f') | KeyCode::Right => self.action(BrowserAction::Forward),
-            KeyCode::Char('r') => self.action(BrowserAction::Reload),
-            _ => Update::none(),
+            KeyAction::CloseTab => self.action(BrowserAction::CloseTab),
+            KeyAction::Back => self.action(BrowserAction::Back),
+            KeyAction::Forward => self.action(BrowserAction::Forward),
+            KeyAction::Reload => self.action(BrowserAction::Reload),
+            KeyAction::ToggleHelp => {
+                self.show_help = !self.show_help;
+                self.offset = self.offset.min(self.max_offset());
+                Update::redraw()
+            }
         }
     }
 
     fn focus_action(&mut self, forward: bool) -> Update<BrowserMessage> {
-        let found = next_action_line(&self.document, self.offset, forward);
+        let found = next_action_line(self.document(), self.offset, forward);
         if let Some((row, target)) = found {
             self.offset = row;
             self.focused = Some(target);
@@ -473,17 +579,20 @@ impl BrowserProgram {
         let target = self
             .focused
             .clone()
-            .or_else(|| first_action_on_line(&self.document, self.offset));
+            .or_else(|| first_action_on_line(self.document(), self.offset));
         target.map_or_else(Update::none, |target| self.activate_target(&target))
     }
 
     fn activate_target(&mut self, target: &str) -> Update<BrowserMessage> {
+        if let Some(id) = target.strip_prefix(CONFIRM_ACTIONS_PREFIX) {
+            return self.confirm_close_all(id == CONFIRM_CLOSE_ALL);
+        }
         if let Some(link_id) = target
             .strip_prefix("browser.link.")
             .and_then(|value| value.parse::<u32>().ok())
         {
             let action_id = self
-                .document
+                .document()
                 .lines
                 .iter()
                 .flat_map(|line| &line.links)
@@ -496,7 +605,7 @@ impl BrowserProgram {
             .and_then(|value| value.parse::<u32>().ok())
         {
             let control = self
-                .document
+                .document()
                 .lines
                 .iter()
                 .flat_map(|line| &line.controls)
@@ -526,10 +635,10 @@ impl BrowserProgram {
             return Update::redraw();
         }
         let found = if reverse {
-            find_document_line_reverse(&self.document, &self.search_query, self.offset)
+            find_document_line_reverse(self.document(), &self.search_query, self.offset)
         } else {
             find_document_line(
-                &self.document,
+                self.document(),
                 &self.search_query,
                 self.offset.saturating_add(1),
             )
@@ -548,16 +657,7 @@ impl BrowserProgram {
             return Update::none();
         };
         if !prompt.is_editable() {
-            let Event::Key(stroke) = event else {
-                return Update::none();
-            };
-            self.prompt = None;
-            return if stroke.key == KeyCode::Char('y') {
-                self.action(BrowserAction::CloseAllTabs)
-            } else {
-                self.status = "close all canceled".to_string();
-                Update::redraw()
-            };
+            return self.handle_confirm_event(event);
         }
         if matches!(event, Event::Key(stroke) if stroke.key == KeyCode::Escape) {
             self.prompt = None;
@@ -573,6 +673,53 @@ impl BrowserProgram {
         }
     }
 
+    /// Close-all confirmation: `y`/`n`/Escape shortcuts, arrow focus and
+    /// Enter/Space activation through BMUX's action row, and button clicks.
+    fn handle_confirm_event(&mut self, event: &Event) -> Update<BrowserMessage> {
+        if let Event::Key(stroke) = event {
+            match stroke.key {
+                KeyCode::Char('y') => return self.confirm_close_all(true),
+                KeyCode::Char('n') | KeyCode::Escape => return self.confirm_close_all(false),
+                _ => {}
+            }
+        }
+        if let Event::Mouse(mouse) = event {
+            let route = self.interaction_router.route(Event::Mouse(*mouse));
+            if matches!(
+                mouse.kind,
+                MouseEventKind::Up(bmux_tui::event::MouseButton::Left)
+            ) && let Some(target) = route.target
+                && target.as_str().starts_with(CONFIRM_ACTIONS_PREFIX)
+            {
+                return self.activate_target(target.as_str());
+            }
+            return Update::none();
+        }
+        let actions = confirm_close_all_actions();
+        let mut state = self.confirm_actions.get();
+        let outcome = ActionRow::new(&actions)
+            .policy(ActionRowPolicy::roving())
+            .handle_event(Rect::default(), &mut state, event);
+        self.confirm_actions.set(state);
+        match outcome {
+            ActionRowOutcome::Activated { id, .. } => {
+                self.confirm_close_all(id == CONFIRM_CLOSE_ALL)
+            }
+            outcome if outcome.needs_redraw() => Update::redraw(),
+            _ => Update::none(),
+        }
+    }
+
+    fn confirm_close_all(&mut self, confirmed: bool) -> Update<BrowserMessage> {
+        self.prompt = None;
+        if confirmed {
+            self.action(BrowserAction::CloseAllTabs)
+        } else {
+            self.status = "close all canceled".to_string();
+            Update::redraw()
+        }
+    }
+
     fn submit_prompt(&mut self) -> Update<BrowserMessage> {
         let input = self.prompt_text();
         match self.prompt.take() {
@@ -581,7 +728,7 @@ impl BrowserProgram {
                 self.action(BrowserAction::OpenUrl(input))
             }
             Some(PromptState::Search) => {
-                if let Some(found) = find_document_line(&self.document, &input, 0) {
+                if let Some(found) = find_document_line(self.document(), &input, 0) {
                     self.offset = found;
                     self.status = format!("found: {input}");
                 } else {
@@ -606,7 +753,7 @@ impl BrowserProgram {
     /// replaceable browser sync without loading state.
     fn scroll_update(&mut self) -> Update<BrowserMessage> {
         let y_px = self
-            .document
+            .document()
             .lines
             .get(self.offset)
             .and_then(|line| line.source_y_px)
@@ -782,7 +929,7 @@ impl Program for BrowserProgram {
                 generation,
             }) if generation == self.request_generation => {
                 self.page = *page;
-                self.document = *document;
+                self.set_document(*document);
                 self.set_tabs(tabs);
                 self.offset = self.offset.min(self.max_offset());
                 self.pending_action = None;
@@ -798,8 +945,8 @@ impl Program for BrowserProgram {
                 // Keep the user's latest local position, not the one the sync started at.
                 page.scroll_y_px = self.page.scroll_y_px;
                 self.page = *page;
-                self.document = *document;
-                self.offset = page_scroll_offset(&self.page, &self.document);
+                self.set_document(*document);
+                self.offset = page_scroll_offset(&self.page, self.document());
                 Update::redraw()
             }
             // The spinner frame derives from elapsed time; ticks only request redraws.
@@ -1134,7 +1281,7 @@ mod tests {
 
         assert_eq!(program.terminal_size, Size::new(20, 10));
         assert!(
-            program.document.lines[program.offset]
+            program.document().lines[program.offset]
                 .text
                 .contains("anchor")
         );
@@ -1243,7 +1390,7 @@ mod tests {
         for _ in 0..3 {
             key(&mut program, KeyCode::Char('j'));
         }
-        let synced_document = program.document.clone();
+        let synced_document = program.document().clone();
         let generation = program.begin_request("idle");
         program.loading = false;
 
@@ -1321,5 +1468,130 @@ mod tests {
 
         assert_eq!(program.offset, 4);
         assert_eq!(program.status, "found: line 4");
+    }
+
+    fn shifted(code: KeyCode) -> KeyStroke {
+        KeyStroke::with_modifiers(
+            code,
+            Modifiers {
+                shift: true,
+                ..Modifiers::NONE
+            },
+        )
+    }
+
+    #[test]
+    fn configured_keymap_drives_actions() {
+        let mut program = program();
+        let overrides = std::collections::BTreeMap::from([(
+            "scroll_down".to_string(),
+            vec!["ctrl+e".to_string()],
+        )]);
+        program.set_keymap(crate::keymap::Keymap::with_overrides(&overrides).unwrap());
+
+        key(&mut program, KeyCode::Char('j'));
+        assert_eq!(program.offset, 0, "default binding was replaced");
+        program
+            .update(RuntimeEvent::Terminal(Event::Key(
+                KeyStroke::with_modifiers(
+                    KeyCode::Char('e'),
+                    Modifiers {
+                        ctrl: true,
+                        ..Modifiers::NONE
+                    },
+                ),
+            )))
+            .unwrap();
+        assert_eq!(program.offset, 1);
+    }
+
+    #[test]
+    fn help_toggle_shrinks_the_scrollable_viewport() {
+        let mut program = program();
+        let before = program.layout().body.height;
+
+        key(&mut program, KeyCode::Char('?'));
+
+        assert!(program.show_help);
+        assert_eq!(program.layout().body.height, before - 1);
+        key(&mut program, KeyCode::Char('?'));
+        assert!(!program.show_help);
+    }
+
+    #[test]
+    fn close_all_dialog_supports_arrows_enter_escape_and_clicks() {
+        let mut program = program();
+        let open = |program: &mut BrowserProgram| {
+            program
+                .update(RuntimeEvent::Terminal(Event::Key(shifted(KeyCode::Char(
+                    'x',
+                )))))
+                .unwrap();
+            assert_eq!(program.prompt, Some(super::PromptState::ConfirmCloseAll));
+        };
+
+        open(&mut program);
+        key(&mut program, KeyCode::Enter);
+        assert!(program.prompt.is_none(), "Enter on focused Cancel closes");
+        assert_eq!(program.status, "close all canceled");
+
+        open(&mut program);
+        key(&mut program, KeyCode::Right);
+        key(&mut program, KeyCode::Enter);
+        assert_eq!(
+            program.pending_action,
+            Some(super::BrowserAction::CloseAllTabs)
+        );
+
+        program.pending_action = None;
+        open(&mut program);
+        key(&mut program, KeyCode::Escape);
+        assert!(program.prompt.is_none());
+        assert!(program.pending_action.is_none());
+
+        open(&mut program);
+        let mut scene = bmux_tui::hit::HitMap::new();
+        scene.push(HitRegion::new(
+            "chrome.confirm.actions.close-all",
+            Rect::new(10, 2, 9, 1),
+        ));
+        program.commit_interactions(scene);
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            program
+                .update(RuntimeEvent::Terminal(Event::Mouse(MouseEvent::new(
+                    kind,
+                    Point::new(12, 2),
+                ))))
+                .unwrap();
+        }
+        assert_eq!(
+            program.pending_action,
+            Some(super::BrowserAction::CloseAllTabs)
+        );
+    }
+
+    #[test]
+    fn dragging_the_scrollbar_scrolls_the_document() {
+        let mut program = program();
+        let scrollbar = program.layout().scrollbar;
+        let top = Point::new(scrollbar.x, scrollbar.y);
+        let bottom = Point::new(scrollbar.x, scrollbar.bottom() - 1);
+
+        for (kind, point) in [
+            (MouseEventKind::Down(MouseButton::Left), top),
+            (MouseEventKind::Drag(MouseButton::Left), bottom),
+            (MouseEventKind::Up(MouseButton::Left), bottom),
+        ] {
+            program
+                .update(RuntimeEvent::Terminal(Event::Mouse(MouseEvent::new(
+                    kind, point,
+                ))))
+                .unwrap();
+        }
+
+        assert!(program.offset > 0, "offset {}", program.offset);
     }
 }

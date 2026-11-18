@@ -15,6 +15,8 @@ use trowser_client::TrowserClient;
 use trowser_config::TrowserConfig;
 use trowser_ipc::{Request, Response, ViewportHint};
 use trowser_terminal::application::BrowserApplicationRenderer;
+use trowser_terminal::keymap::Keymap;
+use trowser_terminal::layout::document_width;
 use trowser_terminal::runtime::{
     BrowserAction, BrowserEffect, BrowserMessage, BrowserProgram, SCROLL_SYNC_DELAY,
 };
@@ -38,12 +40,17 @@ pub async fn run(
             size.height
         );
     }
+    // Validate key bindings before taking over the terminal.
+    let keymap = Keymap::with_overrides(&config.keys)?;
     let document = render_document_mode(
         &initial_page,
-        &TerminalRenderOptions { width: size.width },
+        &TerminalRenderOptions {
+            width: document_width(size.width),
+        },
         RenderMode::default(),
     );
     let mut program = BrowserProgram::new(initial_page, document, size);
+    program.set_keymap(keymap);
     program.set_effect(effect_factory(client.clone()));
     let startup =
         Some(initial_url.map_or(BrowserAction::LoadActiveSnapshot, BrowserAction::OpenUrl));
@@ -134,7 +141,9 @@ fn effect_factory(client: TrowserClient) -> BrowserEffect {
                         let tabs = list_tabs(&client).await.unwrap_or_default();
                         let document = render_document_mode(
                             &page,
-                            &TerminalRenderOptions { width: size.width },
+                            &TerminalRenderOptions {
+                                width: document_width(size.width),
+                            },
                             mode,
                         );
                         BrowserMessage::PageLoaded {
@@ -174,8 +183,13 @@ fn scroll_sync_command(
             let page = navigation_and_snapshot(&client, Request::ScrollTo { y_px, viewport })
                 .await
                 .ok()?;
-            let document =
-                render_document_mode(&page, &TerminalRenderOptions { width: size.width }, mode);
+            let document = render_document_mode(
+                &page,
+                &TerminalRenderOptions {
+                    width: document_width(size.width),
+                },
+                mode,
+            );
             Some(BrowserMessage::ScrollSynced {
                 page: Box::new(page),
                 document: Box::new(document),
@@ -186,7 +200,10 @@ fn scroll_sync_command(
 }
 
 fn viewport_for(size: bmux_tui::geometry::Size) -> ViewportHint {
-    ViewportHint::from_terminal_cells(size.width, size.height.saturating_sub(2).max(1))
+    ViewportHint::from_terminal_cells(
+        document_width(size.width),
+        size.height.saturating_sub(2).max(1),
+    )
 }
 
 async fn execute_action(

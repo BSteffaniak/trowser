@@ -6,6 +6,8 @@
 
 pub mod application;
 pub mod bmux;
+pub mod keymap;
+pub mod layout;
 pub mod runtime;
 
 use std::collections::{BTreeMap, BTreeSet};

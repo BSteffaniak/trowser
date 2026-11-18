@@ -15,6 +15,9 @@ bmux_keyboard = { workspace = true }
 bmux_text_edit = { workspace = true }
 bmux_tui = { workspace = true }
 bmux_tui_components = { workspace = true, features = [
+    "dialog",
+    "key-hint-bar",
+    "scrollbar",
     "spinner",
     "status-bar",
     "tab-bar",

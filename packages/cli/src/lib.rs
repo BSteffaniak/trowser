@@ -262,7 +262,8 @@ async fn run_bmux_interactive(
 ) -> Result<u8> {
     let client = ensure_server(paths).await?;
     let page = empty_page("Loading browser state…");
-    bmux_interactive::run(client, config, page, initial_url).await
+    // Boxed: the interactive runtime owns large program and presenter state.
+    Box::pin(bmux_interactive::run(client, config, page, initial_url)).await
 }
 
 async fn follow_and_snapshot(

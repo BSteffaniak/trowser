@@ -5,6 +5,7 @@
 //! Configuration and path handling for trowser.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -148,6 +149,10 @@ pub struct TrowserConfig {
     pub render: RenderConfig,
     /// Resource policy configuration.
     pub resources: ResourcePolicyConfig,
+    /// Interactive key binding overrides: action name to key strokes such as
+    /// `"ctrl+r"` or `"shift+g"`. Listed actions replace their defaults; an
+    /// empty list unbinds the action.
+    pub keys: BTreeMap<String, Vec<String>>,
 }
 
 impl TrowserConfig {
@@ -194,6 +199,20 @@ mod tests {
 
         assert_eq!(config.resources.max_tabs, Some(12));
         assert_eq!(config.resources.max_awake_tabs, Some(3));
+    }
+
+    #[test]
+    fn config_accepts_key_binding_overrides() {
+        let config =
+            toml::from_str::<TrowserConfig>("[keys]\nreload = [\"ctrl+r\", \"f5\"]\nquit = []\n")
+                .expect("config should parse");
+
+        assert_eq!(
+            config.keys.get("reload"),
+            Some(&vec!["ctrl+r".to_string(), "f5".to_string()])
+        );
+        assert_eq!(config.keys.get("quit"), Some(&Vec::new()));
+        assert!(TrowserConfig::default().keys.is_empty());
     }
 }
 

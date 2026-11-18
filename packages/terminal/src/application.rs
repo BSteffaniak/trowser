@@ -3,12 +3,16 @@
 use std::cell::RefCell;
 
 use bmux_tui::component::{Component, Constraints, LayoutCx};
-use bmux_tui::geometry::{Rect, Size};
+use bmux_tui::geometry::{Insets, Rect, Size};
 use bmux_tui::hit::{HitRegion, HitRole};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text::{Line, Span};
 use bmux_tui::text_width::display_width;
+use bmux_tui_components::dialog::{Dialog, DialogComponent};
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent, KeyHintBarPolicy};
+use bmux_tui_components::modal_frame::{ModalSizing, ModalTheme};
+use bmux_tui_components::scrollbar::{Scrollbar, ScrollbarPolicy};
 use bmux_tui_components::status_bar::{
     StatusBarComponent, StatusBarPolicy, StatusBarStyles, StatusSegment, StatusSeverity,
 };
@@ -16,7 +20,10 @@ use bmux_tui_components::tab_bar::{TabBarComponent, TabBarPolicy, TabBarState, T
 use bmux_tui_components::text_input_box::{TextInputBoxComponent, TextInputBoxPolicy};
 
 use crate::bmux::render_document_frame;
-use crate::runtime::{BrowserProgram, PROMPT_POLICY};
+use crate::layout::BrowserLayout;
+use crate::runtime::{
+    BrowserProgram, CONFIRM_DIALOG_ID, PROMPT_POLICY, PromptState, confirm_close_all_actions,
+};
 
 /// Retained component state used while rendering the interactive application.
 #[derive(Default)]
@@ -44,9 +51,10 @@ impl BrowserApplicationRenderer {
 
 /// Paint the complete interactive trowser surface into one BMUX frame.
 ///
-/// The application surface has a one-row header, a responsive browser-content
-/// viewport, and a one-row status/prompt surface. Browser document content and
-/// images are delegated to the browser-specific semantic painter.
+/// The application surface has a one-row header, an optional tab row, a
+/// responsive browser-content viewport with a scrollbar, an optional key hint
+/// row, and a one-row status/prompt surface (see [`BrowserLayout`]). Browser
+/// document content and images are delegated to the semantic painter.
 pub fn render_browser_frame(
     program: &BrowserProgram,
     tab_state: &mut TabBarState,
@@ -58,13 +66,8 @@ pub fn render_browser_frame(
         return;
     }
 
-    let header = Rect::new(area.x, area.y, area.width, 1);
-    let has_tabs = !program.tabs.is_empty() && area.height >= 4;
-    let tabs_area = has_tabs.then(|| Rect::new(area.x, area.y.saturating_add(1), area.width, 1));
-    let status_y = area.bottom().saturating_sub(1);
-    let status = Rect::new(area.x, status_y, area.width, 1);
-    let body_y = area.y.saturating_add(if has_tabs { 2 } else { 1 });
-    let body = Rect::new(area.x, body_y, area.width, status_y.saturating_sub(body_y));
+    let layout = BrowserLayout::new(area, !program.tabs.is_empty(), program.show_help);
+    let header = layout.header;
 
     let title = if program.page.title.is_empty() {
         program.page.url.as_str()
@@ -85,7 +88,7 @@ pub fn render_browser_frame(
             .pointer_events(false),
     );
 
-    if let Some(tabs_area) = tabs_area {
+    if let Some(tabs_area) = layout.tabs {
         let items = program
             .tabs
             .iter()
@@ -109,9 +112,65 @@ pub fn render_browser_frame(
         *tab_state = state.into_inner();
     }
 
-    render_document_frame(frame, &program.document, program.offset, body);
+    render_document_frame(
+        frame,
+        program.painted_document(),
+        program.offset,
+        layout.body,
+    );
+    render_scrollbar(program, layout, frame);
+    if let Some(hints) = layout.hints {
+        render_key_hints(program, hints, frame);
+    }
 
-    render_status(program, status, frame);
+    render_status(program, layout.status, frame);
+
+    if matches!(program.prompt, Some(PromptState::ConfirmCloseAll)) {
+        render_confirm_dialog(program, area, frame);
+    }
+}
+
+/// Paint the scrollbar only when the document is taller than its viewport.
+fn render_scrollbar(program: &BrowserProgram, layout: BrowserLayout, frame: &mut PaintCx<'_, '_>) {
+    let mut state = program.scrollbar_state();
+    state.viewport_len = layout.body.height;
+    if layout.scrollbar.is_empty() || state.max_offset() == 0 {
+        return;
+    }
+    state.normalize();
+    Scrollbar::new()
+        .policy(ScrollbarPolicy::vertical())
+        .paint(layout.scrollbar, &state, frame);
+}
+
+fn render_key_hints(program: &BrowserProgram, area: Rect, frame: &mut PaintCx<'_, '_>) {
+    let hints = program
+        .key_hints()
+        .iter()
+        .map(|(key, label)| KeyHint::new(key, label))
+        .collect::<Vec<_>>();
+    paint_component(
+        &KeyHintBarComponent::new("chrome.hints", &hints).policy(KeyHintBarPolicy::compact()),
+        area,
+        frame,
+    );
+}
+
+fn render_confirm_dialog(program: &BrowserProgram, area: Rect, frame: &mut PaintCx<'_, '_>) {
+    let body = [Line::raw("Close every open tab?")];
+    let actions = confirm_close_all_actions();
+    let dialog = Dialog::new(&body, &actions, ModalTheme::dark(Color::Cyan))
+        .title("Close all tabs")
+        .sizing(ModalSizing::new(
+            Size::new(24, 6),
+            Size::new(48, 8),
+            Insets::all(1),
+        ));
+    paint_component(
+        &DialogComponent::new(CONFIRM_DIALOG_ID, dialog, &program.confirm_actions),
+        area,
+        frame,
+    );
 }
 
 fn render_status(program: &BrowserProgram, status: Rect, frame: &mut PaintCx<'_, '_>) {
@@ -259,7 +318,8 @@ mod tests {
 
         let narrow = render_rows(&program, Size::new(12, 3));
         assert!(narrow[0].contains("trowser"));
-        assert!(narrow[1].starts_with("semantic bod"));
+        // One column is reserved for the scrollbar.
+        assert!(narrow[1].starts_with("semantic bo"));
 
         let short = render_rows(&program, Size::new(20, 2));
         assert!(short[0].contains("trowser"));
@@ -307,5 +367,84 @@ mod tests {
         assert!(rows[0].contains("trowser"));
         assert!(rows[1].starts_with("body"));
         assert!(rows[4].starts_with("Search: term"));
+    }
+
+    fn long_program(size: Size) -> BrowserProgram {
+        BrowserProgram::new(
+            trowser_render::SemanticPage::default(),
+            RenderedDocument {
+                lines: (0..40)
+                    .map(|index| RenderedLine {
+                        text: format!("line {index}"),
+                        ..RenderedLine::default()
+                    })
+                    .collect(),
+            },
+            size,
+        )
+    }
+
+    #[test]
+    fn draws_scrollbar_only_for_scrollable_documents() {
+        let size = Size::new(30, 10);
+        let rows = render_rows(&long_program(size), size);
+        assert!(rows[1].ends_with('█'), "thumb at the top: {:?}", rows[1]);
+
+        let short = BrowserProgram::new(
+            trowser_render::SemanticPage::default(),
+            RenderedDocument {
+                lines: vec![RenderedLine {
+                    text: "short".to_string(),
+                    ..RenderedLine::default()
+                }],
+            },
+            size,
+        );
+        let rows = render_rows(&short, size);
+        assert!(rows.iter().all(|row| !row.contains('█')));
+    }
+
+    #[test]
+    fn help_toggle_shows_key_hints_from_the_keymap() {
+        let size = Size::new(60, 10);
+        let mut program = long_program(size);
+        program.show_help = true;
+
+        let rows = render_rows(&program, size);
+
+        assert!(rows[8].contains("open"), "hint row: {:?}", rows[8]);
+        assert!(rows[8].contains('?'));
+    }
+
+    #[test]
+    fn close_all_confirmation_renders_as_dialog_with_button_hits() {
+        let size = Size::new(60, 16);
+        let mut program = long_program(size);
+        program.prompt = Some(PromptState::ConfirmCloseAll);
+        let area = Rect::new(0, 0, size.width, size.height);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        let mut tab_state = bmux_tui_components::tab_bar::TabBarState::default();
+
+        render_browser_frame(&program, &mut tab_state, &mut PaintCx::new(&mut frame));
+
+        let ids = frame
+            .hits()
+            .regions()
+            .iter()
+            .map(|region| region.id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            ids.iter()
+                .any(|id| id == "chrome.confirm.actions.close-all")
+        );
+        assert!(ids.iter().any(|id| id == "chrome.confirm.actions.cancel"));
+        drop(frame);
+        let text = (0..size.height)
+            .flat_map(|y| (0..size.width).map(move |x| (x, y)).collect::<Vec<_>>())
+            .filter_map(|(x, y)| buffer.get(bmux_tui::geometry::Point::new(x, y)))
+            .map(|cell| cell.symbol.as_str())
+            .collect::<String>();
+        assert!(text.contains("Close every open tab?"));
     }
 }
