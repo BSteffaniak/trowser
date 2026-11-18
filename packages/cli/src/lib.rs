@@ -253,7 +253,7 @@ fn print_page(
 
 #[allow(
     clippy::too_many_lines,
-    reason = "small crossterm input loop is clearer while interactive mode is still minimal"
+    reason = "small terminal input loop is clearer while interactive mode is still minimal"
 )]
 async fn run_bmux_interactive(
     paths: &ConfigPaths,
@@ -418,7 +418,7 @@ fn empty_page(message: &str) -> trowser_render::SemanticPage {
 }
 
 fn current_viewport_hint() -> Option<ViewportHint> {
-    bmux_tui::crossterm::terminal_size().ok().map(|size| {
+    bmux_tui::terminal_io::terminal_size().ok().map(|size| {
         ViewportHint::from_terminal_cells(size.width, viewport_body_height(size.height))
     })
 }

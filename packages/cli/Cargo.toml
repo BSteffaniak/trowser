@@ -21,12 +21,12 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
 bmux_image = { workspace = true, features = ["iterm2", "kitty", "sixel"] }
-bmux_tui = { workspace = true, features = ["crossterm"] }
+bmux_tui = { workspace = true, features = ["terminal-io"] }
 bmux_tui_runtime = { workspace = true, features = [
-    "crossterm",
     "image-iterm2",
     "image-kitty",
     "image-sixel",
+    "terminal-io",
 ] }
 clap = { workspace = true, features = [
     "derive",

@@ -11,7 +11,9 @@ pub mod runtime;
 use std::collections::{BTreeMap, BTreeSet};
 
 use bmux_tui::geometry::Rect as TuiRect;
-use bmux_tui::image::{ImageContribution, ImageKey, ImageLifecycle, ImagePayload, ImagePlacement};
+use bmux_tui::image::{
+    ImageContribution, ImageFit, ImageKey, ImageLifecycle, ImagePayload, ImagePlacement,
+};
 use trowser_render::{
     BlockLayout, ImagePreview, MediaKind, NAV_SUMMARY_LINK_LIMIT, SemanticBlock,
     SemanticLayoutNode, SemanticPage, SemanticRegion, TextRun, TextRunStyle, reader_blocks,
@@ -1777,7 +1779,7 @@ pub fn image_contribution(
     ImageContribution::Present(ImagePlacement {
         key: ImageKey::new(image.key.clone()),
         payload: ImagePayload::Png {
-            bytes: image.data.clone(),
+            bytes: std::sync::Arc::from(image.data.as_slice()),
             width: image.pixel_width,
             height: image.pixel_height,
         },
@@ -1787,8 +1789,11 @@ pub fn image_contribution(
             image.cell_width,
             image.cell_height,
         ),
+        fit: ImageFit::Stretch,
+        allocation: None,
         clip: viewport,
         lifecycle: ImageLifecycle::Frame,
+        z: 0,
     })
 }
 

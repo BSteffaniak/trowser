@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use bmux_image::ImageConfig;
-use bmux_tui::crossterm::{CrosstermTerminalGuard, terminal_size};
 use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
+use bmux_tui::terminal_io::{TerminalGuard, terminal_size};
 use bmux_tui_runtime::{
     ImageTerminalPresenter, Runtime, RuntimeConfig, RuntimeError, TerminalInput,
 };
@@ -46,7 +46,7 @@ pub async fn run(
     let startup =
         Some(initial_url.map_or(BrowserAction::LoadActiveSnapshot, BrowserAction::OpenUrl));
 
-    let mut guard = CrosstermTerminalGuard::enter(stdout())?;
+    let mut guard = TerminalGuard::enter(stdout())?;
     let capabilities = bmux_image::host_caps::detect_from_env();
     let writer = guard
         .writer_mut()
@@ -83,27 +83,37 @@ pub async fn run(
         message: error.to_string(),
         generation: u64::MAX,
     });
-    let output = match runtime.run().await {
-        Ok(output) | Err(RuntimeError::Program { output, .. }) => output,
-        Err(RuntimeError::Presenter { error, mut output }) => {
-            let cleanup = output.presenter.cleanup_images();
-            let mut input = input;
-            input.shutdown().await;
-            drop(output);
-            let leave = guard.leave();
-            if let Err(cleanup_error) = cleanup {
-                return Err(cleanup_error.into());
-            }
-            leave?;
-            return Err(error.into());
-        }
-    };
+    // The runtime restores presentation state (images, pointer) before returning.
+    let result = runtime.run().await;
     let mut input = input;
     input.shutdown().await;
-    let mut presenter = output.presenter;
-    presenter.cleanup_images()?;
-    drop(presenter);
-    guard.leave()?;
+    let presenter_error = match result {
+        Ok(output) => {
+            drop(output);
+            None
+        }
+        Err(RuntimeError::Program {
+            cleanup_error,
+            output,
+            ..
+        }) => {
+            drop(output);
+            cleanup_error
+        }
+        Err(RuntimeError::Presenter {
+            error,
+            cleanup_error,
+            output,
+        }) => {
+            drop(output);
+            Some(cleanup_error.unwrap_or(error))
+        }
+    };
+    let leave = guard.leave();
+    if let Some(error) = presenter_error {
+        return Err(error.into());
+    }
+    leave?;
     Ok(0)
 }
 
