@@ -11,8 +11,11 @@ pub mod runtime;
 use std::collections::{BTreeMap, BTreeSet};
 
 use bmux_tui::geometry::Rect as TuiRect;
+use std::sync::Arc;
+
 use bmux_tui::image::{
-    ImageContribution, ImageFit, ImageKey, ImageLifecycle, ImagePayload, ImagePlacement,
+    ImageBounds, ImageContribution, ImageFit, ImageKey, ImageLifecycle, ImagePayload,
+    ImagePlacement,
 };
 use trowser_render::{
     BlockLayout, ImagePreview, MediaKind, NAV_SUMMARY_LINK_LIMIT, SemanticBlock,
@@ -24,6 +27,12 @@ use trowser_session_models::ActionId;
 const CSS_PX_PER_CELL_X: f64 = 9.0;
 const MIN_BLOCK_WIDTH: usize = 20;
 const MAX_READER_INDENT: usize = 6;
+
+/// Maximum terminal rows reserved for one inline image.
+///
+/// Painters scan this many lines above the viewport so images whose anchor
+/// line has scrolled off the top are still cropped into view.
+pub const MAX_IMAGE_CELL_HEIGHT: u16 = 24;
 
 /// Terminal rendering options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,33 +115,40 @@ pub struct RenderedLine {
     pub links: Vec<LinkHitbox>,
     /// Form-control hitboxes on this line.
     pub controls: Vec<ControlHitbox>,
-    /// Inline images anchored on this line.
+    /// Inline images whose top row is this line.
     pub images: Vec<RenderedImage>,
     /// Browser source y-coordinate for scroll/anchor synchronization.
     pub source_y_px: Option<u32>,
 }
 
-/// Terminal image payload anchored to a rendered line.
+/// Terminal image anchored at the top row of its reserved cell area.
+///
+/// The payload bytes are shared: cloning a rendered image (for column or box
+/// layout, or when contributing it to a frame) never copies the encoded image,
+/// so BMUX can recognize an unchanged image by pointer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedImage {
     /// Stable browser-content identity used across rendered frames.
-    pub key: String,
-    /// MIME type of the image payload.
-    pub mime_type: String,
-    /// Encoded image bytes.
-    pub data: Vec<u8>,
-    /// Pixel width of the image.
-    pub pixel_width: u32,
-    /// Pixel height of the image.
-    pub pixel_height: u32,
-    /// Desired terminal cell width.
+    pub key: ImageKey,
+    /// Shared encoded image payload and its pixel dimensions.
+    pub payload: ImagePayload,
+    /// Reserved terminal cell width.
     pub cell_width: u16,
-    /// Desired terminal cell height.
+    /// Reserved terminal cell height, including the anchor line.
     pub cell_height: u16,
     /// Start column on the rendered line.
     pub start_col: u16,
-    /// Row offset from the image anchor line for continuation rows.
-    pub row_offset: u16,
+}
+
+impl RenderedImage {
+    /// Pixel dimensions of the payload.
+    #[must_use]
+    pub const fn pixel_size(&self) -> (u32, u32) {
+        match &self.payload {
+            ImagePayload::Png { width, height, .. }
+            | ImagePayload::Pixels { width, height, .. } => (*width, *height),
+        }
+    }
 }
 
 /// A styled text span.
@@ -1178,15 +1194,8 @@ fn offset_images(images: &[RenderedImage], offset: usize) -> Vec<RenderedImage> 
     images
         .iter()
         .map(|image| RenderedImage {
-            key: image.key.clone(),
-            mime_type: image.mime_type.clone(),
-            data: image.data.clone(),
-            pixel_width: image.pixel_width,
-            pixel_height: image.pixel_height,
-            cell_width: image.cell_width,
-            cell_height: image.cell_height,
             start_col: offset_col(image.start_col, offset),
-            row_offset: image.row_offset,
+            ..image.clone()
         })
         .collect()
 }
@@ -1719,7 +1728,10 @@ fn attach_preview_image(
         .unwrap_or(u16::MAX)
         .max(1);
     let ratio = f64::from(pixel_height) / f64::from(pixel_width);
-    let cell_height = ((f64::from(cell_width) * ratio / 2.0).round() as u16).clamp(1, 24);
+    // Row allocation only: terminal cells are assumed to be about twice as tall
+    // as wide. BMUX fits the image exactly with real cell metrics (`Contain`).
+    let cell_height =
+        ((f64::from(cell_width) * ratio / 2.0).round() as u16).clamp(1, MAX_IMAGE_CELL_HEIGHT);
     let image_line = preview_placeholder_line(placement, usize::from(cell_width));
     let Some(line) = document.lines.get_mut(line_index) else {
         return;
@@ -1731,28 +1743,25 @@ fn attach_preview_image(
     }];
     line.links.clear();
     line.controls.clear();
-    let rendered_image = RenderedImage {
-        key: preview_image_key(preview, pixel_width, pixel_height),
-        mime_type: preview.mime_type.clone(),
-        data: preview.data.clone(),
-        pixel_width,
-        pixel_height,
+    line.images.push(RenderedImage {
+        key: ImageKey::new(preview_image_key(preview, pixel_width, pixel_height)),
+        payload: ImagePayload::Png {
+            bytes: Arc::from(preview.data.as_slice()),
+            width: pixel_width,
+            height: pixel_height,
+        },
         cell_width,
         cell_height,
         start_col: u16::try_from(placement.indent.saturating_add(2)).unwrap_or(u16::MAX),
-        row_offset: 0,
-    };
-    line.images.push(rendered_image.clone());
+    });
+    // Continuation rows carry only placeholder text (the plain-text fallback);
+    // the image is attached once, to its top row.
     let reserved = usize::from(cell_height.saturating_sub(1));
-    let rows = (1..=reserved).map(|row_offset| {
-        let mut line = line_with_style(
+    let rows = (0..reserved).map(|_| {
+        line_with_style(
             preview_placeholder_line(placement, usize::from(cell_width)),
             SpanStyle::Chrome,
-        );
-        let mut image = rendered_image.clone();
-        image.row_offset = u16::try_from(row_offset).unwrap_or(u16::MAX);
-        line.images.push(image);
-        line
+        )
     });
     document.lines.splice((line_index + 1)..=line_index, rows);
 }
@@ -1761,7 +1770,6 @@ fn preview_image_key(preview: &ImagePreview, pixel_width: u32, pixel_height: u32
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    preview.mime_type.hash(&mut hasher);
     preview.data.hash(&mut hasher);
     pixel_width.hash(&mut hasher);
     pixel_height.hash(&mut hasher);
@@ -1769,32 +1777,50 @@ fn preview_image_key(preview: &ImagePreview, pixel_width: u32, pixel_height: u32
 }
 
 /// Convert one rendered image into a protocol-neutral BMUX contribution.
+///
+/// `anchor_row` is the terminal row of the image's top line and may lie above
+/// the viewport (negative or less than `viewport.y`) when the page is scrolled.
+/// The full cell allocation is retained so BMUX crops the visible part instead
+/// of refitting or displacing it. Returns `None` when no part is visible.
 #[must_use]
 pub fn image_contribution(
     image: &RenderedImage,
-    line_row: u16,
+    key: ImageKey,
+    anchor_row: i64,
     viewport: TuiRect,
-) -> ImageContribution {
-    let anchor_row = line_row.saturating_sub(image.row_offset);
-    ImageContribution::Present(ImagePlacement {
-        key: ImageKey::new(image.key.clone()),
-        payload: ImagePayload::Png {
-            bytes: std::sync::Arc::from(image.data.as_slice()),
-            width: image.pixel_width,
-            height: image.pixel_height,
-        },
-        destination: TuiRect::new(
-            image.start_col,
-            anchor_row,
-            image.cell_width,
-            image.cell_height,
-        ),
-        fit: ImageFit::Stretch,
-        allocation: None,
+) -> Option<ImageContribution> {
+    let allocation = ImageBounds {
+        x: i32::from(viewport.x.saturating_add(image.start_col)),
+        y: i32::try_from(anchor_row).ok()?,
+        width: image.cell_width,
+        height: image.cell_height,
+    };
+    let left = i64::from(allocation.x).max(i64::from(viewport.x));
+    let right =
+        (i64::from(allocation.x) + i64::from(allocation.width)).min(i64::from(viewport.right()));
+    let top = anchor_row.max(i64::from(viewport.y));
+    let bottom = anchor_row
+        .saturating_add(i64::from(allocation.height))
+        .min(i64::from(viewport.bottom()));
+    if right <= left || bottom <= top {
+        return None;
+    }
+    let destination = TuiRect::new(
+        u16::try_from(left).ok()?,
+        u16::try_from(top).ok()?,
+        u16::try_from(right - left).ok()?,
+        u16::try_from(bottom - top).ok()?,
+    );
+    Some(ImageContribution::Present(ImagePlacement {
+        key,
+        payload: image.payload.clone(),
+        destination,
+        fit: ImageFit::Contain,
+        allocation: Some(allocation),
         clip: viewport,
         lifecycle: ImageLifecycle::Frame,
         z: 0,
-    })
+    }))
 }
 
 fn preview_placeholder_line(placement: ReaderPlacement, cell_width: usize) -> String {
@@ -2715,22 +2741,31 @@ mod tests {
         let rendered =
             render_document_mode(&page, &TerminalRenderOptions::default(), RenderMode::Page);
 
-        let (row, image) = rendered
+        let image_lines = rendered
             .lines
             .iter()
             .enumerate()
-            .find_map(|(row, line)| line.images.first().map(|image| (row, image)))
-            .expect("rendered image intent");
+            .filter(|(_, line)| !line.images.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            image_lines.len(),
+            1,
+            "image is attached to its top line only"
+        );
+        let (row, line) = image_lines[0];
+        let image = &line.images[0];
         let contribution = image_contribution(
             image,
-            u16::try_from(row).expect("test row"),
+            image.key.clone(),
+            i64::try_from(row).expect("test row"),
             bmux_tui::geometry::Rect::new(0, 0, 80, 24),
         );
         assert!(matches!(
             contribution,
-            bmux_tui::image::ImageContribution::Present(ref placement)
+            Some(bmux_tui::image::ImageContribution::Present(ref placement))
                 if placement.key.as_str().starts_with("preview:")
                     && matches!(placement.payload, bmux_tui::image::ImagePayload::Png { .. })
+                    && placement.fit == bmux_tui::image::ImageFit::Contain
         ));
         assert!(rendered.to_plain_text().contains("diagram"));
     }
@@ -2769,7 +2804,7 @@ mod tests {
             .iter()
             .find_map(|line| line.images.first())
             .expect("rendered image intent");
-        assert_eq!((image.pixel_width, image.pixel_height), (37, 19));
+        assert_eq!(image.pixel_size(), (37, 19));
     }
 
     #[test]

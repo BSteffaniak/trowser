@@ -1,8 +1,11 @@
 //! BMUX frame adapter for trowser's browser-specific rendered document.
 
-use super::{RenderedDocument, SpanStyle, image_contribution};
+use std::collections::BTreeMap;
+
+use super::{MAX_IMAGE_CELL_HEIGHT, RenderedDocument, SpanStyle, image_contribution};
 use bmux_tui::geometry::Rect;
 use bmux_tui::hit::{HitRegion, HitRole};
+use bmux_tui::image::ImageKey;
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text::{Line, Span};
@@ -63,8 +66,48 @@ pub fn render_document_frame(
                 .tab_order(i32::try_from(control.control_id).unwrap_or(i32::MAX)),
             );
         }
+    }
+    paint_document_images(frame, document, offset, viewport);
+}
+
+/// Contribute each image that is at least partly visible exactly once.
+///
+/// Images are attached to their top line only, so lines up to
+/// [`MAX_IMAGE_CELL_HEIGHT`] above the viewport are scanned for images that
+/// extend into it. Identical content appearing more than once in a frame gets
+/// a distinct key per occurrence, since BMUX treats a reused key as one image.
+fn paint_document_images(
+    frame: &mut PaintCx<'_, '_>,
+    document: &RenderedDocument,
+    offset: usize,
+    viewport: Rect,
+) {
+    let first = offset.saturating_sub(usize::from(MAX_IMAGE_CELL_HEIGHT));
+    let end = offset.saturating_add(usize::from(viewport.height));
+    let mut occurrences = BTreeMap::<&ImageKey, usize>::new();
+    for (index, line) in document
+        .lines
+        .iter()
+        .enumerate()
+        .take(end)
+        .skip(first)
+        .filter(|(_, line)| !line.images.is_empty())
+    {
+        let relative = i64::try_from(index)
+            .unwrap_or(i64::MAX)
+            .saturating_sub(i64::try_from(offset).unwrap_or(i64::MAX));
+        let anchor_row = i64::from(viewport.y).saturating_add(relative);
         for image in &line.images {
-            frame.push_image(image_contribution(image, row, viewport));
+            let seen = occurrences.entry(&image.key).or_default();
+            let key = if *seen == 0 {
+                image.key.clone()
+            } else {
+                ImageKey::new(format!("{}#{seen}", image.key.as_str()))
+            };
+            *seen += 1;
+            if let Some(contribution) = image_contribution(image, key, anchor_row, viewport) {
+                frame.push_image(contribution);
+            }
         }
     }
 }
@@ -91,9 +134,12 @@ const fn span_style(style: SpanStyle) -> Style {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use bmux_tui::buffer::Buffer;
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::Rect;
+    use bmux_tui::image::{ImageContribution, ImageFit, ImageKey, ImagePayload, ImagePlacement};
     use bmux_tui::paint::PaintCx;
 
     use super::render_document_frame;
@@ -129,17 +175,7 @@ mod tests {
                         start_col: 4,
                         end_col: 20,
                     }],
-                    images: vec![RenderedImage {
-                        key: "preview:test".to_string(),
-                        mime_type: "image/png".to_string(),
-                        data: vec![1, 2, 3],
-                        pixel_width: 1,
-                        pixel_height: 1,
-                        cell_width: 2,
-                        cell_height: 1,
-                        start_col: 3,
-                        row_offset: 0,
-                    }],
+                    images: vec![test_image("preview:test", 1)],
                     ..RenderedLine::default()
                 },
             ],
@@ -163,5 +199,104 @@ mod tests {
                 .collect::<String>(),
             "visible"
         );
+    }
+
+    fn test_image(key: &str, cell_height: u16) -> RenderedImage {
+        RenderedImage {
+            key: ImageKey::new(key),
+            payload: ImagePayload::Png {
+                bytes: Arc::from([1_u8, 2, 3].as_slice()),
+                width: 4,
+                height: 2,
+            },
+            cell_width: 2,
+            cell_height,
+            start_col: 3,
+        }
+    }
+
+    fn image_document(images_at: &[(usize, RenderedImage)], len: usize) -> RenderedDocument {
+        let mut document = RenderedDocument {
+            lines: vec![RenderedLine::default(); len],
+        };
+        for (line, image) in images_at {
+            document.lines[*line].images.push(image.clone());
+        }
+        document
+    }
+
+    fn paint_images(
+        document: &RenderedDocument,
+        offset: usize,
+        viewport: Rect,
+    ) -> Vec<ImagePlacement> {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 12));
+        let mut frame = Frame::new(&mut buffer);
+        render_document_frame(&mut PaintCx::new(&mut frame), document, offset, viewport);
+        frame
+            .images()
+            .iter()
+            .map(|contribution| match contribution {
+                ImageContribution::Present(placement) => placement.clone(),
+                ImageContribution::Remove(key) => panic!("unexpected removal of {key:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn crops_image_whose_top_scrolled_above_viewport() {
+        let document = image_document(&[(2, test_image("preview:tall", 5))], 10);
+        let viewport = Rect::new(0, 1, 20, 6);
+
+        // Lines 0..4 are scrolled away; the image covers lines 2..7.
+        let placements = paint_images(&document, 4, viewport);
+
+        assert_eq!(placements.len(), 1);
+        let placement = &placements[0];
+        let allocation = placement.allocation.expect("full allocation retained");
+        assert_eq!((allocation.y, allocation.height), (-1, 5));
+        assert_eq!(placement.destination, Rect::new(3, 1, 2, 3));
+        assert_eq!(placement.fit, ImageFit::Contain);
+        assert!(allocation.covers(placement.destination));
+    }
+
+    #[test]
+    fn skips_images_entirely_outside_viewport() {
+        let document = image_document(
+            &[(0, test_image("above", 2)), (9, test_image("below", 2))],
+            12,
+        );
+
+        assert!(paint_images(&document, 4, Rect::new(0, 0, 20, 4)).is_empty());
+    }
+
+    #[test]
+    fn contributes_each_visible_image_once_with_shared_bytes() {
+        let image = test_image("preview:shared", 4);
+        let document = image_document(&[(1, image.clone())], 8);
+
+        let placements = paint_images(&document, 0, Rect::new(0, 0, 20, 8));
+
+        assert_eq!(placements.len(), 1);
+        let (ImagePayload::Png { bytes: painted, .. }, ImagePayload::Png { bytes: source, .. }) =
+            (&placements[0].payload, &image.payload)
+        else {
+            panic!("expected PNG payloads");
+        };
+        assert!(Arc::ptr_eq(painted, source));
+    }
+
+    #[test]
+    fn distinguishes_repeated_identical_images() {
+        let image = test_image("preview:dup", 1);
+        let document = image_document(&[(0, image.clone()), (2, image)], 4);
+
+        let placements = paint_images(&document, 0, Rect::new(0, 0, 20, 4));
+
+        let keys = placements
+            .iter()
+            .map(|placement| placement.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(keys, ["preview:dup", "preview:dup#1"]);
     }
 }
