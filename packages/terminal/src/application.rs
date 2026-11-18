@@ -8,20 +8,19 @@ use bmux_tui::hit::{HitRegion, HitRole};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text::{Line, Span};
+use bmux_tui::text_width::display_width;
 use bmux_tui_components::status_bar::{
     StatusBarComponent, StatusBarPolicy, StatusBarStyles, StatusSegment, StatusSeverity,
 };
 use bmux_tui_components::tab_bar::{TabBarComponent, TabBarPolicy, TabBarState, TabItem};
-use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
 use bmux_tui_components::text_input_box::{TextInputBoxComponent, TextInputBoxPolicy};
 
 use crate::bmux::render_document_frame;
-use crate::runtime::BrowserProgram;
+use crate::runtime::{BrowserProgram, PROMPT_POLICY};
 
 /// Retained component state used while rendering the interactive application.
 #[derive(Default)]
 pub struct BrowserApplicationRenderer {
-    prompt: TextInputState,
     tabs: TabBarState,
 }
 
@@ -34,7 +33,7 @@ impl BrowserApplicationRenderer {
 
     /// Render one application frame.
     pub fn render(&mut self, program: &BrowserProgram, frame: &mut PaintCx<'_, '_>) {
-        render_browser_frame(program, &mut self.prompt, &mut self.tabs, frame);
+        render_browser_frame(program, &mut self.tabs, frame);
     }
 
     /// Commit the exact interaction scene after successful presentation.
@@ -50,7 +49,6 @@ impl BrowserApplicationRenderer {
 /// images are delegated to the browser-specific semantic painter.
 pub fn render_browser_frame(
     program: &BrowserProgram,
-    prompt_state: &mut TextInputState,
     tab_state: &mut TabBarState,
     frame: &mut PaintCx<'_, '_>,
 ) {
@@ -113,39 +111,30 @@ pub fn render_browser_frame(
 
     render_document_frame(frame, &program.document, program.offset, body);
 
-    render_status(program, prompt_state, status, frame);
+    render_status(program, status, frame);
 }
 
-fn render_status(
-    program: &BrowserProgram,
-    prompt_state: &mut TextInputState,
-    status: Rect,
-    frame: &mut PaintCx<'_, '_>,
-) {
+fn render_status(program: &BrowserProgram, status: Rect, frame: &mut PaintCx<'_, '_>) {
     if let Some(prompt) = &program.prompt {
-        if prompt_state.buffer().text() != prompt.input() {
-            *prompt_state =
-                TextInputState::new(bmux_text_edit::TextEditBuffer::from_text(prompt.input()));
-        }
         frame.write_line(
             LocalRect::terminal(status),
             &Line::from_spans([Span::styled(prompt.label(), Style::new().fg(Color::Yellow))]),
         );
-        let label_width = u16::try_from(prompt.label().chars().count()).unwrap_or(u16::MAX);
+        let label_width = u16::try_from(display_width(prompt.label())).unwrap_or(u16::MAX);
         let input_area = Rect::new(
             status.x.saturating_add(label_width),
             status.y,
             status.width.saturating_sub(label_width),
             1,
         );
-        let state = RefCell::new(std::mem::take(prompt_state));
-        paint_component(
-            &TextInputBoxComponent::new("chrome.status", TextInputPolicy::default(), &state)
-                .policy(TextInputBoxPolicy::bare().focused(true)),
-            input_area,
-            frame,
-        );
-        *prompt_state = state.into_inner();
+        if prompt.is_editable() {
+            paint_component(
+                &TextInputBoxComponent::new("chrome.status", PROMPT_POLICY, &program.prompt_input)
+                    .policy(TextInputBoxPolicy::bare().focused(true)),
+                input_area,
+                frame,
+            );
+        }
     } else {
         let severity = if program.loading {
             StatusSeverity::Warning
@@ -193,7 +182,6 @@ fn paint_component(component: &impl Component, area: Rect, frame: &mut PaintCx<'
 }
 
 fn status_text<'a>(program: &'a BrowserProgram, loading_text: &'a mut String) -> &'a str {
-    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     if !program.loading {
         return program.status.as_str();
     }
@@ -202,7 +190,8 @@ fn status_text<'a>(program: &'a BrowserProgram, loading_text: &'a mut String) ->
     } else {
         program.status.as_str()
     };
-    *loading_text = format!("{} {label}", FRAMES[program.loading_frame % FRAMES.len()]);
+    let frame = program.spinner.frame(program.loading_started.elapsed());
+    *loading_text = format!("{frame} {label}");
     loading_text.as_str()
 }
 
@@ -239,14 +228,8 @@ mod tests {
         let area = Rect::new(0, 0, size.width, size.height);
         let mut buffer = Buffer::empty(area);
         let mut frame = Frame::new(&mut buffer);
-        let mut prompt_state = bmux_tui_components::text_input::TextInputState::default();
         let mut tab_state = bmux_tui_components::tab_bar::TabBarState::default();
-        render_browser_frame(
-            program,
-            &mut prompt_state,
-            &mut tab_state,
-            &mut PaintCx::new(&mut frame),
-        );
+        render_browser_frame(program, &mut tab_state, &mut PaintCx::new(&mut frame));
         drop(frame);
         (0..size.height)
             .map(|y| {
@@ -298,21 +281,16 @@ mod tests {
             },
             Size::new(40, 5),
         );
-        program.prompt = Some(PromptState::Search {
-            input: "term".to_string(),
-        });
+        program.prompt = Some(PromptState::Search);
+        *program.prompt_input.get_mut() = bmux_tui_components::text_input::TextInputState::new(
+            bmux_text_edit::TextEditBuffer::from_text("term"),
+        );
         let area = Rect::new(0, 0, 40, 5);
         let mut buffer = Buffer::empty(area);
         let mut frame = Frame::new(&mut buffer);
-        let mut prompt_state = bmux_tui_components::text_input::TextInputState::default();
         let mut tab_state = bmux_tui_components::tab_bar::TabBarState::default();
 
-        render_browser_frame(
-            &program,
-            &mut prompt_state,
-            &mut tab_state,
-            &mut PaintCx::new(&mut frame),
-        );
+        render_browser_frame(&program, &mut tab_state, &mut PaintCx::new(&mut frame));
 
         assert_eq!(frame.hits().regions()[0].id.as_str(), "chrome.header");
         assert_eq!(frame.hits().regions()[1].id.as_str(), "chrome.status.input");

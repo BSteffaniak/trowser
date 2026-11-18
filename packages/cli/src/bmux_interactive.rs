@@ -15,7 +15,9 @@ use trowser_client::TrowserClient;
 use trowser_config::TrowserConfig;
 use trowser_ipc::{Request, Response, ViewportHint};
 use trowser_terminal::application::BrowserApplicationRenderer;
-use trowser_terminal::runtime::{BrowserAction, BrowserEffect, BrowserMessage, BrowserProgram};
+use trowser_terminal::runtime::{
+    BrowserAction, BrowserEffect, BrowserMessage, BrowserProgram, SCROLL_SYNC_DELAY,
+};
 use trowser_terminal::{RenderMode, TerminalRenderOptions, render_document_mode};
 
 use crate::{
@@ -120,6 +122,9 @@ pub async fn run(
 fn effect_factory(client: TrowserClient) -> BrowserEffect {
     Arc::new(move |action, generation, size, mode| {
         let client = client.clone();
+        if let BrowserAction::ScrollTo(y_px) = action {
+            return scroll_sync_command(client, y_px, generation, size, mode);
+        }
         bmux_tui_runtime::Command::replace(
             bmux_tui_runtime::CommandKey::new("browser.navigation"),
             async move {
@@ -149,15 +154,47 @@ fn effect_factory(client: TrowserClient) -> BrowserEffect {
     })
 }
 
+/// Debounced background scroll sync.
+///
+/// Each local scroll replaces the pending sync, so the daemon only scrolls and
+/// re-extracts the page once scrolling pauses. Failures are dropped: the local
+/// view is already correct and the next sync or navigation retries.
+fn scroll_sync_command(
+    client: TrowserClient,
+    y_px: u32,
+    generation: u64,
+    size: bmux_tui::geometry::Size,
+    mode: RenderMode,
+) -> bmux_tui_runtime::Command<BrowserMessage> {
+    bmux_tui_runtime::Command::replace(
+        bmux_tui_runtime::CommandKey::new("browser.scroll-sync"),
+        async move {
+            tokio::time::sleep(SCROLL_SYNC_DELAY).await;
+            let viewport = Some(viewport_for(size));
+            let page = navigation_and_snapshot(&client, Request::ScrollTo { y_px, viewport })
+                .await
+                .ok()?;
+            let document =
+                render_document_mode(&page, &TerminalRenderOptions { width: size.width }, mode);
+            Some(BrowserMessage::ScrollSynced {
+                page: Box::new(page),
+                document: Box::new(document),
+                generation,
+            })
+        },
+    )
+}
+
+fn viewport_for(size: bmux_tui::geometry::Size) -> ViewportHint {
+    ViewportHint::from_terminal_cells(size.width, size.height.saturating_sub(2).max(1))
+}
+
 async fn execute_action(
     client: &TrowserClient,
     action: BrowserAction,
     size: bmux_tui::geometry::Size,
 ) -> Result<trowser_render::SemanticPage> {
-    let viewport = Some(ViewportHint::from_terminal_cells(
-        size.width,
-        size.height.saturating_sub(2).max(1),
-    ));
+    let viewport = Some(viewport_for(size));
     match action {
         BrowserAction::LoadActiveSnapshot => active_snapshot_for(client, viewport).await,
         BrowserAction::OpenUrl(url) => {
@@ -187,6 +224,7 @@ async fn execute_action(
             action_id,
             text,
         } => crate::input_control_or_action(client, control_id, action_id, text).await,
+        // Normally routed through `scroll_sync_command`; kept for completeness.
         BrowserAction::ScrollTo(y_px) => {
             navigation_and_snapshot(client, Request::ScrollTo { y_px, viewport }).await
         }

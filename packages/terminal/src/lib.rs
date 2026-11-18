@@ -11,6 +11,7 @@ pub mod runtime;
 use std::collections::{BTreeMap, BTreeSet};
 
 use bmux_tui::geometry::Rect as TuiRect;
+use bmux_tui::text_width::{display_width, truncate_to_display_width, wrap_text_with_continuation};
 use std::sync::Arc;
 
 use bmux_tui::image::{
@@ -469,7 +470,7 @@ const fn region_title(region: SemanticRegion) -> Option<&'static str> {
 
 fn push_section_heading(document: &mut RenderedDocument, title: &str, width: usize) {
     let prefix = format!("── {title} ");
-    let fill = width.saturating_sub(prefix.chars().count()).min(80);
+    let fill = width.saturating_sub(display_width(&prefix)).min(80);
     document.lines.push(RenderedLine::default());
     document.lines.push(line_with_style(
         format!("{prefix}{}", "─".repeat(fill)),
@@ -1021,14 +1022,14 @@ fn box_document(title: &str, content: &RenderedDocument, width: usize) -> Render
 
 fn box_top_line(title: &str, width: usize) -> String {
     let label = format!(" {title} ");
-    let fill = width.saturating_sub(label.chars().count() + 2);
+    let fill = width.saturating_sub(display_width(&label) + 2);
     format!("╭{label}{}╮", "─".repeat(fill))
 }
 
 fn box_content_line(line: &RenderedLine, width: usize) -> RenderedLine {
     let inner_width = width.saturating_sub(4);
     let clipped = truncate_for_cells(&line.text, inner_width);
-    let pad = inner_width.saturating_sub(clipped.chars().count());
+    let pad = inner_width.saturating_sub(display_width(&clipped));
     let text = format!("│ {clipped}{} │", " ".repeat(pad));
     RenderedLine {
         spans: boxed_spans(line, &clipped, pad),
@@ -1090,7 +1091,7 @@ fn combine_document_columns_row(
     for (index, column) in columns.iter().enumerate() {
         let line = column.lines.get(row).cloned().unwrap_or_default();
         let width = widths.get(index).copied().unwrap_or_default();
-        let filler = width.saturating_sub(line.text.chars().count());
+        let filler = width.saturating_sub(display_width(&line.text));
         append_column_line(
             &line,
             filler,
@@ -1208,13 +1209,18 @@ fn document_width(document: &RenderedDocument) -> usize {
     document
         .lines
         .iter()
-        .map(|line| line.text.chars().count())
+        .map(|line| display_width(&line.text))
         .max()
         .unwrap_or_default()
 }
 
 fn truncate_for_cells(text: &str, width: usize) -> String {
-    text.chars().take(width).collect()
+    truncate_to_display_width(text, width)
+}
+
+/// Terminal cells occupied by one character.
+fn char_width(ch: char) -> usize {
+    display_width(ch.encode_utf8(&mut [0; 4]))
 }
 
 fn line_with_style(text: String, style: SpanStyle) -> RenderedLine {
@@ -1277,7 +1283,8 @@ fn push_nav_chip_lines(
         let chip = format!("[{link_id}] {label}");
         let mut cells = inline_cells(&chip, SpanStyle::Link, Some(&(link_id, action_id)));
         cells.extend(inline_cells("  ", SpanStyle::Normal, None));
-        if current.len() > 5 && current.len().saturating_add(cells.len()) > max_width {
+        let current_width = cells_width(&current);
+        if current_width > 5 && current_width.saturating_add(cells_width(&cells)) > max_width {
             push_inline_cells_line(document, &current);
             current = inline_cells("nav: ", SpanStyle::Chrome, None);
         }
@@ -1683,7 +1690,7 @@ fn push_media_block_lines(
             action_id: action_id.cloned(),
             action: ControlHitboxAction::Click,
             start_col: u16::try_from(placement.indent).unwrap_or(u16::MAX),
-            end_col: u16::try_from(line.text.chars().count()).unwrap_or(u16::MAX),
+            end_col: u16::try_from(display_width(&line.text)).unwrap_or(u16::MAX),
         });
     }
 }
@@ -1887,8 +1894,27 @@ fn format_control_text(control_id: u32, label: &str, control_type: &str, value: 
 #[derive(Debug, Clone)]
 struct InlineCell {
     ch: char,
+    /// Terminal cells this character occupies (0 for combining marks, 2 for wide).
+    width: usize,
     style: SpanStyle,
     link: Option<(u32, Option<ActionId>)>,
+}
+
+fn cells_width(cells: &[InlineCell]) -> usize {
+    cells.iter().map(|cell| cell.width).sum()
+}
+
+/// Number of leading cells that fit in `width` terminal columns (at least one).
+fn cells_fitting(cells: &[InlineCell], width: usize) -> usize {
+    let mut used = 0usize;
+    let fitting = cells
+        .iter()
+        .take_while(|cell| {
+            used += cell.width;
+            used <= width
+        })
+        .count();
+    fitting.max(1)
 }
 
 fn push_rich_text_lines(
@@ -1905,7 +1931,9 @@ fn push_rich_text_lines(
         .into_iter()
         .chain(inline_cells(prefix, default_style, None))
         .collect::<Vec<_>>();
+    let prefix_width = cells_width(&prefix_cells);
     let mut current = prefix_cells.clone();
+    let mut current_width = prefix_width;
     let mut needs_space = false;
 
     for run in rich_display_runs(runs, next_link_id, default_style) {
@@ -1914,38 +1942,43 @@ fn push_rich_text_lines(
             if word_cells.is_empty() {
                 continue;
             }
-            let add_space = needs_space && current.len() > prefix_cells.len();
-            let needed = word_cells.len() + usize::from(add_space);
-            if current.len() > prefix_cells.len()
-                && current.len().saturating_add(needed) > max_width
-            {
+            let mut word_width = cells_width(&word_cells);
+            let add_space = needs_space && current_width > prefix_width;
+            let needed = word_width + usize::from(add_space);
+            if current_width > prefix_width && current_width.saturating_add(needed) > max_width {
                 push_inline_cells_line(document, &current);
                 current.clone_from(&prefix_cells);
+                current_width = prefix_width;
             }
-            if add_space && current.len() > prefix_cells.len() {
+            if add_space && current_width > prefix_width {
                 current.push(InlineCell {
                     ch: ' ',
+                    width: 1,
                     style: default_style,
                     link: None,
                 });
+                current_width += 1;
             }
-            while current.len().saturating_add(word_cells.len()) > max_width
-                && current.len() == prefix_cells.len()
+            while current_width.saturating_add(word_width) > max_width
+                && current_width == prefix_width
                 && !word_cells.is_empty()
             {
-                let take = max_width.saturating_sub(current.len()).max(1);
+                let take = cells_fitting(&word_cells, max_width.saturating_sub(current_width));
                 let rest = word_cells.split_off(take.min(word_cells.len()));
                 current.extend(word_cells);
                 push_inline_cells_line(document, &current);
                 current.clone_from(&prefix_cells);
+                current_width = prefix_width;
                 word_cells = rest;
+                word_width = cells_width(&word_cells);
             }
             current.extend(word_cells);
+            current_width += word_width;
             needs_space = true;
         }
     }
 
-    if current.len() > prefix_cells.len() || !prefix.is_empty() {
+    if current_width > prefix_width || !prefix.is_empty() {
         push_inline_cells_line(document, &current);
     }
 }
@@ -2003,6 +2036,7 @@ fn inline_cells(
     text.chars()
         .map(|ch| InlineCell {
             ch,
+            width: char_width(ch),
             style,
             link: link.cloned(),
         })
@@ -2042,13 +2076,16 @@ fn inline_spans(cells: &[InlineCell]) -> Vec<StyledSpan> {
 
 fn inline_links(cells: &[InlineCell]) -> Vec<LinkHitbox> {
     let mut ranges: BTreeMap<u32, (Option<ActionId>, usize, usize)> = BTreeMap::new();
-    for (index, cell) in cells.iter().enumerate() {
+    let mut column = 0usize;
+    for cell in cells {
+        let end = column + cell.width;
         if let Some((link_id, action_id)) = &cell.link {
             ranges
                 .entry(*link_id)
-                .and_modify(|(_, _, end)| *end = index + 1)
-                .or_insert_with(|| (action_id.clone(), index, index + 1));
+                .and_modify(|(_, _, range_end)| *range_end = end)
+                .or_insert_with(|| (action_id.clone(), column, end));
         }
+        column = end;
     }
     ranges
         .into_iter()
@@ -2080,10 +2117,7 @@ fn push_code_block_lines(
         SpanStyle::Chrome,
     ));
     for raw_line in text.lines().take(160) {
-        let visible = raw_line
-            .chars()
-            .take(placement.width.saturating_sub(2))
-            .collect::<String>();
+        let visible = truncate_to_display_width(raw_line, placement.width.saturating_sub(2));
         document.lines.push(line_with_style(
             format!("{}│ {visible}", " ".repeat(placement.indent)),
             SpanStyle::Code,
@@ -2200,7 +2234,7 @@ fn push_wrapped_lines(
                 link_id,
                 action_id,
                 start_col: u16::try_from(indent).unwrap_or(u16::MAX),
-                end_col: u16::try_from(text.chars().count()).unwrap_or(u16::MAX),
+                end_col: u16::try_from(display_width(&text)).unwrap_or(u16::MAX),
             }]
         });
         document.lines.push(RenderedLine {
@@ -2246,7 +2280,7 @@ fn push_wrapped_control_lines(
                 action_id: action_id.clone(),
                 action,
                 start_col: u16::try_from(indent).unwrap_or(u16::MAX),
-                end_col: u16::try_from(text.chars().count()).unwrap_or(u16::MAX),
+                end_col: u16::try_from(display_width(&text)).unwrap_or(u16::MAX),
             }],
             text,
             links: Vec::new(),
@@ -2274,7 +2308,7 @@ fn push_text_lines(
     link: Option<(u32, Option<ActionId>)>,
 ) {
     for line in text.lines() {
-        let end_col = u16::try_from(line.chars().count()).unwrap_or(u16::MAX);
+        let end_col = u16::try_from(display_width(line)).unwrap_or(u16::MAX);
         let links = link.clone().map_or_else(Vec::new, |(link_id, action_id)| {
             vec![LinkHitbox {
                 link_id,
@@ -2323,7 +2357,7 @@ fn render_header(page: &SemanticPage, width: usize, output: &mut String) {
     pad_to_width(
         output,
         width.saturating_sub(2),
-        title.chars().count().min(width.saturating_sub(4)) + 1,
+        display_width(title).min(width.saturating_sub(4)) + 1,
     );
     output.push('│');
     output.push('\n');
@@ -2619,12 +2653,8 @@ fn format_media_state(
 }
 
 fn fit_line(text: &str, width: usize, fill: char) -> String {
-    let mut output = String::new();
-    let mut used = 0usize;
-    for ch in text.chars().take(width) {
-        output.push(ch);
-        used += 1;
-    }
+    let mut output = truncate_to_display_width(text, width);
+    let used = display_width(&output);
     if width > used {
         output.push_str(&fill.to_string().repeat(width - used));
     }
@@ -2645,35 +2675,18 @@ fn render_box_line(text: &str, indent: usize, width: usize, output: &mut String)
 
 fn wrap_lines(text: &str, width: usize) -> Vec<String> {
     let width = width.max(MIN_BLOCK_WIDTH);
-    let mut line_len = 0usize;
-    let mut current = String::new();
-    let mut lines = Vec::new();
-
-    for word in text.split_whitespace() {
-        let word_len = word.chars().count();
-        if line_len != 0 && line_len + 1 + word_len > width {
-            lines.push(current);
-            current = String::new();
-            line_len = 0;
-        } else if line_len != 0 {
-            current.push(' ');
-            line_len += 1;
-        }
-        current.push_str(word);
-        line_len += word_len;
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return Vec::new();
     }
-
-    if !current.is_empty() {
-        lines.push(current);
-    }
-
-    lines
+    wrap_text_with_continuation(&normalized, width, width)
+        .into_iter()
+        .map(|line| line.trim_end().to_owned())
+        .collect()
 }
 
 fn push_truncated(output: &mut String, text: &str, width: usize) {
-    for ch in text.chars().take(width) {
-        output.push(ch);
-    }
+    output.push_str(&truncate_to_display_width(text, width));
 }
 
 fn pad_to_width(output: &mut String, width: usize, used: usize) {
@@ -2692,6 +2705,33 @@ mod tests {
         BlockLayout, ImagePreview, MediaKind, SemanticBlock, SemanticLayoutNode, SemanticPage,
         SemanticRegion,
     };
+
+    #[test]
+    fn measures_wide_characters_in_terminal_cells() {
+        let mut cells = super::inline_cells("日本 ", super::SpanStyle::Normal, None);
+        cells.extend(super::inline_cells(
+            "ab",
+            super::SpanStyle::Link,
+            Some(&(1, None)),
+        ));
+
+        let links = super::inline_links(&cells);
+
+        assert_eq!((links[0].start_col, links[0].end_col), (5, 7));
+        assert_eq!(super::cells_width(&cells), 7);
+        assert_eq!(super::cells_fitting(&cells, 3), 1);
+        let truncated = super::truncate_for_cells("日本語テキスト", 6);
+        assert_eq!(truncated, "日本…", "a wide character is never split");
+        assert!(super::display_width(&truncated) <= 6);
+    }
+
+    #[test]
+    fn wraps_long_words_without_overflowing_width() {
+        let lines = super::wrap_lines(&format!("short {}", "x".repeat(50)), 20);
+
+        assert!(lines.iter().all(|line| super::display_width(line) <= 20));
+        assert_eq!(lines[0], "short");
+    }
 
     #[test]
     fn renders_semantic_text() {

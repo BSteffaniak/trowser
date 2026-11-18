@@ -1,17 +1,49 @@
 //! Trowser-owned interactive state machine for the BMUX TUI runtime.
 
+use std::cell::RefCell;
+use std::time::{Duration, Instant};
+
 use bmux_keyboard::{KeyCode, KeyStroke};
+use bmux_text_edit::TextEditBuffer;
 use bmux_tui::event::{Event, MouseEventKind};
 use bmux_tui::geometry::Size;
 use bmux_tui::hit::HitMap;
 use bmux_tui::interaction::InteractionRouter;
+use bmux_tui_components::spinner::Spinner;
+use bmux_tui_components::text_input::{
+    EdgePolicy, KeyboardPolicy, TextInputControl, TextInputOutcome, TextInputPolicy,
+    TextInputState, ViewportPolicy,
+};
 use bmux_tui_runtime::{Command, Program, RuntimeEvent, Subscription, SubscriptionKey, Update};
 
 use crate::{
     ControlHitboxAction, RenderMode, RenderedDocument, TerminalRenderOptions, render_document_mode,
 };
 
+/// Single-row prompt editing: Enter submits; cursor movement, word editing,
+/// paste, selection and undo use BMUX's standard readline keymap.
+pub const PROMPT_POLICY: TextInputPolicy = TextInputPolicy {
+    keyboard: KeyboardPolicy {
+        shift_enter: None,
+        ..KeyboardPolicy::chat_composer()
+    },
+    viewport: ViewportPolicy {
+        auto_scroll_to_cursor: true,
+        min_rows: 1,
+        max_rows: Some(1),
+    },
+    edge: EdgePolicy::disabled(),
+    ..TextInputPolicy::chat_composer()
+};
+
+/// Idle time after local scrolling before the browser scroll position is synced.
+pub const SCROLL_SYNC_DELAY: Duration = Duration::from_millis(250);
+
 /// CLI-owned asynchronous effect factory used by the terminal state machine.
+///
+/// [`BrowserAction::ScrollTo`] is a background sync: the effect should wait
+/// [`SCROLL_SYNC_DELAY`] under its own replaceable command key and answer with
+/// [`BrowserMessage::ScrollSynced`] rather than [`BrowserMessage::PageLoaded`].
 pub type BrowserEffect = std::sync::Arc<
     dyn Fn(BrowserAction, u64, Size, RenderMode) -> Command<BrowserMessage> + Send + Sync,
 >;
@@ -30,6 +62,15 @@ pub enum BrowserMessage {
         /// Current daemon-owned tab summaries after the operation.
         tabs: Vec<trowser_session_models::TabSummary>,
         /// Monotonic request generation used to reject stale completions.
+        generation: u64,
+    },
+    /// A debounced background scroll sync refreshed the page after local scrolling.
+    ScrollSynced {
+        /// Sanitized browser page at the synced scroll position.
+        page: Box<trowser_render::SemanticPage>,
+        /// Browser-specific terminal projection.
+        document: Box<RenderedDocument>,
+        /// Request generation current when the sync was issued.
         generation: u64,
     },
     /// Advance the loading indicator through normal runtime invalidation.
@@ -86,7 +127,7 @@ pub enum BrowserAction {
         /// Submitted text.
         text: String,
     },
-    /// Synchronize the terminal viewport with an absolute browser scroll offset.
+    /// Sync the browser to an absolute scroll offset after local scrolling.
     ScrollTo(u32),
     /// Switch to a daemon-owned browser tab.
     SwitchTab(trowser_session_models::TabId),
@@ -101,52 +142,39 @@ pub enum BrowserAction {
 }
 
 /// Prompt currently owned by the interactive trowser UI.
+///
+/// Editable text lives in [`BrowserProgram::prompt_input`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptState {
     /// URL entry prompt.
-    OpenUrl { input: String },
+    OpenUrl,
     /// In-document search prompt.
-    Search { input: String },
+    Search,
     /// Text entry for one rendered form control.
     ControlInput {
         control_id: u32,
         action_id: Option<trowser_session_models::ActionId>,
-        input: String,
     },
     /// Confirmation before closing every browser tab.
     ConfirmCloseAll,
 }
 
 impl PromptState {
-    fn input_mut(&mut self) -> &mut String {
-        match self {
-            Self::OpenUrl { input } | Self::Search { input } | Self::ControlInput { input, .. } => {
-                input
-            }
-            Self::ConfirmCloseAll => unreachable!("confirmation prompt has no editable input"),
-        }
-    }
-
     /// Return the prompt label shown in application chrome.
     #[must_use]
     pub const fn label(&self) -> &'static str {
         match self {
-            Self::OpenUrl { .. } => "Open URL: ",
-            Self::Search { .. } => "Search: ",
+            Self::OpenUrl => "Open URL: ",
+            Self::Search => "Search: ",
             Self::ControlInput { .. } => "Text: ",
             Self::ConfirmCloseAll => "Close all tabs? [y/N] ",
         }
     }
 
-    /// Return current prompt input.
+    /// Whether this prompt collects editable text.
     #[must_use]
-    pub const fn input(&self) -> &str {
-        match self {
-            Self::OpenUrl { input } | Self::Search { input } | Self::ControlInput { input, .. } => {
-                input.as_str()
-            }
-            Self::ConfirmCloseAll => "",
-        }
+    pub const fn is_editable(&self) -> bool {
+        !matches!(self, Self::ConfirmCloseAll)
     }
 }
 
@@ -170,10 +198,16 @@ pub struct BrowserProgram {
     pub tabs: Vec<trowser_session_models::TabSummary>,
     /// Prompt state, when the application is collecting local input.
     pub prompt: Option<PromptState>,
+    /// Editable prompt text, cursor, selection and undo history.
+    ///
+    /// Shared with the prompt component during painting, hence the `RefCell`.
+    pub prompt_input: RefCell<TextInputState>,
     /// Whether an asynchronous browser operation is pending.
     pub loading: bool,
-    /// Current loading animation frame.
-    pub loading_frame: usize,
+    /// When the pending browser operation started, for the loading spinner.
+    pub loading_started: Instant,
+    /// Loading indicator animation.
+    pub spinner: Spinner,
     /// Stable committed focus identifier.
     pub focused: Option<String>,
     interaction_router: InteractionRouter,
@@ -203,8 +237,10 @@ impl BrowserProgram {
             tab_status: String::new(),
             tabs: Vec::new(),
             prompt: None,
+            prompt_input: RefCell::new(TextInputState::default()),
             loading: false,
-            loading_frame: 0,
+            loading_started: Instant::now(),
+            spinner: Spinner::braille(),
             focused: None,
             interaction_router: InteractionRouter::new(),
             terminal_size,
@@ -238,7 +274,7 @@ impl BrowserProgram {
         self.request_generation = self.request_generation.saturating_add(1);
         self.status = status.into();
         self.loading = true;
-        self.loading_frame = 0;
+        self.loading_started = Instant::now();
         self.request_generation
     }
 
@@ -251,6 +287,29 @@ impl BrowserProgram {
             .map(|id| id.as_str().to_owned());
     }
 
+    /// Current prompt text, empty when no prompt is open.
+    #[must_use]
+    pub fn prompt_text(&self) -> String {
+        self.prompt_input.borrow().buffer().text().to_owned()
+    }
+
+    fn open_prompt(&mut self, prompt: PromptState, initial: &str) -> Update<BrowserMessage> {
+        self.prompt = Some(prompt);
+        *self.prompt_input.get_mut() = TextInputState::new(TextEditBuffer::from_text(initial));
+        Update::redraw()
+    }
+
+    fn reproject_document(&mut self) {
+        self.document = render_document_mode(
+            &self.page,
+            &TerminalRenderOptions {
+                width: self.terminal_size.width,
+            },
+            self.render_mode,
+        );
+        self.offset = page_scroll_offset(&self.page, &self.document);
+    }
+
     fn max_offset(&self) -> usize {
         self.document.lines.len().saturating_sub(usize::from(
             self.terminal_size.height.saturating_sub(2).max(1),
@@ -260,16 +319,14 @@ impl BrowserProgram {
     fn handle_terminal(&mut self, event: &Event) -> Update<BrowserMessage> {
         match event {
             Event::Resize(size) => {
+                // The runtime already resizes and resets the presenter.
                 self.terminal_size = *size;
-                self.document = render_document_mode(
-                    &self.page,
-                    &TerminalRenderOptions { width: size.width },
-                    self.render_mode,
-                );
-                self.offset = page_scroll_offset(&self.page, &self.document);
-                Update::reset()
+                self.reproject_document();
+                Update::redraw()
             }
-            Event::Key(stroke) if self.prompt.is_some() => self.handle_prompt_key(*stroke),
+            Event::Key(_) | Event::Paste(_) if self.prompt.is_some() => {
+                self.handle_prompt_event(event)
+            }
             Event::Key(stroke) => self.handle_unprompted_key(*stroke),
             Event::Mouse(mouse) => {
                 let route = self.interaction_router.route(Event::Mouse(*mouse));
@@ -368,29 +425,16 @@ impl BrowserProgram {
                 self.scroll_update()
             }
             KeyCode::Char('m') => {
+                // A plain redraw keeps retained terminal images that are still valid.
                 self.render_mode = self.render_mode.next();
-                self.document = render_document_mode(
-                    &self.page,
-                    &TerminalRenderOptions {
-                        width: self.terminal_size.width,
-                    },
-                    self.render_mode,
-                );
-                self.offset = page_scroll_offset(&self.page, &self.document);
+                self.reproject_document();
                 self.status = format!("render mode: {}", self.render_mode.label());
-                Update::reset()
-            }
-            KeyCode::Char('o' | 't') => {
-                self.prompt = Some(PromptState::OpenUrl {
-                    input: String::new(),
-                });
                 Update::redraw()
             }
+            KeyCode::Char('o' | 't') => self.open_prompt(PromptState::OpenUrl, ""),
             KeyCode::Char('/') => {
-                self.prompt = Some(PromptState::Search {
-                    input: self.search_query.clone(),
-                });
-                Update::redraw()
+                let query = self.search_query.clone();
+                self.open_prompt(PromptState::Search, &query)
             }
             KeyCode::Char('n') if modifiers.shift => self.repeat_search(true),
             KeyCode::Char('n') => self.repeat_search(false),
@@ -398,8 +442,7 @@ impl BrowserProgram {
             KeyCode::Char('a') => self.focus_action(true),
             KeyCode::Enter => self.activate_focused_action(),
             KeyCode::Char('x') if modifiers.shift => {
-                self.prompt = Some(PromptState::ConfirmCloseAll);
-                Update::redraw()
+                self.open_prompt(PromptState::ConfirmCloseAll, "")
             }
             KeyCode::Char('x') => self.action(BrowserAction::CloseTab),
             KeyCode::Char('b') | KeyCode::Left => self.action(BrowserAction::Back),
@@ -465,14 +508,13 @@ impl BrowserProgram {
                     control_id,
                     action_id,
                 }),
-                ControlHitboxAction::InputText => {
-                    self.prompt = Some(PromptState::ControlInput {
+                ControlHitboxAction::InputText => self.open_prompt(
+                    PromptState::ControlInput {
                         control_id,
                         action_id,
-                        input: String::new(),
-                    });
-                    Update::redraw()
-                }
+                    },
+                    "",
+                ),
             };
         }
         self.action(BrowserAction::Activate(target.to_owned()))
@@ -501,8 +543,14 @@ impl BrowserProgram {
         Update::redraw()
     }
 
-    fn handle_prompt_key(&mut self, stroke: KeyStroke) -> Update<BrowserMessage> {
-        if matches!(self.prompt, Some(PromptState::ConfirmCloseAll)) {
+    fn handle_prompt_event(&mut self, event: &Event) -> Update<BrowserMessage> {
+        let Some(prompt) = &self.prompt else {
+            return Update::none();
+        };
+        if !prompt.is_editable() {
+            let Event::Key(stroke) = event else {
+                return Update::none();
+            };
             self.prompt = None;
             return if stroke.key == KeyCode::Char('y') {
                 self.action(BrowserAction::CloseAllTabs)
@@ -511,64 +559,51 @@ impl BrowserProgram {
                 Update::redraw()
             };
         }
-        let KeyStroke { key, modifiers } = stroke;
-        match key {
-            KeyCode::Escape => {
-                self.prompt = None;
-                Update::redraw()
+        if matches!(event, Event::Key(stroke) if stroke.key == KeyCode::Escape) {
+            self.prompt = None;
+            return Update::redraw();
+        }
+        match TextInputControl::new(&PROMPT_POLICY).handle_event(self.prompt_input.get_mut(), event)
+        {
+            TextInputOutcome::Submitted => self.submit_prompt(),
+            TextInputOutcome::Edited | TextInputOutcome::Redraw => Update::redraw(),
+            TextInputOutcome::Ignored | TextInputOutcome::EdgeUp | TextInputOutcome::EdgeDown => {
+                Update::none()
             }
-            KeyCode::Enter => {
-                let prompt = self.prompt.take();
-                match prompt {
-                    Some(PromptState::OpenUrl { input }) if !input.is_empty() => {
-                        self.status.clone_from(&input);
-                        self.action(BrowserAction::OpenUrl(input))
-                    }
-                    Some(PromptState::Search { input }) => {
-                        self.search_query.clone_from(&input);
-                        if let Some(found) = find_document_line(&self.document, &input, 0) {
-                            self.offset = found;
-                            self.status = format!("found: {input}");
-                        } else {
-                            self.status = format!("not found: {input}");
-                        }
-                        Update::redraw()
-                    }
-                    Some(PromptState::ControlInput {
-                        control_id,
-                        action_id,
-                        input,
-                    }) => self.action(BrowserAction::InputControl {
-                        control_id,
-                        action_id,
-                        text: input,
-                    }),
-                    Some(PromptState::OpenUrl { .. } | PromptState::ConfirmCloseAll) | None => {
-                        Update::redraw()
-                    }
-                }
-            }
-            KeyCode::Backspace => {
-                if let Some(prompt) = self.prompt.as_mut() {
-                    prompt.input_mut().pop();
-                }
-                Update::redraw()
-            }
-            KeyCode::Char(character) if !modifiers.ctrl && !modifiers.alt => {
-                if let Some(prompt) = self.prompt.as_mut() {
-                    let character = if modifiers.shift {
-                        character.to_ascii_uppercase()
-                    } else {
-                        character
-                    };
-                    prompt.input_mut().push(character);
-                }
-                Update::redraw()
-            }
-            _ => Update::none(),
         }
     }
 
+    fn submit_prompt(&mut self) -> Update<BrowserMessage> {
+        let input = self.prompt_text();
+        match self.prompt.take() {
+            Some(PromptState::OpenUrl) if !input.is_empty() => {
+                self.status.clone_from(&input);
+                self.action(BrowserAction::OpenUrl(input))
+            }
+            Some(PromptState::Search) => {
+                if let Some(found) = find_document_line(&self.document, &input, 0) {
+                    self.offset = found;
+                    self.status = format!("found: {input}");
+                } else {
+                    self.status = format!("not found: {input}");
+                }
+                self.search_query = input;
+                Update::redraw()
+            }
+            Some(PromptState::ControlInput {
+                control_id,
+                action_id,
+            }) => self.action(BrowserAction::InputControl {
+                control_id,
+                action_id,
+                text: input,
+            }),
+            Some(PromptState::OpenUrl | PromptState::ConfirmCloseAll) | None => Update::redraw(),
+        }
+    }
+
+    /// Scrolling is local: redraw immediately and schedule a debounced,
+    /// replaceable browser sync without loading state.
     fn scroll_update(&mut self) -> Update<BrowserMessage> {
         let y_px = self
             .document
@@ -576,7 +611,19 @@ impl BrowserProgram {
             .get(self.offset)
             .and_then(|line| line.source_y_px)
             .unwrap_or(0);
-        self.action(BrowserAction::ScrollTo(y_px))
+        if y_px == self.page.scroll_y_px {
+            return Update::redraw();
+        }
+        self.page.scroll_y_px = y_px;
+        let Some(effect) = self.effect.as_ref() else {
+            return Update::redraw();
+        };
+        Update::redraw().with_command(effect(
+            BrowserAction::ScrollTo(y_px),
+            self.request_generation,
+            self.terminal_size,
+            self.render_mode,
+        ))
     }
 
     fn action(&mut self, action: BrowserAction) -> Update<BrowserMessage> {
@@ -592,7 +639,7 @@ impl BrowserProgram {
                 self.terminal_size,
                 self.render_mode,
             ))
-            .with_subscription(loading_subscription(generation))
+            .with_subscription(loading_subscription(generation, self.spinner.interval()))
     }
 }
 
@@ -624,12 +671,12 @@ fn find_document_line(document: &RenderedDocument, query: &str, start: usize) ->
         .map(|(index, _)| index)
 }
 
-fn loading_subscription(generation: u64) -> Subscription<BrowserMessage> {
+fn loading_subscription(generation: u64, interval: Duration) -> Subscription<BrowserMessage> {
     Subscription::new(
         SubscriptionKey::new("browser.loading"),
         move |sender| async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                tokio::time::sleep(interval).await;
                 if sender
                     .send(BrowserMessage::LoadingTick { generation })
                     .await
@@ -743,10 +790,22 @@ impl Program for BrowserProgram {
                 self.loading = false;
                 Update::redraw().cancel_subscription(SubscriptionKey::new("browser.loading"))
             }
+            RuntimeEvent::Message(BrowserMessage::ScrollSynced {
+                mut page,
+                document,
+                generation,
+            }) if generation == self.request_generation && !self.loading => {
+                // Keep the user's latest local position, not the one the sync started at.
+                page.scroll_y_px = self.page.scroll_y_px;
+                self.page = *page;
+                self.document = *document;
+                self.offset = page_scroll_offset(&self.page, &self.document);
+                Update::redraw()
+            }
+            // The spinner frame derives from elapsed time; ticks only request redraws.
             RuntimeEvent::Message(BrowserMessage::LoadingTick { generation })
                 if generation == self.request_generation && self.loading =>
             {
-                self.loading_frame = self.loading_frame.wrapping_add(1);
                 Update::redraw()
             }
             RuntimeEvent::Message(BrowserMessage::Failed {
@@ -988,10 +1047,7 @@ mod tests {
                 ),
             )))
             .unwrap();
-        assert_eq!(
-            program.prompt.as_ref().map(super::PromptState::input),
-            Some("A")
-        );
+        assert_eq!(program.prompt_text(), "A");
     }
 
     #[test]
@@ -1116,5 +1172,154 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(program.page.title, "current");
+    }
+
+    type Recorded = std::sync::Arc<std::sync::Mutex<Vec<super::BrowserAction>>>;
+
+    fn scrollable_program() -> (BrowserProgram, Recorded) {
+        let mut program = BrowserProgram::new(
+            trowser_render::SemanticPage::default(),
+            RenderedDocument {
+                lines: (0..20_u32)
+                    .map(|index| RenderedLine {
+                        text: format!("line {index}"),
+                        source_y_px: Some(index * 20),
+                        ..RenderedLine::default()
+                    })
+                    .collect(),
+            },
+            Size::new(80, 6),
+        );
+        let recorded = Recorded::default();
+        let sink = std::sync::Arc::clone(&recorded);
+        program.set_effect(std::sync::Arc::new(move |action, _, _, _| {
+            sink.lock().unwrap().push(action);
+            bmux_tui_runtime::Command::concurrent(async { None })
+        }));
+        (program, recorded)
+    }
+
+    fn key(
+        program: &mut BrowserProgram,
+        code: KeyCode,
+    ) -> bmux_tui_runtime::Update<BrowserMessage> {
+        program
+            .update(RuntimeEvent::Terminal(Event::Key(KeyStroke::simple(code))))
+            .unwrap()
+    }
+
+    #[test]
+    fn scrolling_is_local_and_only_schedules_background_sync() {
+        let (mut program, recorded) = scrollable_program();
+
+        let update = key(&mut program, KeyCode::Char('j'));
+
+        assert_eq!(program.offset, 1);
+        assert_eq!(update.invalidation, Invalidation::Redraw);
+        assert!(!program.loading, "scrolling must not show loading state");
+        assert!(program.status.is_empty());
+        assert!(program.pending_action.is_none());
+        assert_eq!(program.page.scroll_y_px, 20);
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            [super::BrowserAction::ScrollTo(20)]
+        );
+
+        // Scrolling back to an already-synced position schedules nothing new.
+        key(&mut program, KeyCode::Char('k'));
+        key(&mut program, KeyCode::Char('k'));
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            [
+                super::BrowserAction::ScrollTo(20),
+                super::BrowserAction::ScrollTo(0)
+            ]
+        );
+    }
+
+    #[test]
+    fn scroll_sync_keeps_latest_local_position_and_yields_to_navigation() {
+        let (mut program, _) = scrollable_program();
+        for _ in 0..3 {
+            key(&mut program, KeyCode::Char('j'));
+        }
+        let synced_document = program.document.clone();
+        let generation = program.begin_request("idle");
+        program.loading = false;
+
+        program
+            .update(RuntimeEvent::Message(BrowserMessage::ScrollSynced {
+                page: Box::new(trowser_render::SemanticPage {
+                    title: "synced".to_string(),
+                    scroll_y_px: 20,
+                    ..trowser_render::SemanticPage::default()
+                }),
+                document: Box::new(synced_document.clone()),
+                generation,
+            }))
+            .unwrap();
+        assert_eq!(program.page.title, "synced");
+        assert_eq!(program.offset, 3, "sync must not move the view back");
+
+        let navigation = program.begin_request("navigating");
+        program
+            .update(RuntimeEvent::Message(BrowserMessage::ScrollSynced {
+                page: Box::new(trowser_render::SemanticPage {
+                    title: "late sync".to_string(),
+                    ..trowser_render::SemanticPage::default()
+                }),
+                document: Box::new(synced_document),
+                generation: navigation,
+            }))
+            .unwrap();
+        assert_eq!(program.page.title, "synced", "sync ignored while loading");
+    }
+
+    #[test]
+    fn render_mode_switch_redraws_without_resetting_images() {
+        let mut program = program();
+
+        let update = key(&mut program, KeyCode::Char('m'));
+
+        assert_eq!(update.invalidation, Invalidation::Redraw);
+    }
+
+    #[test]
+    fn prompt_uses_bmux_text_editing() {
+        let mut program = program();
+        for code in [
+            KeyCode::Char('o'),
+            KeyCode::Char('a'),
+            KeyCode::Char('c'),
+            KeyCode::Left,
+            KeyCode::Char('b'),
+            KeyCode::End,
+            KeyCode::Space,
+        ] {
+            key(&mut program, code);
+        }
+        program
+            .update(RuntimeEvent::Terminal(Event::Paste(
+                "d.example".to_string(),
+            )))
+            .unwrap();
+        assert_eq!(program.prompt_text(), "abc d.example");
+
+        key(&mut program, KeyCode::Escape);
+        assert!(program.prompt.is_none());
+        assert!(program.pending_action.is_none());
+    }
+
+    #[test]
+    fn search_prompt_starts_with_previous_query() {
+        let mut program = program();
+        program.search_query = "line 4".to_string();
+
+        key(&mut program, KeyCode::Char('/'));
+        assert_eq!(program.prompt_text(), "line 4");
+        key(&mut program, KeyCode::Enter);
+
+        assert_eq!(program.offset, 4);
+        assert_eq!(program.status, "found: line 4");
     }
 }
